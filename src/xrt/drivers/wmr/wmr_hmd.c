@@ -2046,6 +2046,14 @@ wmr_hmd_create(enum wmr_headset_type hmd_type,
 	exts.h_pixels = (uint32_t)wh->config.eye_params[0].display_size.y;
 	u_extents_2d_split_side_by_side(&wh->base, &exts);
 
+	// WMR panels (Reverb G1/G2, Odyssey, Odyssey+, ...) run at 90 Hz.
+	// u_extents_2d_split_side_by_side() does not set the frame interval, so
+	// without this it stays 0 — and a downstream consumer (the SteamVR driver
+	// bridge) computes refresh = 1/0 = infinite and falls back to 60 Hz,
+	// which mis-paces frames against the 90 Hz panel and causes judder.
+	wh->base.hmd->screens[0].nominal_frame_interval_ns =
+	    (uint64_t)(1000000000.0 / 90.0);
+
 	// Fill in blend mode - just opqaue, unless we get Hololens support one day.
 	size_t idx = 0;
 	wh->base.hmd->blend_modes[idx++] = XRT_BLEND_MODE_OPAQUE;
