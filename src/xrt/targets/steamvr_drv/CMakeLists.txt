@@ -65,6 +65,16 @@ set_target_properties(driver_monado PROPERTIES LIBRARY_OUTPUT_DIRECTORY "${PLUGI
 # don't add lib prefix to driver_monado.so
 set_target_properties(driver_monado PROPERTIES PREFIX "")
 
+# Add $ORIGIN to the runtime path so a deployment can bundle the driver's direct
+# dependencies (e.g. libhidapi-libusb) next to the .so, for use inside SteamVR's
+# Steam Linux Runtime (pressure-vessel) container, which lacks host-local libraries.
+# Note: the install(DIRECTORY) below ships the build-tree binary verbatim, so
+# BUILD_RPATH is what ends up in installed copies too; INSTALL_RPATH is set for
+# consistency should this ever switch to install(TARGETS).
+if(UNIX AND NOT APPLE)
+	set_target_properties(driver_monado PROPERTIES BUILD_RPATH "$ORIGIN" INSTALL_RPATH "$ORIGIN")
+endif()
+
 install(
 	DIRECTORY "${PROJECT_BINARY_DIR}/steamvr-monado"
 	DESTINATION "${CMAKE_INSTALL_PREFIX}/share"
