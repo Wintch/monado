@@ -71,6 +71,11 @@
 //! Specifies whether the user wants to use a SLAM tracker.
 DEBUG_GET_ONCE_BOOL_OPTION(wmr_slam, "WMR_SLAM", true)
 
+//! Whether to start tracking-camera streaming. With cameras off, SLAM and hand tracking
+//! are disabled and the headset runs orientation-only from the IMU. Lets a headset whose
+//! cameras fail to start (or whose user needs neither) run at all instead of aborting.
+DEBUG_GET_ONCE_BOOL_OPTION(wmr_cameras, "WMR_CAMERAS", true)
+
 //! Specifies whether the user wants to use a SLAM tracker.
 DEBUG_GET_ONCE_NUM_OPTION(sleep_seconds, "WMR_DISPLAY_INIT_SLEEP_SECONDS", 4)
 
@@ -1685,6 +1690,9 @@ wmr_hmd_setup_trackers(struct wmr_hmd *wh, struct xrt_slam_sinks *out_sinks, str
 	// We always have at least 3dof HMD tracking
 	bool dof3_enabled = true;
 
+	// Without camera streaming there is no data for SLAM or hand tracking.
+	bool cams_enabled = debug_get_bool_option_wmr_cameras();
+
 	// Decide whether to initialize the SLAM tracker
 	bool slam_wanted = debug_get_bool_option_wmr_slam();
 #ifdef XRT_FEATURE_SLAM
@@ -1692,7 +1700,7 @@ wmr_hmd_setup_trackers(struct wmr_hmd *wh, struct xrt_slam_sinks *out_sinks, str
 #else
 	bool slam_supported = false;
 #endif
-	bool slam_enabled = slam_supported && slam_wanted;
+	bool slam_enabled = slam_supported && slam_wanted && cams_enabled;
 
 	// Decide whether to initialize the hand tracker
 	bool hand_wanted = debug_get_bool_option_wmr_handtracking();
@@ -1701,7 +1709,7 @@ wmr_hmd_setup_trackers(struct wmr_hmd *wh, struct xrt_slam_sinks *out_sinks, str
 #else
 	bool hand_supported = false;
 #endif
-	bool hand_enabled = hand_supported && hand_wanted;
+	bool hand_enabled = hand_supported && hand_wanted && cams_enabled;
 
 	wh->base.supported.orientation_tracking = dof3_enabled || slam_enabled;
 	wh->base.supported.position_tracking = slam_enabled;
@@ -1715,11 +1723,13 @@ wmr_hmd_setup_trackers(struct wmr_hmd *wh, struct xrt_slam_sinks *out_sinks, str
 
 	const char *slam_status = wh->tracking.slam_enabled ? "Enabled"
 	                          : !slam_wanted            ? "Disabled by the user (envvar set to false)"
+	                          : !cams_enabled           ? "Disabled by the user (WMR_CAMERAS=0)"
 	                          : !slam_supported         ? "Unavailable (not built)"
 	                                                    : NULL;
 
 	const char *hand_status = wh->tracking.hand_enabled ? "Enabled"
 	                          : !hand_wanted            ? "Disabled by the user (envvar set to false)"
+	                          : !cams_enabled           ? "Disabled by the user (WMR_CAMERAS=0)"
 	                          : !hand_supported         ? "Unavailable (not built)"
 	                                                    : NULL;
 
@@ -2011,14 +2021,24 @@ wmr_hmd_create(enum wmr_headset_type hmd_type,
 		return;
 	}
 
-	// Stream data source into sinks (if populated)
-	bool stream_started = xrt_fs_slam_stream_start(wh->tracking.source, &sinks);
-	if (!stream_started) {
-		//! @todo Could reach this due to !XRT_HAVE_LIBUSB but the HMD should keep working
-		WMR_WARN(wh, "Failed to start WMR source");
-		wmr_hmd_destroy(&wh->base);
-		wh = NULL;
-		return;
+	// Stream data source into sinks (if populated).
+	//
+	// With WMR_CAMERAS=0 the stream is not started at all: setup_trackers has already
+	// forced SLAM and hand tracking off, so nothing consumes the frames, and skipping the
+	// start also means a camera in a bad state cannot abort an orientation-only session
+	// (a failed stream start below destroys the whole HMD). The camera USB interface is
+	// still claimed by wmr_source_create above; only streaming is skipped.
+	if (!debug_get_bool_option_wmr_cameras()) {
+		WMR_INFO(wh, "Camera streaming disabled (WMR_CAMERAS=0), running orientation-only");
+	} else {
+		bool stream_started = xrt_fs_slam_stream_start(wh->tracking.source, &sinks);
+		if (!stream_started) {
+			//! @todo Could reach this due to !XRT_HAVE_LIBUSB but the HMD should keep working
+			WMR_WARN(wh, "Failed to start WMR source");
+			wmr_hmd_destroy(&wh->base);
+			wh = NULL;
+			return;
+		}
 	}
 
 	// Hand over hololens sensor device to reading thread.
