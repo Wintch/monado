@@ -328,7 +328,9 @@ wmr_controller_hp_update_inputs(struct xrt_device *xdev)
 	xrt_inputs[WMR_CONTROLLER_INDEX_HOME_CLICK].value.boolean = cur_inputs->home;
 	xrt_inputs[WMR_CONTROLLER_INDEX_X_A_CLICK].value.boolean = cur_inputs->x_a;
 	xrt_inputs[WMR_CONTROLLER_INDEX_Y_B_CLICK].value.boolean = cur_inputs->y_b;
-	xrt_inputs[WMR_CONTROLLER_INDEX_SQUEEZE_CLICK].value.boolean = cur_inputs->squeeze;
+	// squeeze_click is the parsed button bit; assigning the analog squeeze float here made
+	// any non-zero grip pressure read as a click.
+	xrt_inputs[WMR_CONTROLLER_INDEX_SQUEEZE_CLICK].value.boolean = cur_inputs->squeeze_click;
 	xrt_inputs[WMR_CONTROLLER_INDEX_SQUEEZE_VALUE].value.vec1.x = cur_inputs->squeeze;
 	xrt_inputs[WMR_CONTROLLER_INDEX_TRIGGER_VALUE].value.vec1.x = cur_inputs->trigger;
 	xrt_inputs[WMR_CONTROLLER_INDEX_THUMBSTICK_CLICK].value.boolean = cur_inputs->thumbstick.click;
