@@ -336,6 +336,11 @@ wmr_controller_hp_update_inputs(struct xrt_device *xdev)
 	xrt_inputs[WMR_CONTROLLER_INDEX_THUMBSTICK_CLICK].value.boolean = cur_inputs->thumbstick.click;
 	xrt_inputs[WMR_CONTROLLER_INDEX_THUMBSTICK].value.vec2 = cur_inputs->thumbstick.values;
 
+	// Without a timestamp OpenXR reports lastChangeTime == 0 for every WMR action.
+	for (uint32_t i = 0; i < xdev->input_count; i++) {
+		xrt_inputs[i].timestamp = (int64_t)wcb->last_imu_timestamp_ns;
+	}
+
 	os_mutex_unlock(&wcb->data_lock);
 
 	return XRT_SUCCESS;
@@ -397,7 +402,7 @@ wmr_controller_hp_create(struct wmr_controller_connection *conn,
 	}
 
 	for (uint32_t i = 0; i < wcb->base.input_count; i++) {
-		wcb->base.inputs[0].active = true;
+		wcb->base.inputs[i].active = true;
 	}
 
 	ctrl->last_inputs.imu.timestamp_ticks = 0;
@@ -417,8 +422,8 @@ wmr_controller_hp_create(struct wmr_controller_connection *conn,
 	u_var_add_f32(wcb, &ctrl->last_inputs.trigger, "input.trigger");
 	u_var_add_u8(wcb, &ctrl->last_inputs.battery, "input.battery");
 	u_var_add_bool(wcb, &ctrl->last_inputs.thumbstick.click, "input.thumbstick.click");
-	u_var_add_f32(wcb, &ctrl->last_inputs.thumbstick.values.x, "input.thumbstick.values.y");
-	u_var_add_f32(wcb, &ctrl->last_inputs.thumbstick.values.y, "input.thumbstick.values.x");
+	u_var_add_f32(wcb, &ctrl->last_inputs.thumbstick.values.x, "input.thumbstick.values.x");
+	u_var_add_f32(wcb, &ctrl->last_inputs.thumbstick.values.y, "input.thumbstick.values.y");
 	if (controller_type == XRT_DEVICE_TYPE_LEFT_HAND_CONTROLLER) {
 		u_var_add_bool(wcb, &ctrl->last_inputs.x_a, "input.x");
 		u_var_add_bool(wcb, &ctrl->last_inputs.y_b, "input.y");
