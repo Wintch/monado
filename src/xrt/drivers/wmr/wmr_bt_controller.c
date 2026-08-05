@@ -55,9 +55,21 @@ read_packets(struct wmr_bt_connection *conn)
 	DRV_TRACE_IDENT(read_packets_got);
 
 	if (size < 0) {
-		WMR_ERROR(conn, "WMR Controller (Bluetooth): Error reading from device");
-		return false;
+		/* Transient read errors happen when the radio link hiccups; a single one
+		 * used to permanently break this thread while the xdev stayed registered,
+		 * leaving a mute controller. Only give up after several in a row. */
+		conn->consecutive_read_errors++;
+		if (conn->consecutive_read_errors >= 10) {
+			WMR_ERROR(conn, "WMR Controller (Bluetooth): %d consecutive read errors, giving up",
+			          conn->consecutive_read_errors);
+			return false;
+		}
+		WMR_DEBUG(conn, "WMR Controller (Bluetooth): Error reading from device (%d in a row)",
+		          conn->consecutive_read_errors);
+		os_nanosleep(U_TIME_1MS_IN_NS * 100);
+		return true;
 	}
+	conn->consecutive_read_errors = 0;
 	if (size == 0) {
 		WMR_TRACE(conn, "WMR Controller (Bluetooth): No data to read from device");
 		return true; // No more messages, return.

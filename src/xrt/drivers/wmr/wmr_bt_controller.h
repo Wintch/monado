@@ -36,6 +36,9 @@ struct wmr_bt_connection
 	struct os_thread_helper controller_thread;
 
 	struct os_mutex hid_lock;
+
+	//! Transient-read-error streak; the read thread only gives up after several in a row.
+	int consecutive_read_errors;
 };
 
 struct xrt_device *
