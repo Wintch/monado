@@ -33,6 +33,9 @@
 #include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
+
+//! Radial thumbstick deadzone, applied by the per-model packet parsers. Off by default.
+DEBUG_GET_ONCE_FLOAT_OPTION(wmr_stick_deadzone, "WMR_STICK_DEADZONE", 0.0f)
 #include <string.h>
 #include <assert.h>
 #include <errno.h>
@@ -573,6 +576,28 @@ wmr_controller_base_deinit(struct wmr_controller_base *wcb)
 
 	// Destroy the fusion.
 	m_imu_3dof_close(&wcb->fusion);
+}
+
+void
+wmr_controller_base_apply_stick_deadzone(struct xrt_vec2 *stick)
+{
+	const float deadzone = debug_get_float_option_wmr_stick_deadzone();
+	if (deadzone <= 0.0f || deadzone >= 1.0f) {
+		return;
+	}
+
+	const float mag = sqrtf(stick->x * stick->x + stick->y * stick->y);
+	if (mag < deadzone) {
+		stick->x = 0.0f;
+		stick->y = 0.0f;
+		return;
+	}
+
+	/* Rescale so the active range still spans 0..1. A full diagonal has mag > 1,
+	 * where the rescale can push a component past 1 - clamp per component. */
+	const float rescale = (mag - deadzone) / (1.0f - deadzone) / mag;
+	stick->x = fminf(fmaxf(stick->x * rescale, -1.0f), 1.0f);
+	stick->y = fminf(fmaxf(stick->y * rescale, -1.0f), 1.0f);
 }
 
 /*

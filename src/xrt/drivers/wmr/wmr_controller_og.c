@@ -283,6 +283,8 @@ wmr_controller_og_packet_parse(struct wmr_controller_og *ctrl, const unsigned ch
 		last_input->thumbstick.values.y = 1.0f;
 	}
 
+	wmr_controller_base_apply_stick_deadzone(&last_input->thumbstick.values);
+
 	// Read trigger value (0x00 - 0xFF)
 	last_input->trigger = (float)read8(&p) / 0xFF;
 
