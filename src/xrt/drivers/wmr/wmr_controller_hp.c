@@ -102,7 +102,34 @@ static struct xrt_binding_output_pair simple_outputs[1] = {
     {XRT_OUTPUT_NAME_SIMPLE_VIBRATION, XRT_OUTPUT_NAME_G2_CONTROLLER_HAPTIC},
 };
 
-static struct xrt_binding_profile binding_profiles[2] = {
+/*
+ * Remap for the native /interaction_profiles/microsoft/motion_controller profile
+ * (xrt_device name XRT_DEVICE_WMR_CONTROLLER, per bindings.json's "monado_device"). This
+ * driver self-identifies as XRT_DEVICE_HP_REVERB_G2_CONTROLLER (see set_controller_props()
+ * below) and its inputs are named XRT_INPUT_G2_CONTROLLER_*, not XRT_INPUT_WMR_* - without
+ * this table, oxr_input.c's get_binding() finds neither a name match nor a binding_profiles
+ * fallback for that profile (profile->xname != xdev->name && xbp == NULL) and silently drops
+ * every action bound to it. Discovered 2026-08-06: a WMR thumbstick binding for video seek
+ * never fired, and this is why - not just the new action, ALL microsoft/motion_controller
+ * bindings (grip pose, squeeze, quit) were unreachable on real G2 hardware, masked because
+ * the app happened to still get pose/grip/select through the khr/simple_controller fallback
+ * (simple_inputs below) since hello_xr suggests bindings for that profile too.
+ */
+static struct xrt_binding_input_pair wmr_inputs[7] = {
+    {XRT_INPUT_WMR_MENU_CLICK, XRT_INPUT_G2_CONTROLLER_MENU_CLICK},
+    {XRT_INPUT_WMR_SQUEEZE_CLICK, XRT_INPUT_G2_CONTROLLER_SQUEEZE_CLICK},
+    {XRT_INPUT_WMR_TRIGGER_VALUE, XRT_INPUT_G2_CONTROLLER_TRIGGER_VALUE},
+    {XRT_INPUT_WMR_THUMBSTICK_CLICK, XRT_INPUT_G2_CONTROLLER_THUMBSTICK_CLICK},
+    {XRT_INPUT_WMR_THUMBSTICK, XRT_INPUT_G2_CONTROLLER_THUMBSTICK},
+    {XRT_INPUT_WMR_GRIP_POSE, XRT_INPUT_G2_CONTROLLER_GRIP_POSE},
+    {XRT_INPUT_WMR_AIM_POSE, XRT_INPUT_G2_CONTROLLER_AIM_POSE},
+};
+
+static struct xrt_binding_output_pair wmr_outputs[1] = {
+    {XRT_OUTPUT_NAME_WMR_HAPTIC, XRT_OUTPUT_NAME_G2_CONTROLLER_HAPTIC},
+};
+
+static struct xrt_binding_profile binding_profiles[3] = {
     {
         .name = XRT_DEVICE_TOUCH_CONTROLLER,
         .inputs = touch_inputs,
@@ -116,6 +143,13 @@ static struct xrt_binding_profile binding_profiles[2] = {
         .input_count = ARRAY_SIZE(simple_inputs),
         .outputs = simple_outputs,
         .output_count = ARRAY_SIZE(simple_outputs),
+    },
+    {
+        .name = XRT_DEVICE_WMR_CONTROLLER,
+        .inputs = wmr_inputs,
+        .input_count = ARRAY_SIZE(wmr_inputs),
+        .outputs = wmr_outputs,
+        .output_count = ARRAY_SIZE(wmr_outputs),
     },
 };
 
