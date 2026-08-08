@@ -579,6 +579,8 @@ if(XRT_BUILD_DRIVER_WMR)
 			aux_util_sink # TODO remove this when converted to builders.
 			aux_math
 			aux_tracking
+			tracking-includes
+			constellation
 			xrt-external-cjson
 		)
 	list(APPEND ENABLED_HEADSET_DRIVERS wmr)
