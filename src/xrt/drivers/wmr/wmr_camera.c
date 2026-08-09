@@ -125,6 +125,7 @@ struct wmr_camera
 	struct u_sink_debug debug_sinks[2];
 
 	struct xrt_frame_sink *cam_sinks[WMR_MAX_CAMERAS]; //!< Downstream sinks to push tracking frames to
+	struct xrt_frame_sink *ctrl_cam_sinks[WMR_MAX_CAMERAS]; //!< Downstream sinks for controller-tracking frames
 
 	enum u_logging_level log_level;
 };
@@ -426,6 +427,24 @@ img_xfer_cb(struct libusb_transfer *xfer)
 		for (int i = 0; i < cam->slam_cam_count; i++) {
 			xrt_frame_reference(&frames[i], NULL);
 		}
+	} else {
+		DRV_TRACE_IDENT(push_to_ctrl_sinks);
+
+		// Controller-tracking frames carry all tcam_count cameras' image data, not just the SLAM subset.
+		struct xrt_frame *frames[WMR_MAX_CAMERAS] = {NULL};
+		for (int i = 0; i < cam->tcam_count; i++) {
+			u_frame_create_roi(xf, cam->tcam_confs[i].roi, &frames[i]);
+		}
+
+		for (int i = 0; i < cam->tcam_count; i++) {
+			if (cam->ctrl_cam_sinks[i] != NULL) {
+				xrt_sink_push_frame(cam->ctrl_cam_sinks[i], frames[i]);
+			}
+		}
+
+		for (int i = 0; i < cam->tcam_count; i++) {
+			xrt_frame_reference(&frames[i], NULL);
+		}
 	}
 
 drop_frame:
@@ -458,6 +477,7 @@ wmr_camera_open(struct wmr_camera_open_config *config)
 	for (int i = 0; i < cam->tcam_count; i++) {
 		cam->tcam_confs[i] = *config->tcam_confs[i];
 		cam->cam_sinks[i] = config->tcam_sinks[i];
+		cam->ctrl_cam_sinks[i] = config->ctrl_cam_sinks != NULL ? config->ctrl_cam_sinks[i] : NULL;
 	}
 
 	if (os_thread_helper_init(&cam->usb_thread) != 0) {

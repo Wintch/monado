@@ -28,6 +28,9 @@ struct wmr_camera_open_config
 	struct xrt_prober_device *dev_holo;
 	struct wmr_camera_config **tcam_confs; //!< Pointers to tracking cameras. Will be copied.
 	struct xrt_frame_sink **tcam_sinks;    //!< Sinks for tracking cameras
+	struct xrt_frame_sink **ctrl_cam_sinks; //!< Sinks for controller-tracking frames (frametype 0x2), one per
+	                                         //!< tracking camera. Entries may be NULL to drop that camera's
+	                                         //!< controller frames; the whole array may be NULL to disable.
 	int tcam_count;                        //!< Tracking camera count
 	int slam_cam_count;                    //!< Number of tracking cameras to use for SLAM
 	enum u_logging_level log_level;

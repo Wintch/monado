@@ -11,6 +11,7 @@
 #include "wmr_config.h"
 #include "wmr_protocol.h"
 
+#include "constellation/t_rift_blobwatch.h"
 #include "math/m_api.h"
 #include "math/m_clock_tracking.h"
 #include "math/m_filter_fifo.h"
@@ -70,6 +71,9 @@ struct wmr_source
 	struct u_sink_debug ui_cam_sinks[WMR_MAX_CAMERAS]; //!< Sink to display camera frames in UI
 	struct m_ff_vec3_f32 *gyro_ff;                     //!< Queue of gyroscope data to display in UI
 	struct m_ff_vec3_f32 *accel_ff;                    //!< Queue of accelerometer data to display in UI
+
+	// Controller-tracking (constellation) frames: blob detection only for now, debug-only, no tracker wired yet
+	struct u_sink_debug ctrl_blob_debug_sinks[WMR_MAX_CAMERAS]; //!< Sink to display detected LED blobs in UI
 
 	bool is_running;              //!< Whether the device is streaming
 	bool first_imu_received;      //!< Don't send frames until first IMU sample
@@ -275,6 +279,7 @@ wmr_source_node_destroy(struct xrt_frame_node *node)
 	WMR_DEBUG(ws, "Destroying WMR source");
 	for (int i = 0; i < ws->config.tcam_count; i++) {
 		u_sink_debug_destroy(&ws->ui_cam_sinks[i]);
+		u_sink_debug_destroy(&ws->ctrl_blob_debug_sinks[i]);
 	}
 	m_ff_vec3_f32_free(&ws->gyro_ff);
 	m_ff_vec3_f32_free(&ws->accel_ff);
@@ -327,10 +332,44 @@ wmr_source_create(struct xrt_frame_context *xfctx, struct xrt_prober_device *dev
 	}
 	ws->in_sinks.imu = &ws->imu_sink;
 
+	// Controller-tracking (frametype 0x2) frames: run LED blob detection per camera and show it in the debug
+	// GUI. Debug-only for now -- no t_constellation_tracker exists yet, so the visualizer's downstream blob
+	// sink is NULL.
+	struct xrt_frame_sink *ctrl_cam_sinks[WMR_MAX_CAMERAS] = {NULL};
+	for (int i = 0; i < cfg.tcam_count; i++) {
+		u_sink_debug_init(&ws->ctrl_blob_debug_sinks[i]);
+
+		struct t_blob_sink *blob_sink = NULL;
+		u_sink_blob_visualizer_create(xfctx, NULL, &ws->ctrl_blob_debug_sinks[i], cfg.tcams[i]->roi.extent.w,
+		                              cfg.tcams[i]->roi.extent.h, &blob_sink);
+
+		struct t_rift_blobwatch_params bw_params = {
+		    .pixel_threshold = RIFT_BLOBWATCH_PIXEL_THRESHOLD_CV1,
+		    .blob_required_threshold = RIFT_BLOBWATCH_BLOB_REQUIRED_THRESHOLD,
+		    .max_match_dist = RIFT_BLOBWATCH_DEFAULT_MAX_MATCH_DIST,
+		    .max_blob_width = RIFT_BLOBWATCH_DEFAULT_MAX_BLOB_WIDTH,
+		};
+		struct xrt_frame_sink *frame_sink = NULL;
+		struct t_blobwatch *blobwatch = NULL;
+		int ret = t_rift_blobwatch_create(&bw_params, xfctx, blob_sink, &frame_sink, &blobwatch);
+		if (ret != 0) {
+			WMR_WARN(ws, "Failed to create controller-tracking blobwatch for camera %d: %d", i, ret);
+			continue;
+		}
+
+		if (!u_sink_simple_queue_create(xfctx, frame_sink, &frame_sink)) {
+			WMR_WARN(ws, "Failed to create controller-tracking blobwatch queue for camera %d", i);
+			continue;
+		}
+
+		ctrl_cam_sinks[i] = frame_sink;
+	}
+
 	struct wmr_camera_open_config options = {
 	    .dev_holo = dev_holo,
 	    .tcam_confs = cfg.tcams,
 	    .tcam_sinks = ws->in_sinks.cams,
+	    .ctrl_cam_sinks = ctrl_cam_sinks,
 	    .tcam_count = cfg.tcam_count,
 	    .slam_cam_count = cfg.slam_cam_count,
 	    .log_level = ws->log_level,
@@ -353,6 +392,11 @@ wmr_source_create(struct xrt_frame_context *xfctx, struct xrt_prober_device *dev
 		char label[] = "Camera NNNNNNNNNNN";
 		(void)snprintf(label, sizeof(label), "Camera %d", i);
 		u_var_add_sink_debug(ws, &ws->ui_cam_sinks[i], label);
+	}
+	for (int i = 0; i < cfg.tcam_count; i++) {
+		char label[] = "Controller Blob Cam NNNNNNNNNNN";
+		(void)snprintf(label, sizeof(label), "Controller Blob Cam %d", i);
+		u_var_add_sink_debug(ws, &ws->ctrl_blob_debug_sinks[i], label);
 	}
 
 	// Setup node
