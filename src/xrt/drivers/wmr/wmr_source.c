@@ -299,7 +299,10 @@ wmr_source_node_destroy(struct xrt_frame_node *node)
 
 //! Create and open the frame server for IMU/camera streaming.
 struct xrt_fs *
-wmr_source_create(struct xrt_frame_context *xfctx, struct xrt_prober_device *dev_holo, struct wmr_hmd_config cfg)
+wmr_source_create(struct xrt_frame_context *xfctx,
+                  struct xrt_prober_device *dev_holo,
+                  struct wmr_hmd_config cfg,
+                  struct t_blob_sink **ctrl_cam_constellation_sinks)
 {
 	DRV_TRACE_MARKER();
 
@@ -333,15 +336,18 @@ wmr_source_create(struct xrt_frame_context *xfctx, struct xrt_prober_device *dev
 	ws->in_sinks.imu = &ws->imu_sink;
 
 	// Controller-tracking (frametype 0x2) frames: run LED blob detection per camera and show it in the debug
-	// GUI. Debug-only for now -- no t_constellation_tracker exists yet, so the visualizer's downstream blob
-	// sink is NULL.
+	// GUI. When ctrl_cam_constellation_sinks is set (WMR_CONSTELLATION_CONTROLLERS=1), detections are also
+	// forwarded to the constellation tracker; the debug panel keeps working either way.
 	struct xrt_frame_sink *ctrl_cam_sinks[WMR_MAX_CAMERAS] = {NULL};
 	for (int i = 0; i < cfg.tcam_count; i++) {
 		u_sink_debug_init(&ws->ctrl_blob_debug_sinks[i]);
 
+		struct t_blob_sink *downstream =
+		    ctrl_cam_constellation_sinks != NULL ? ctrl_cam_constellation_sinks[i] : NULL;
+
 		struct t_blob_sink *blob_sink = NULL;
-		u_sink_blob_visualizer_create(xfctx, NULL, &ws->ctrl_blob_debug_sinks[i], cfg.tcams[i]->roi.extent.w,
-		                              cfg.tcams[i]->roi.extent.h, &blob_sink);
+		u_sink_blob_visualizer_create(xfctx, downstream, &ws->ctrl_blob_debug_sinks[i],
+		                              cfg.tcams[i]->roi.extent.w, cfg.tcams[i]->roi.extent.h, &blob_sink);
 
 		struct t_rift_blobwatch_params bw_params = {
 		    .pixel_threshold = RIFT_BLOBWATCH_PIXEL_THRESHOLD_CV1,

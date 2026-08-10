@@ -82,6 +82,11 @@ DEBUG_GET_ONCE_NUM_OPTION(sleep_seconds, "WMR_DISPLAY_INIT_SLEEP_SECONDS", 4)
 //! Specifies whether the user wants to use the hand tracker.
 DEBUG_GET_ONCE_BOOL_OPTION(wmr_handtracking, "WMR_HANDTRACKING", true)
 
+//! Whether to run the optical LED constellation tracker for controller positional tracking.
+//! Plumbing/telemetry only for now -- nothing consumes its output yet, orientation-only
+//! controller tracking is unaffected either way. See docs/03-controllers.md.
+DEBUG_GET_ONCE_BOOL_OPTION(wmr_constellation_controllers, "WMR_CONSTELLATION_CONTROLLERS", false)
+
 #ifdef XRT_FEATURE_SLAM
 //! Whether to submit samples to the SLAM tracker from the start.
 DEBUG_GET_ONCE_OPTION(slam_submit_from_start, "SLAM_SUBMIT_FROM_START", NULL)
@@ -1427,6 +1432,80 @@ wmr_hmd_fill_slam_cams_calibration(struct wmr_hmd *wh)
 	}
 }
 
+/*!
+ * Builds a constellation-tracker camera mosaic from the same per-camera intrinsics/extrinsics
+ * SLAM already uses (@ref wmr_hmd_fill_slam_cams_calibration), and creates the tracker. Indexed
+ * in raw USB frame order (0..tcam_count-1), matching @ref wmr_camera_open_config.ctrl_cam_sinks
+ * -- NOT the calibration JSON's HT-numbering, hence the same camera-2/3 pose swap SLAM applies
+ * for the same reason (see the comment there).
+ *
+ * No device is registered with the tracker here (that needs the per-controller LED model, a
+ * later patch) -- this only wires cameras in, so the tracker has somewhere to send unmatched
+ * blob observations once something calls @ref t_constellation_tracker_add_device.
+ *
+ * Sets wh->tracking.constellation_tracker and wh->tracking.constellation_cam_blob_sinks[] on
+ * success; leaves both zeroed on failure (logged, not fatal -- controller tracking stays
+ * orientation-only exactly as if WMR_CONSTELLATION_CONTROLLERS were never set).
+ */
+static void
+wmr_hmd_create_constellation_tracker(struct wmr_hmd *wh)
+{
+	struct t_constellation_tracker_params params = {
+	    .flags = T_CONSTELLATION_TRACKER_FLAGS_NONE,
+	    .num_mosaics = 1,
+	};
+	struct t_constellation_tracker_camera_mosaic *mosaic = &params.mosaics[0];
+
+	for (int i = 0; i < wh->config.tcam_count && i < XRT_TRACKING_MAX_CAMS; i++) {
+		struct xrt_pose P_imu_ci;
+
+		if (i == 0) {
+			P_imu_ci = wh->config.sensors.accel.pose;
+		} else {
+			struct xrt_pose P_ci_c0 = wh->config.tcams[i]->pose;
+
+			//! @note Same HT2/HT3 extrinsics-vs-USB-order swap as wmr_hmd_fill_slam_cams_calibration.
+			if (i == 2 || i == 3) {
+				P_ci_c0 = wh->config.tcams[i == 2 ? 3 : 2]->pose;
+			}
+
+			struct xrt_pose P_c0_ci;
+			math_pose_invert(&P_ci_c0, &P_c0_ci);
+			math_pose_transform(&wh->config.sensors.accel.pose, &P_c0_ci, &P_imu_ci);
+		}
+
+		mosaic->cameras[mosaic->num_cameras++] = (struct t_constellation_tracker_camera){
+		    .calibration = wmr_hmd_get_cam_calib(wh, i),
+		    .pose_in_origin = P_imu_ci,
+		    .has_concrete_pose = true, // Real extrinsics from the headset's own factory calibration.
+		};
+	}
+
+	int ret = t_constellation_tracker_create(&wh->tracking.xfctx, &params, &wh->tracking.constellation_tracker);
+	if (ret != 0) {
+		WMR_WARN(wh, "Failed to create constellation tracker for controllers, code %d -- controllers stay "
+		             "orientation-only",
+		         ret);
+		wh->tracking.constellation_tracker = NULL;
+		return;
+	}
+
+	for (size_t i = 0; i < mosaic->num_cameras; i++) {
+		wh->tracking.constellation_cam_blob_sinks[i] = mosaic->cameras[i].blob_sink;
+	}
+
+	WMR_INFO(wh, "Constellation tracker created for controller positional tracking (%zu cameras, no devices "
+	             "registered yet)",
+	         mosaic->num_cameras);
+}
+
+struct t_constellation_tracker *
+wmr_hmd_get_constellation_tracker(struct xrt_device *head)
+{
+	struct wmr_hmd *wh = (struct wmr_hmd *)head;
+	return wh->tracking.constellation_tracker;
+}
+
 XRT_MAYBE_UNUSED static struct t_imu_calibration
 wmr_hmd_get_imu_calib(struct wmr_hmd *wh)
 {
@@ -2009,8 +2088,15 @@ wmr_hmd_create(enum wmr_headset_type hmd_type,
 	// Switch on IMU on the HMD.
 	hololens_sensors_enable_imu(wh);
 
+	if (debug_get_bool_option_wmr_cameras() && debug_get_bool_option_wmr_constellation_controllers()) {
+		wmr_hmd_create_constellation_tracker(wh);
+	}
+
 	// Switch on data streams on the HMD (only cameras for now as IMU is not yet integrated into wmr_source)
-	wh->tracking.source = wmr_source_create(&wh->tracking.xfctx, dev_holo, wh->config);
+	wh->tracking.source = wmr_source_create(&wh->tracking.xfctx, dev_holo, wh->config,
+	                                        wh->tracking.constellation_tracker != NULL
+	                                            ? wh->tracking.constellation_cam_blob_sinks
+	                                            : NULL);
 
 	struct xrt_slam_sinks sinks = {0};
 	struct xrt_device *hand_device = NULL;

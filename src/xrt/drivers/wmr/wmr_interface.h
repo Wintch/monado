@@ -151,6 +151,18 @@ wmr_create_bt_controller(struct xrt_prober *xp,
                          enum u_logging_level log_level,
                          struct xrt_device **out_xdev);
 
+struct t_constellation_tracker;
+
+/*!
+ * Returns the WMR headset's constellation tracker for controller positional tracking, or NULL if
+ * WMR_CONSTELLATION_CONTROLLERS is off or tracker creation failed. @p head must be the @ref
+ * xrt_device returned as `out_hmd` from @ref wmr_create_headset.
+ *
+ * @ingroup drv_wmr
+ */
+struct t_constellation_tracker *
+wmr_hmd_get_constellation_tracker(struct xrt_device *head);
+
 
 #ifdef __cplusplus
 }

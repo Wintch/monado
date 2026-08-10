@@ -15,6 +15,8 @@
 #pragma once
 
 #include "tracking/t_tracking.h"
+#include "tracking/t_constellation.h"
+#include "constellation/t_constellation_tracker.h"
 #include "xrt/xrt_device.h"
 #include "xrt/xrt_frame.h"
 #include "xrt/xrt_prober.h"
@@ -144,6 +146,18 @@ struct wmr_hmd
 
 		//! SLAM systems track the IMU pose, enabling this corrects it to middle of the eyes
 		bool imu2me;
+
+		/*!
+		 * Optional constellation tracker for controller positional tracking (WMR_CONSTELLATION_CONTROLLERS).
+		 * NULL unless the feature is enabled and creation succeeded. Owned by @ref wh, destroyed via @ref
+		 * xfctx like everything else here.
+		 */
+		struct t_constellation_tracker *constellation_tracker;
+
+		//! Per-camera blob sinks handed out by @ref constellation_tracker, indexed like @ref
+		//! wmr_hmd_config.tcams. Entries beyond the tracker's camera count are NULL. Only valid when
+		//! @ref constellation_tracker is non-NULL.
+		struct t_blob_sink *constellation_cam_blob_sinks[WMR_MAX_CAMERAS];
 	} tracking;
 
 	//! Whether to track the HMD with 6dof SLAM or fallback to the `fusion` 3dof tracker
