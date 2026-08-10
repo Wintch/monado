@@ -142,6 +142,21 @@ struct wmr_controller_base
 		t_constellation_device_id_t device_id;
 		//! NULL unless device_id is valid; used only to remove the device from the tracker on destroy.
 		struct t_constellation_tracker *tracker;
+
+		/*!
+		 * Latest sample from the tracker, for the debug GUI only -- nothing reads this for the actual
+		 * device pose yet. Written from the tracker's own thread in
+		 * @ref wmr_controller_base_constellation_sample_store, read by the GUI thread via the
+		 * u_var_add_ro_* registrations in @ref wmr_controller_base_add_to_constellation_tracker.
+		 * Intentionally unsynchronized, same as the rest of this codebase's GUI-only debug fields
+		 * (e.g. wmr_camera.c's exposure/gain widgets) -- a torn read just shows a stale frame's value
+		 * for one GUI refresh, never a correctness issue.
+		 */
+		struct xrt_pose last_pose;
+		int64_t last_timestamp_ns;
+		struct t_constellation_tracker_sample_metrics last_metrics;
+		//! Samples received since registration, so "stuck at 0" is visible at a glance in the GUI.
+		uint64_t sample_count;
 	} constellation;
 };
 

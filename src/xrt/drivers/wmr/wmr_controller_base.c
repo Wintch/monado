@@ -692,14 +692,19 @@ wmr_controller_base_init(struct wmr_controller_base *wcb,
 #define WMR_CONSTELLATION_LED_RADIUS_M 0.003f
 #define WMR_CONSTELLATION_LED_VISIBILITY_ANGLE DEG_TO_RAD(75)
 
-//! Placeholder for @ref t_constellation_tracker_device::push_constellation_tracker_sample -- does
-//! nothing yet. Real handling (telemetry storage, live XYZ in the debug GUI) is a later patch;
-//! until then the tracker computes samples but they go nowhere, matching "plumbing only".
+//! @ref t_constellation_tracker_device::push_constellation_tracker_sample. Stores the sample for
+//! the debug GUI only -- nothing consumes this for the device's actual reported pose yet, that's
+//! a later patch, and orientation keeps coming exclusively from the IMU fusion as always.
 static void
-constellation_sample_noop(struct t_constellation_tracker_device *device, struct t_constellation_tracker_sample *sample)
+constellation_sample_store(struct t_constellation_tracker_device *device, struct t_constellation_tracker_sample *sample)
 {
-	(void)device;
-	(void)sample;
+	struct wmr_controller_base *wcb =
+	    container_of(device, struct wmr_controller_base, constellation.device);
+
+	wcb->constellation.last_pose = sample->pose;
+	wcb->constellation.last_timestamp_ns = sample->timestamp_ns;
+	wcb->constellation.last_metrics = sample->metrics;
+	wcb->constellation.sample_count++;
 }
 
 void
@@ -730,7 +735,7 @@ wmr_controller_base_add_to_constellation_tracker(struct wmr_controller_base *wcb
 	    .compute_led_visibility = NULL,
 	};
 
-	wcb->constellation.device.push_constellation_tracker_sample = constellation_sample_noop;
+	wcb->constellation.device.push_constellation_tracker_sample = constellation_sample_store;
 
 	struct t_constellation_tracker_device_params params = {
 	    .led_model = wcb->constellation.led_model,
@@ -746,6 +751,13 @@ wmr_controller_base_add_to_constellation_tracker(struct wmr_controller_base *wcb
 	}
 
 	wcb->constellation.tracker = tracker;
+
+	u_var_add_gui_header(wcb, NULL, "Constellation tracking (telemetry only)");
+	u_var_add_ro_u64(wcb, &wcb->constellation.sample_count, "constellation.sample_count");
+	u_var_add_ro_vec3_f32(wcb, &wcb->constellation.last_pose.position, "constellation.position_m");
+	u_var_add_ro_u32(wcb, &wcb->constellation.last_metrics.matched_blob_count, "constellation.matched_blobs");
+	u_var_add_ro_u32(wcb, &wcb->constellation.last_metrics.visible_led_count, "constellation.visible_leds");
+	u_var_add_ro_f64(wcb, &wcb->constellation.last_metrics.reprojection_error, "constellation.reprojection_error_px");
 
 	WMR_INFO(wcb, "Registered with constellation tracker (%d LEDs, device id %d) -- telemetry only, no effect "
 	              "on the output pose yet",
