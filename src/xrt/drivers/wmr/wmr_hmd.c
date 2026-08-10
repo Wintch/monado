@@ -83,9 +83,9 @@ DEBUG_GET_ONCE_NUM_OPTION(sleep_seconds, "WMR_DISPLAY_INIT_SLEEP_SECONDS", 4)
 DEBUG_GET_ONCE_BOOL_OPTION(wmr_handtracking, "WMR_HANDTRACKING", true)
 
 //! Whether to run the optical LED constellation tracker for controller positional tracking.
-//! Plumbing/telemetry only for now -- nothing consumes its output yet, orientation-only
-//! controller tracking is unaffected either way. See docs/03-controllers.md.
-DEBUG_GET_ONCE_BOOL_OPTION(wmr_constellation_controllers, "WMR_CONSTELLATION_CONTROLLERS", false)
+//! Default on since 0017 (patches/monado/0017): controllers report a real fused position, not
+//! just orientation. See docs/03-controllers.md.
+DEBUG_GET_ONCE_BOOL_OPTION(wmr_constellation_controllers, "WMR_CONSTELLATION_CONTROLLERS", true)
 
 #ifdef XRT_FEATURE_SLAM
 //! Whether to submit samples to the SLAM tracker from the start.
