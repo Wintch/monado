@@ -23,6 +23,7 @@
 
 #include "wmr/wmr_common.h"
 #include "wmr/wmr_interface.h"
+#include "wmr/wmr_controller_base.h"
 
 #include <assert.h>
 
@@ -286,6 +287,21 @@ wmr_open_system_impl(struct xrt_builder *xb,
 	}
 	if (ht_right != NULL) {
 		xsysd->static_xdevs[xsysd->static_xdev_count++] = ht_right;
+	}
+
+	// Register controllers for optical positional tracking (WMR_CONSTELLATION_CONTROLLERS). No-op
+	// unless wmr_hmd_create_constellation_tracker (wmr_hmd.c) actually created a tracker; telemetry
+	// only for now, doesn't affect the pose either of these devices report.
+	struct t_constellation_tracker *constellation_tracker = wmr_hmd_get_constellation_tracker(head);
+	if (constellation_tracker != NULL) {
+		if (left != NULL) {
+			wmr_controller_base_add_to_constellation_tracker((struct wmr_controller_base *)left,
+			                                                 constellation_tracker);
+		}
+		if (right != NULL) {
+			wmr_controller_base_add_to_constellation_tracker((struct wmr_controller_base *)right,
+			                                                 constellation_tracker);
+		}
 	}
 
 	// Use hand tracking if no controllers.

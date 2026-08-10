@@ -19,6 +19,8 @@
 #include "util/u_device.h"
 #include "util/u_logging.h"
 #include "xrt/xrt_device.h"
+#include "tracking/t_constellation.h"
+#include "constellation/t_constellation_tracker.h"
 
 #include "wmr_controller_protocol.h"
 #include "wmr_config.h"
@@ -124,7 +126,35 @@ struct wmr_controller_base
 	struct m_imu_3dof fusion;
 	//! The last angular velocity from the IMU, for prediction.
 	struct xrt_vec3 last_angular_velocity;
+
+	/*!
+	 * Optical LED constellation tracking state (WMR_CONSTELLATION_CONTROLLERS). Only populated
+	 * after a successful @ref wmr_controller_base_add_to_constellation_tracker call; otherwise
+	 * constellation_device_id stays XRT_CONSTELLATION_INVALID_DEVICE_ID and none of this is
+	 * used. Orientation tracking (fusion, above) is entirely unaffected either way.
+	 */
+	struct
+	{
+		//! Backing storage for constellation_led_model.leds, converted once from config.leds.
+		struct t_constellation_tracker_led leds[WMR_MAX_LEDS];
+		struct t_constellation_tracker_led_model led_model;
+		struct t_constellation_tracker_device device;
+		t_constellation_device_id_t device_id;
+		//! NULL unless device_id is valid; used only to remove the device from the tracker on destroy.
+		struct t_constellation_tracker *tracker;
+	} constellation;
 };
+
+/*!
+ * Builds a constellation LED model from this controller's already-parsed factory calibration
+ * (@ref wmr_controller_config.leds) and registers it with @p tracker. No-op if @p tracker is
+ * NULL (WMR_CONSTELLATION_CONTROLLERS off or tracker creation failed) or @p wcb has no LEDs.
+ *
+ * @ingroup drv_wmr
+ */
+void
+wmr_controller_base_add_to_constellation_tracker(struct wmr_controller_base *wcb,
+                                                  struct t_constellation_tracker *tracker);
 
 bool
 wmr_controller_base_init(struct wmr_controller_base *wcb,

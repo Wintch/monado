@@ -557,6 +557,10 @@ wmr_controller_base_deinit(struct wmr_controller_base *wcb)
 {
 	DRV_TRACE_MARKER();
 
+	if (wcb->constellation.tracker != NULL) {
+		t_constellation_tracker_remove_device(wcb->constellation.tracker, wcb->constellation.device_id);
+	}
+
 	// Remove the variable tracking.
 	u_var_remove_root(wcb);
 
@@ -618,6 +622,7 @@ wmr_controller_base_init(struct wmr_controller_base *wcb,
 	wcb->log_level = log_level;
 	wcb->wcc = conn;
 	wcb->receive_bytes = receive_bytes;
+	wcb->constellation.device_id = XRT_CONSTELLATION_INVALID_DEVICE_ID;
 
 	if (controller_type == XRT_DEVICE_TYPE_LEFT_HAND_CONTROLLER) {
 		snprintf(wcb->base.str, ARRAY_SIZE(wcb->base.str), "WMR Left Controller");
@@ -679,4 +684,70 @@ wmr_controller_base_init(struct wmr_controller_base *wcb,
 	wmr_controller_send_bytes(wcb, wmr_controller_imu_on_cmd, sizeof(wmr_controller_imu_on_cmd));
 
 	return true;
+}
+
+//! LED physical size isn't in the WMR calibration JSON (only position + normal) -- this is a
+//! reasonable estimate for the G2 controller ring, not a measured value. Revisit if 0016's
+//! telemetry shows a poor reprojection fit.
+#define WMR_CONSTELLATION_LED_RADIUS_M 0.003f
+#define WMR_CONSTELLATION_LED_VISIBILITY_ANGLE DEG_TO_RAD(75)
+
+//! Placeholder for @ref t_constellation_tracker_device::push_constellation_tracker_sample -- does
+//! nothing yet. Real handling (telemetry storage, live XYZ in the debug GUI) is a later patch;
+//! until then the tracker computes samples but they go nowhere, matching "plumbing only".
+static void
+constellation_sample_noop(struct t_constellation_tracker_device *device, struct t_constellation_tracker_sample *sample)
+{
+	(void)device;
+	(void)sample;
+}
+
+void
+wmr_controller_base_add_to_constellation_tracker(struct wmr_controller_base *wcb,
+                                                 struct t_constellation_tracker *tracker)
+{
+	if (tracker == NULL || wcb->config.led_count == 0) {
+		return;
+	}
+
+	for (int i = 0; i < wcb->config.led_count; i++) {
+		wcb->constellation.leds[i] = (struct t_constellation_tracker_led){
+		    .position = wcb->config.leds[i].pos,
+		    .normal = wcb->config.leds[i].norm,
+		    .radius_m = WMR_CONSTELLATION_LED_RADIUS_M,
+		    .visibility_angle = WMR_CONSTELLATION_LED_VISIBILITY_ANGLE,
+		    .id = i,
+		};
+	}
+
+	wcb->constellation.led_model = (struct t_constellation_tracker_led_model){
+	    .leds = wcb->constellation.leds,
+	    .led_count = (size_t)wcb->config.led_count,
+	    // No custom ring-occlusion model yet -- pose_metrics.c's built-in facing_dot/visibility_angle
+	    // check (same one pssense relies on) is a reasonable first pass. See t_constellation.h's own
+	    // note that WMR's inward-facing ring LEDs are exactly the motivating case for this callback
+	    // if the generic check turns out not to be enough.
+	    .compute_led_visibility = NULL,
+	};
+
+	wcb->constellation.device.push_constellation_tracker_sample = constellation_sample_noop;
+
+	struct t_constellation_tracker_device_params params = {
+	    .led_model = wcb->constellation.led_model,
+	    .tracking_source = NULL,
+	};
+
+	int ret = t_constellation_tracker_add_device(tracker, &params, &wcb->constellation.device,
+	                                             &wcb->constellation.device_id);
+	if (ret != 0) {
+		WMR_WARN(wcb, "Failed to register with constellation tracker, code %d -- stays orientation-only", ret);
+		wcb->constellation.device_id = XRT_CONSTELLATION_INVALID_DEVICE_ID;
+		return;
+	}
+
+	wcb->constellation.tracker = tracker;
+
+	WMR_INFO(wcb, "Registered with constellation tracker (%d LEDs, device id %d) -- telemetry only, no effect "
+	              "on the output pose yet",
+	         wcb->config.led_count, wcb->constellation.device_id);
 }
