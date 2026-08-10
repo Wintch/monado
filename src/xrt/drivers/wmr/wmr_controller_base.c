@@ -529,6 +529,21 @@ wmr_controller_base_get_tracked_pose(struct xrt_device *xdev,
 	} else {
 		pose.position.x = 0.2;
 	}
+
+	// Real position from the constellation tracker (WMR_CONSTELLATION_CONTROLLERS), if the last sample
+	// is fresh. Orientation below always comes from the IMU fusion regardless -- never overwritten by
+	// the constellation solve, which only ever contributes position. Falls back to the placeholder
+	// above (and drops the POSITION_*_BIT flags, exactly like before this patch) if the controller
+	// hasn't been seen by a camera recently, e.g. it's out of view or the feature is off -- a stale
+	// position silently marked "tracked" would be worse than the honest placeholder.
+	static const int64_t WMR_CONSTELLATION_MAX_SAMPLE_AGE_NS = 200000000; // 200ms, ~6 frames at 30fps
+	if (wcb->constellation.tracker != NULL && wcb->constellation.sample_count > 0 &&
+	    at_timestamp_ns - wcb->constellation.last_timestamp_ns < WMR_CONSTELLATION_MAX_SAMPLE_AGE_NS) {
+		pose.position = wcb->constellation.last_pose.position;
+		relation.relation_flags = (enum xrt_space_relation_flags)(
+		    relation.relation_flags | XRT_SPACE_RELATION_POSITION_VALID_BIT |
+		    XRT_SPACE_RELATION_POSITION_TRACKED_BIT);
+	}
 	relation.pose = pose;
 
 	// Copy data while holding the lock.
@@ -751,6 +766,14 @@ wmr_controller_base_add_to_constellation_tracker(struct wmr_controller_base *wcb
 	}
 
 	wcb->constellation.tracker = tracker;
+
+	// Adopt the tracker's own tracking origin (XRT_TRACKING_TYPE_CONSTELLATION), same as pssense/PSVR2
+	// does for the same kind of camera-driven controller tracking. This is what makes the fused
+	// position in wmr_controller_base_get_tracked_pose meaningful in the space graph instead of
+	// composing against the generic placeholder origin u_builder_setup_tracking_origins hands out to
+	// XRT_TRACKING_TYPE_NONE devices -- see that function for the y=1.3 placeholder this replaces.
+	wcb->base.tracking_origin = t_constellation_tracker_get_tracking_origin(tracker);
+	wcb->base.supported.position_tracking = true;
 
 	u_var_add_gui_header(wcb, NULL, "Constellation tracking (telemetry only)");
 	u_var_add_ro_u64(wcb, &wcb->constellation.sample_count, "constellation.sample_count");
