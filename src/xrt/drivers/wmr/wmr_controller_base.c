@@ -720,6 +720,16 @@ constellation_sample_store(struct t_constellation_tracker_device *device, struct
 	wcb->constellation.last_timestamp_ns = sample->timestamp_ns;
 	wcb->constellation.last_metrics = sample->metrics;
 	wcb->constellation.sample_count++;
+
+	// Throttled to ~2/s at 30fps so this is readable in the log without needing the debug GUI.
+	if (wcb->constellation.sample_count % 15 == 0) {
+		WMR_INFO(wcb,
+		        "constellation sample #%llu: pos=(%.3f, %.3f, %.3f) matched_blobs=%u "
+		        "visible_leds=%u reproj_err_px=%.2f",
+		        (unsigned long long)wcb->constellation.sample_count, sample->pose.position.x,
+		        sample->pose.position.y, sample->pose.position.z, sample->metrics.matched_blob_count,
+		        sample->metrics.visible_led_count, sample->metrics.reprojection_error);
+	}
 }
 
 void
