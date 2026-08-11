@@ -556,13 +556,23 @@ wmr_controller_base_get_tracked_pose(struct xrt_device *xdev,
 	// No prediction needed.
 	if (at_timestamp_ns < last_imu_timestamp_ns) {
 		*out_relation = relation;
-		return XRT_SUCCESS;
+	} else {
+		int64_t prediction_ns = at_timestamp_ns - last_imu_timestamp_ns;
+		double prediction_s = time_ns_to_s(prediction_ns);
+
+		m_predict_relation(&relation, prediction_s, out_relation);
 	}
 
-	int64_t prediction_ns = at_timestamp_ns - last_imu_timestamp_ns;
-	double prediction_s = time_ns_to_s(prediction_ns);
-
-	m_predict_relation(&relation, prediction_s, out_relation);
+	// Throttled log of what this function actually hands back to the app -- as opposed to
+	// constellation_sample_store's log of the tracker's internal telemetry -- so 0017 can be verified
+	// from the real output, not just the solver's own bookkeeping. ~once/sec at typical 90Hz polling.
+	static uint64_t get_tracked_pose_call_count = 0;
+	if (++get_tracked_pose_call_count % 90 == 0) {
+		bool pos_tracked = (out_relation->relation_flags & XRT_SPACE_RELATION_POSITION_TRACKED_BIT) != 0;
+		WMR_INFO(wcb, "get_tracked_pose: pos=(%.3f, %.3f, %.3f) position_tracked=%s",
+		        out_relation->pose.position.x, out_relation->pose.position.y,
+		        out_relation->pose.position.z, pos_tracked ? "yes" : "no (placeholder)");
+	}
 
 	return XRT_SUCCESS;
 }
