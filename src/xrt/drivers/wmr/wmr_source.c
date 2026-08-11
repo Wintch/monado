@@ -46,6 +46,20 @@
 DEBUG_GET_ONCE_LOG_OPTION(wmr_log, "WMR_LOG", U_LOGGING_INFO)
 
 /*!
+ * Per-camera controller-tracking timestamp-fix sink. `base` must be the first member: this is
+ * what makes `container_of` in @ref receive_ctrl_cam safe to use on an element of an array of
+ * these -- unlike computing `container_of` straight from `struct wmr_source::ctrl_ts_fix_sinks`
+ * (the bug this replaces), each instance here is its own object, so offsetof(base) is the same
+ * fixed 0 no matter which array slot the instance lives in.
+ */
+struct wmr_ctrl_ts_fix_sink
+{
+	struct xrt_frame_sink base;
+	struct wmr_source *ws;
+	struct xrt_frame_sink *downstream; //!< Real blobwatch chain entry point
+};
+
+/*!
  * Handles all the data sources from the WMR driver
  *
  * @todo Currently only properly handling tracking cameras, move IMU and other sources here
@@ -78,9 +92,8 @@ struct wmr_source
 	// forwarding frames, but this ctrl path never did -- so constellation sample timestamps stayed in the raw
 	// hardware clock while get_tracked_pose compares against os_monotonic_get_ns(), a ~44.5M ms mismatch
 	// confirmed live tonight (get_tracked_pose log: position_tracked=no, delta_ms in the tens of millions).
-	// These two arrays let receive_ctrl_cam apply the same correction before frames reach blobwatch.
-	struct xrt_frame_sink ctrl_ts_fix_sinks[WMR_MAX_CAMERAS];       //!< Applies +cam_hw2mono, then forwards
-	struct xrt_frame_sink *ctrl_ts_fix_downstream[WMR_MAX_CAMERAS]; //!< Real blobwatch chain entry point
+	// This array lets receive_ctrl_cam apply the same correction before frames reach blobwatch.
+	struct wmr_ctrl_ts_fix_sink ctrl_ts_fix_sinks[WMR_MAX_CAMERAS];
 
 	bool is_running;              //!< Whether the device is streaming
 	bool first_imu_received;      //!< Don't send frames until first IMU sample
@@ -125,16 +138,20 @@ void (*receive_cam[WMR_MAX_CAMERAS])(struct xrt_frame_sink *, struct xrt_frame *
 };
 
 //! EXPERIMENT 2026-08-11: mirrors receive_cam0..3's "xf->timestamp += ws->cam_hw2mono" for the
-//! controller-tracking path, which never had it. Index is recovered via pointer arithmetic on
-//! ws->ctrl_ts_fix_sinks since, unlike the per-camera SLAM macro, one function serves all cameras.
+//! controller-tracking path, which never had it. One function serves all cameras, so `ws` and the
+//! real downstream sink are recovered via container_of on the per-camera wmr_ctrl_ts_fix_sink
+//! instance itself (see its doc comment) -- NOT by indexing into wmr_source's array directly,
+//! which was tonight's actual bug: container_of only recovers the enclosing struct correctly when
+//! `sink` points at the start of the named field, and for camera index i>0 it instead pointed
+//! i*sizeof(xrt_frame_sink) bytes into the array, silently reading garbage for every camera but 0.
 static void
 receive_ctrl_cam(struct xrt_frame_sink *sink, struct xrt_frame *xf)
 {
-	struct wmr_source *ws = container_of(sink, struct wmr_source, ctrl_ts_fix_sinks);
-	ptrdiff_t cam_id = sink - ws->ctrl_ts_fix_sinks;
+	struct wmr_ctrl_ts_fix_sink *self = container_of(sink, struct wmr_ctrl_ts_fix_sink, base);
+	struct wmr_source *ws = self->ws;
 
 	xf->timestamp += ws->cam_hw2mono;
-	xrt_sink_push_frame(ws->ctrl_ts_fix_downstream[cam_id], xf);
+	xrt_sink_push_frame(self->downstream, xf);
 }
 
 static void
@@ -391,9 +408,10 @@ wmr_source_create(struct xrt_frame_context *xfctx,
 		// EXPERIMENT 2026-08-11: apply the same hw->mono clock correction the SLAM cam_sinks path gets
 		// (see receive_cam0..3) before frames reach blobwatch, so constellation sample timestamps end up
 		// in the same clock domain get_tracked_pose compares against. See the struct field comments.
-		ws->ctrl_ts_fix_downstream[i] = frame_sink;
-		ws->ctrl_ts_fix_sinks[i].push_frame = receive_ctrl_cam;
-		ctrl_cam_sinks[i] = &ws->ctrl_ts_fix_sinks[i];
+		ws->ctrl_ts_fix_sinks[i].base.push_frame = receive_ctrl_cam;
+		ws->ctrl_ts_fix_sinks[i].ws = ws;
+		ws->ctrl_ts_fix_sinks[i].downstream = frame_sink;
+		ctrl_cam_sinks[i] = &ws->ctrl_ts_fix_sinks[i].base;
 	}
 
 	struct wmr_camera_open_config options = {
