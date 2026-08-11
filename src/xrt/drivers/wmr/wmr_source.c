@@ -74,6 +74,13 @@ struct wmr_source
 
 	// Controller-tracking (constellation) frames: blob detection only for now, debug-only, no tracker wired yet
 	struct u_sink_debug ctrl_blob_debug_sinks[WMR_MAX_CAMERAS]; //!< Sink to display detected LED blobs in UI
+	// EXPERIMENT 2026-08-11: the SLAM cam_sinks path applies +cam_hw2mono (see receive_cam0..3 below) before
+	// forwarding frames, but this ctrl path never did -- so constellation sample timestamps stayed in the raw
+	// hardware clock while get_tracked_pose compares against os_monotonic_get_ns(), a ~44.5M ms mismatch
+	// confirmed live tonight (get_tracked_pose log: position_tracked=no, delta_ms in the tens of millions).
+	// These two arrays let receive_ctrl_cam apply the same correction before frames reach blobwatch.
+	struct xrt_frame_sink ctrl_ts_fix_sinks[WMR_MAX_CAMERAS];       //!< Applies +cam_hw2mono, then forwards
+	struct xrt_frame_sink *ctrl_ts_fix_downstream[WMR_MAX_CAMERAS]; //!< Real blobwatch chain entry point
 
 	bool is_running;              //!< Whether the device is streaming
 	bool first_imu_received;      //!< Don't send frames until first IMU sample
@@ -116,6 +123,19 @@ void (*receive_cam[WMR_MAX_CAMERAS])(struct xrt_frame_sink *, struct xrt_frame *
     receive_cam2, //
     receive_cam3, //
 };
+
+//! EXPERIMENT 2026-08-11: mirrors receive_cam0..3's "xf->timestamp += ws->cam_hw2mono" for the
+//! controller-tracking path, which never had it. Index is recovered via pointer arithmetic on
+//! ws->ctrl_ts_fix_sinks since, unlike the per-camera SLAM macro, one function serves all cameras.
+static void
+receive_ctrl_cam(struct xrt_frame_sink *sink, struct xrt_frame *xf)
+{
+	struct wmr_source *ws = container_of(sink, struct wmr_source, ctrl_ts_fix_sinks);
+	ptrdiff_t cam_id = sink - ws->ctrl_ts_fix_sinks;
+
+	xf->timestamp += ws->cam_hw2mono;
+	xrt_sink_push_frame(ws->ctrl_ts_fix_downstream[cam_id], xf);
+}
 
 static void
 receive_imu_sample(struct xrt_imu_sink *sink, struct xrt_imu_sample *s)
@@ -368,7 +388,12 @@ wmr_source_create(struct xrt_frame_context *xfctx,
 			continue;
 		}
 
-		ctrl_cam_sinks[i] = frame_sink;
+		// EXPERIMENT 2026-08-11: apply the same hw->mono clock correction the SLAM cam_sinks path gets
+		// (see receive_cam0..3) before frames reach blobwatch, so constellation sample timestamps end up
+		// in the same clock domain get_tracked_pose compares against. See the struct field comments.
+		ws->ctrl_ts_fix_downstream[i] = frame_sink;
+		ws->ctrl_ts_fix_sinks[i].push_frame = receive_ctrl_cam;
+		ctrl_cam_sinks[i] = &ws->ctrl_ts_fix_sinks[i];
 	}
 
 	struct wmr_camera_open_config options = {

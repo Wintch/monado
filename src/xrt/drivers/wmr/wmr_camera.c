@@ -37,8 +37,13 @@ DEBUG_GET_ONCE_BOOL_OPTION(wmr_autoexposure, "WMR_AUTOEXPOSURE", true)
 //! Specifies whether the user wants to use the same exp/gain values for all cameras
 DEBUG_GET_ONCE_BOOL_OPTION(wmr_unify_expgain, "WMR_UNIFY_EXPGAIN", false)
 
+//! Mirrors the option of the same name in wmr_hmd.c -- this is unvalidated, opt-in only.
+DEBUG_GET_ONCE_BOOL_OPTION(wmr_constellation_controllers, "WMR_CONSTELLATION_CONTROLLERS", false)
+
 static int
 update_expgain(struct wmr_camera *cam, struct xrt_frame **frames);
+static int
+wmr_camera_set_ctrl_exposure_gain(struct wmr_camera *cam, uint8_t camera_id, uint16_t exposure, uint8_t gain);
 
 /*
  *
@@ -61,6 +66,21 @@ update_expgain(struct wmr_camera *cam, struct xrt_frame **frames);
 #define WMR_CAMERA_CMD_OFF 0x82
 
 #define DEFAULT_EXPOSURE 6000
+/*
+ * Controller-tracking frames want a very short exposure and minimum gain: the point is to see
+ * the controllers' own (visible-light) LEDs as isolated bright points and essentially nothing
+ * else. Values from thaytan's dev-constellation-controller-tracking branch, which is the
+ * reference implementation for WMR constellation tracking.
+ *
+ * This is also why WMR controller tracking works in a dark room and why using these headsets
+ * in direct sunlight is advised against: the exposure is chosen so that only the LEDs stand
+ * out, so ambient light is irrelevant until it is bright enough to swamp them.
+ */
+// EXPERIMENT 2026-08-11: thaytan's values (400/1) read back as exposure=20 on this hardware once
+// the +2 slot fix landed -- still a fully black debug panel. Trying much higher values to check
+// whether this is simply an amplitude problem before doubting the slot mapping itself.
+#define DEFAULT_CTRL_EXPOSURE 6000
+#define DEFAULT_CTRL_GAIN 100
 #define DEFAULT_GAIN 127
 
 #define WMR_FRAMETYPE_SLAM 0x0
@@ -535,6 +555,34 @@ wmr_camera_open(struct wmr_camera_open_config *config)
 		ceg->aeg = u_autoexpgain_create(U_AEG_STRATEGY_TRACKING, enable_aeg, frame_delay);
 	}
 
+	/*
+	 * Exposure/gain for the controller-tracking frames, which is a SEPARATE set of hardware
+	 * slots from the SLAM ones set in update_expgain(). Without this the controller frames
+	 * keep whatever the sensor defaults to, which on a Reverb G2 is a completely black image
+	 * even with the controllers' LEDs plainly lit and clearly visible in the SLAM stream.
+	 *
+	 * The slot mapping is the uncertain part. thaytan's branch has this as `camera_id + 2`,
+	 * which is right for a two-camera headset (slots 0-1 SLAM, 2-3 controller) but would land
+	 * on real SLAM cameras on the four-camera G2. Generalised here to + tcam_count, which
+	 * reduces to thaytan's constant in the two-camera case. NOTE that his version of this loop
+	 * is `for (i = cam->tcam_count; i < cam->tcam_count; i++)`, which never executes, so the
+	 * mapping has almost certainly never run on any hardware -- treat it as a hypothesis under
+	 * test, not a port. Acceptance is visual and immediate: "Controller Tracking Streams" in
+	 * the debug GUI must stop being black and show the LED points, and "SLAM Tracking Streams"
+	 * must be unchanged. If the SLAM view degrades, the mapping is wrong: revert.
+	 */
+	if (debug_get_bool_option_wmr_constellation_controllers()) {
+		for (int i = 0; i < cam->tcam_count; i++) {
+			const struct wmr_camera_config *config = &cam->tcam_confs[i];
+			bool status = wmr_camera_set_ctrl_exposure_gain(cam, config->location, DEFAULT_CTRL_EXPOSURE,
+			                                               DEFAULT_CTRL_GAIN);
+			if (status != 0) {
+				WMR_CAM_ERROR(cam, "Failed to set controller-tracking exposure and gain for camera %d",
+				              i);
+			}
+		}
+	}
+
 	u_sink_debug_init(&cam->debug_sinks[WMR_DEBUG_SINK_SLAM]);
 	u_sink_debug_init(&cam->debug_sinks[WMR_DEBUG_SINK_CONTROLLER]);
 	u_var_add_root(cam, "WMR Camera", true);
@@ -748,6 +796,17 @@ update_expgain(struct wmr_camera *cam, struct xrt_frame **frames)
 		res |= status;
 	}
 	return res;
+}
+
+//! Same command, but addressing the controller-tracking exposure slots instead of the SLAM ones.
+static int
+wmr_camera_set_ctrl_exposure_gain(struct wmr_camera *cam, uint8_t camera_id, uint16_t exposure, uint8_t gain)
+{
+	// EXPERIMENT 2026-08-11: +tcam_count (the generalised mapping) sends successfully but the
+	// frametype-2 exposure readback stays 0 regardless. Trying thaytan's original hardcoded
+	// +2 literally instead of scaling by tcam_count, since this hardware's real camera
+	// location IDs are 0,1,4,5 (not contiguous 0-3) -- a flat +2 lands on 2,3,6,7, untested.
+	return wmr_camera_set_exposure_gain(cam, camera_id + 2, exposure, gain);
 }
 
 int

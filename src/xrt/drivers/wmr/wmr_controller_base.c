@@ -576,8 +576,13 @@ wmr_controller_base_get_tracked_pose(struct xrt_device *xdev,
 	// Throttled log of what this function actually hands back to the app -- as opposed to
 	// constellation_sample_store's log of the tracker's internal telemetry -- so 0017 can be verified
 	// from the real output, not just the solver's own bookkeeping. ~once/sec at typical 90Hz polling.
+	// EXPERIMENT 2026-08-11: the original throttle used a function-local `static` counter, which is ONE
+	// instance shared across every wcb (left AND right controller both call this function), so it only
+	// ever fired for whichever device's calls happened to land on the modulo boundary -- silently hiding
+	// the other controller's output the whole time. Gate on this device's OWN sample_count instead.
 	static uint64_t get_tracked_pose_call_count = 0;
-	if (++get_tracked_pose_call_count % 90 == 0) {
+	++get_tracked_pose_call_count;
+	if (wcb->constellation.sample_count > 0 && wcb->constellation.sample_count % 30 == 0) {
 		bool pos_tracked = (out_relation->relation_flags & XRT_SPACE_RELATION_POSITION_TRACKED_BIT) != 0;
 		WMR_INFO(wcb,
 		        "get_tracked_pose: pos=(%.3f, %.3f, %.3f) position_tracked=%s at_ts=%lld "

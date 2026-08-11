@@ -734,6 +734,16 @@ Camera::pushPose(CameraSample &camera_sample,
 	    .average_brightness = average_brightness, // @todo compute this
 	    .metrics = metrics,
 	};
+	// KNOWN ISSUE, found 2026-08-11, NOT understood: at this exact point, sample.timestamp_ns is
+	// consistently correct (hw2mono-adjusted, matching Monado's host clock) for one device_id and
+	// consistently raw/uncorrected (device hardware clock) for another, deterministically -- confirmed
+	// with a temporary per-call trace, not a transient or a race. Both devices reach this same code
+	// path via the same Camera::pushPose, from the same camera_sample.timestamp_ns assigned once in
+	// CameraSample's constructor (t_constellation_tracker.cpp), which is itself fed by receive_ctrl_cam's
+	// "xf->timestamp += ws->cam_hw2mono" (wmr_source.c) -- so whatever the mechanism is, it depends on
+	// something about the device/camera pairing, not a simple missing conversion. This is why
+	// get_tracked_pose's freshness check still fails for at least one controller even with both the
+	// exposure fix and this clock fix applied. See docs/pruebas.jsonl for the full trace.
 	t_constellation_tracker_device_push_sample(device->device, &sample);
 
 	{
