@@ -537,8 +537,18 @@ wmr_controller_base_get_tracked_pose(struct xrt_device *xdev,
 	// hasn't been seen by a camera recently, e.g. it's out of view or the feature is off -- a stale
 	// position silently marked "tracked" would be worse than the honest placeholder.
 	static const int64_t WMR_CONSTELLATION_MAX_SAMPLE_AGE_NS = 200000000; // 200ms, ~6 frames at 30fps
+	int64_t constellation_sample_age_ns = at_timestamp_ns - wcb->constellation.last_timestamp_ns;
+	if (constellation_sample_age_ns < 0) {
+		constellation_sample_age_ns = -constellation_sample_age_ns;
+	}
+	// Absolute value: the constellation tracker's blob-observation timestamps and Monado's own
+	// at_timestamp_ns aren't guaranteed to be in the same clock domain (observed the sample's
+	// timestamp reading several seconds AHEAD of at_timestamp_ns in testing) -- a plain "is it in the
+	// past and recent" check let a frozen, stale sample pass as fresh for 6+ seconds straight because
+	// the negative delta was trivially less than the threshold. Treat "suspiciously far in either
+	// direction" as equally stale.
 	if (wcb->constellation.tracker != NULL && wcb->constellation.sample_count > 0 &&
-	    at_timestamp_ns - wcb->constellation.last_timestamp_ns < WMR_CONSTELLATION_MAX_SAMPLE_AGE_NS) {
+	    constellation_sample_age_ns < WMR_CONSTELLATION_MAX_SAMPLE_AGE_NS) {
 		pose.position = wcb->constellation.last_pose.position;
 		relation.relation_flags = (enum xrt_space_relation_flags)(
 		    relation.relation_flags | XRT_SPACE_RELATION_POSITION_VALID_BIT |
