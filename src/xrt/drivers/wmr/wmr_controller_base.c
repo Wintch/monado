@@ -569,9 +569,14 @@ wmr_controller_base_get_tracked_pose(struct xrt_device *xdev,
 	static uint64_t get_tracked_pose_call_count = 0;
 	if (++get_tracked_pose_call_count % 90 == 0) {
 		bool pos_tracked = (out_relation->relation_flags & XRT_SPACE_RELATION_POSITION_TRACKED_BIT) != 0;
-		WMR_INFO(wcb, "get_tracked_pose: pos=(%.3f, %.3f, %.3f) position_tracked=%s",
+		WMR_INFO(wcb,
+		        "get_tracked_pose: pos=(%.3f, %.3f, %.3f) position_tracked=%s at_ts=%lld "
+		        "last_sample_ts=%lld delta_ms=%.1f sample_count=%llu",
 		        out_relation->pose.position.x, out_relation->pose.position.y,
-		        out_relation->pose.position.z, pos_tracked ? "yes" : "no (placeholder)");
+		        out_relation->pose.position.z, pos_tracked ? "yes" : "no (placeholder)",
+		        (long long)at_timestamp_ns, (long long)wcb->constellation.last_timestamp_ns,
+		        (double)(at_timestamp_ns - wcb->constellation.last_timestamp_ns) / 1e6,
+		        (unsigned long long)wcb->constellation.sample_count);
 	}
 
 	return XRT_SUCCESS;
