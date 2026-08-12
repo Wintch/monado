@@ -87,6 +87,9 @@ DEBUG_GET_ONCE_BOOL_OPTION(slam_submit_from_start, "SLAM_SUBMIT_FROM_START", fal
 DEBUG_GET_ONCE_NUM_OPTION(slam_openvr_groundtruth_device, "SLAM_OPENVR_GROUNDTRUTH_DEVICE", 0)
 DEBUG_GET_ONCE_NUM_OPTION(slam_prediction_type, "SLAM_PREDICTION_TYPE", long(SLAM_PRED_DEAD_RECKONING))
 DEBUG_GET_ONCE_BOOL_OPTION(slam_write_csvs, "SLAM_WRITE_CSVS", false)
+DEBUG_GET_ONCE_BOOL_OPTION(slam_features_enable, "SLAM_FEATURES_ENABLE", false)
+DEBUG_GET_ONCE_BOOL_OPTION(euroc_record, "EUROC_RECORD", false)
+DEBUG_GET_ONCE_OPTION(euroc_record_path, "EUROC_RECORD_PATH", nullptr)
 DEBUG_GET_ONCE_OPTION(slam_csv_path, "SLAM_CSV_PATH", "evaluation/")
 DEBUG_GET_ONCE_BOOL_OPTION(slam_timing_stat, "SLAM_TIMING_STAT", true)
 DEBUG_GET_ONCE_BOOL_OPTION(slam_features_stat, "SLAM_FEATURES_STAT", true)
@@ -590,6 +593,25 @@ features_ui_setup(TrackerSlam &t)
 	}
 
 	u_var_add_curves(&t, &t.features.fcs_ui, "Feature count");
+
+	// SLAM_FEATURES_ENABLE=1 turns the per-frame feature counts on without the debug GUI, so
+	// "is the visual front-end tracking anything at all?" can be answered from features.csv.
+	if (debug_get_bool_option_slam_features_enable()) {
+		if (!t.exts.has_pose_features) {
+			SLAM_WARN("SLAM_FEATURES_ENABLE set but the tracker has no pose-features extension");
+		} else {
+			vit_result_t vres =
+			    t.vit.tracker_enable_extension(t.tracker, VIT_TRACKER_EXTENSION_POSE_FEATURES, true);
+			if (vres != VIT_SUCCESS) {
+				SLAM_ERROR("Failed to enable the tracker features extension (%d)", vres);
+			} else {
+				t.features.enabled = true;
+				snprintf(t.features.enable_btn.label, sizeof(t.features.enable_btn.label), "%s",
+				         "[ON] Disable features info");
+				SLAM_INFO("Feature counts enabled via SLAM_FEATURES_ENABLE");
+			}
+		}
+	}
 }
 
 static vector<int>
@@ -1521,7 +1543,10 @@ t_slam_create(struct xrt_frame_context *xfctx,
 
 	xrt_frame_context_add(xfctx, &t.node);
 
-	t.euroc_recorder = euroc_recorder_create(xfctx, NULL, t.cam_count, false);
+	// EUROC_RECORD=1 starts the EuRoC dataset recorder without needing the debug GUI, so a
+	// dataset can be captured headlessly and replayed later through the euroc driver.
+	t.euroc_recorder = euroc_recorder_create(xfctx, debug_get_option_euroc_record_path(), t.cam_count,
+	                                         debug_get_bool_option_euroc_record());
 
 	t.last_imu_ts = INT64_MIN;
 	t.last_cam_ts = vector<timepoint_ns>(t.cam_count, INT64_MIN);
