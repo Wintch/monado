@@ -88,6 +88,7 @@ DEBUG_GET_ONCE_NUM_OPTION(slam_openvr_groundtruth_device, "SLAM_OPENVR_GROUNDTRU
 DEBUG_GET_ONCE_NUM_OPTION(slam_prediction_type, "SLAM_PREDICTION_TYPE", long(SLAM_PRED_DEAD_RECKONING))
 DEBUG_GET_ONCE_BOOL_OPTION(slam_write_csvs, "SLAM_WRITE_CSVS", false)
 DEBUG_GET_ONCE_BOOL_OPTION(slam_features_enable, "SLAM_FEATURES_ENABLE", false)
+DEBUG_GET_ONCE_BOOL_OPTION(slam_config_pipeline_only, "SLAM_CONFIG_PIPELINE_ONLY", false)
 DEBUG_GET_ONCE_BOOL_OPTION(euroc_record, "EUROC_RECORD", false)
 DEBUG_GET_ONCE_OPTION(euroc_record_path, "EUROC_RECORD_PATH", nullptr)
 DEBUG_GET_ONCE_OPTION(slam_csv_path, "SLAM_CSV_PATH", "evaluation/")
@@ -1512,9 +1513,18 @@ t_slam_create(struct xrt_frame_context *xfctx,
 
 	t.base.get_tracked_pose = t_slam_get_tracked_pose;
 
+	// SLAM_CONFIG is normally all-or-nothing: pass a file and the driver's calibration is no
+	// longer sent, so tuning one pipeline parameter means hand-writing the whole device
+	// calibration in the tracker's own format first. SLAM_CONFIG_PIPELINE_ONLY=1 says the file
+	// carries pipeline settings only, and keeps the driver calibration -- which is what makes a
+	// config sweep against real hardware a one-line change per run instead of a project.
+	bool pipeline_only = debug_get_bool_option_slam_config_pipeline_only();
 	if (!config_file) {
 		SLAM_INFO("Using calibration from driver and default pipeline settings");
 		send_calibration(t, *config->slam_calib); // Not null because of `some_calib`
+	} else if (pipeline_only && some_calib) {
+		SLAM_INFO("Using calibration from driver and pipeline settings from the SLAM_CONFIG file");
+		send_calibration(t, *config->slam_calib);
 	} else {
 		SLAM_INFO("Using sensor calibration provided by the SLAM_CONFIG file");
 	}
