@@ -1433,6 +1433,49 @@ wmr_hmd_fill_slam_cams_calibration(struct wmr_hmd *wh)
 }
 
 /*!
+ * Where the constellation tracker asks "where was the headset at time T", so it can place the
+ * head-mounted cameras in the world before solving for a controller.
+ *
+ * Without this the mosaic has no tracking origin and CameraMosaic::getTrackingOriginPose returns
+ * XRT_POSE_IDENTITY -- the tracker then assumes the headset never moves and never turns, so every
+ * controller position comes out in a frame bolted to the IMU's initial orientation instead of the
+ * world. Measured 2026-08-12: controllers tracked and displaced correctly in all three axes, but
+ * along visibly wrong axes, and turning the head did not carry them.
+ *
+ * Two details this has to get right:
+ *
+ * - The tracker discards the observation unless BOTH position and orientation are valid
+ *   (getTrackingOriginPose -> std::nullopt). With a 3dof head there is no valid position, but in
+ *   that mode the headset IS the fixed origin, so (0,0,0) is the honest answer rather than a
+ *   missing one -- and orientation, the part that was missing entirely, is real either way.
+ * - Orientation is NOT forced: if the fusion has not produced a valid one yet, an identity
+ *   quaternion would silently claim the head is facing forward. Leave the flags clear and let the
+ *   tracker skip the frame.
+ */
+static void
+wmr_hmd_constellation_tracking_source_get_tracked_pose(struct t_constellation_tracker_tracking_source *tracking_source,
+                                                       int64_t when_ns,
+                                                       struct xrt_space_relation *out_relation)
+{
+	struct wmr_hmd *wh = container_of(tracking_source, struct wmr_hmd, tracking.constellation_tracking_source);
+
+	*out_relation = (struct xrt_space_relation)XRT_SPACE_RELATION_ZERO;
+
+	xrt_result_t xret = wmr_hmd_get_tracked_pose(&wh->base, XRT_INPUT_GENERIC_HEAD_POSE, when_ns, out_relation);
+	if (xret != XRT_SUCCESS ||
+	    (out_relation->relation_flags & XRT_SPACE_RELATION_ORIENTATION_VALID_BIT) == 0) {
+		*out_relation = (struct xrt_space_relation)XRT_SPACE_RELATION_ZERO;
+		return;
+	}
+
+	if ((out_relation->relation_flags & XRT_SPACE_RELATION_POSITION_VALID_BIT) == 0) {
+		out_relation->pose.position = (struct xrt_vec3){0.f, 0.f, 0.f};
+		out_relation->relation_flags = (enum xrt_space_relation_flags)(
+		    out_relation->relation_flags | XRT_SPACE_RELATION_POSITION_VALID_BIT);
+	}
+}
+
+/*!
  * Builds a constellation-tracker camera mosaic from the same per-camera intrinsics/extrinsics
  * SLAM already uses (@ref wmr_hmd_fill_slam_cams_calibration), and creates the tracker. Indexed
  * in raw USB frame order (0..tcam_count-1), matching @ref wmr_camera_open_config.ctrl_cam_sinks
@@ -1455,6 +1498,12 @@ wmr_hmd_create_constellation_tracker(struct wmr_hmd *wh)
 	    .num_mosaics = 1,
 	};
 	struct t_constellation_tracker_camera_mosaic *mosaic = &params.mosaics[0];
+
+	// The cameras below are given IMU-relative poses; this is what the tracker composes them with
+	// to get where they actually are in the world each frame.
+	wh->tracking.constellation_tracking_source.get_tracked_pose =
+	    wmr_hmd_constellation_tracking_source_get_tracked_pose;
+	mosaic->tracking_origin = &wh->tracking.constellation_tracking_source;
 
 	for (int i = 0; i < wh->config.tcam_count && i < XRT_TRACKING_MAX_CAMS; i++) {
 		struct xrt_pose P_imu_ci;

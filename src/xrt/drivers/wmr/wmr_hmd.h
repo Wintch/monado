@@ -158,6 +158,14 @@ struct wmr_hmd
 		//! wmr_hmd_config.tcams. Entries beyond the tracker's camera count are NULL. Only valid when
 		//! @ref constellation_tracker is non-NULL.
 		struct t_blob_sink *constellation_cam_blob_sinks[WMR_MAX_CAMERAS];
+
+		/*!
+		 * Where the constellation tracker gets the headset's own pose from, so it can place the
+		 * head-mounted cameras in the world. The mosaic's cameras are given IMU-relative poses; this
+		 * is what turns those into world poses every frame. See @ref
+		 * wmr_hmd_constellation_tracking_source_get_tracked_pose.
+		 */
+		struct t_constellation_tracker_tracking_source constellation_tracking_source;
 	} tracking;
 
 	//! Whether to track the HMD with 6dof SLAM or fallback to the `fusion` 3dof tracker
