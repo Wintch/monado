@@ -45,6 +45,16 @@
 
 DEBUG_GET_ONCE_LOG_OPTION(wmr_log, "WMR_LOG", U_LOGGING_INFO)
 
+//! Largest backwards step in the converted IMU timeline still treated as clock-offset jitter
+//! rather than a real discontinuity. Measured 2026-08-12 over one session: 281 backwards events,
+//! p50 3.3 ms, p99 14.7 ms, max 17.3 ms. A device-clock restart looks nothing like this -- the
+//! one measured was 8.23 s -- so this threshold separates the two cleanly with room to spare.
+#define IMU_JITTER_MAX_NS (20 * 1000 * 1000)
+
+//! How far past the last accepted timestamp a floored sample is placed. Small enough to barely
+//! disturb the integrator, large enough to keep strict ordering (the sample period is ~4 ms).
+#define IMU_MIN_STEP_NS (250 * 1000)
+
 /*!
  * Per-camera controller-tracking timestamp-fix sink. `base` must be the first member: this is
  * what makes `container_of` in @ref receive_ctrl_cam safe to use on an element of an array of
@@ -98,6 +108,9 @@ struct wmr_source
 	bool is_running;              //!< Whether the device is streaming
 	bool first_imu_received;      //!< Don't send frames until first IMU sample
 	timepoint_ns last_imu_ns;     //!< Last timepoint received.
+	uint64_t imu_dropped_run;     //!< IMU samples dropped in the current out-of-order burst
+	uint64_t imu_dropped_total;   //!< IMU samples dropped since startup (link/clock health)
+	uint64_t imu_stabilised_total; //!< IMU samples saved by flooring instead of dropping
 	time_duration_ns hw2mono;     //!< Estimated offset from IMU to monotonic clock
 	time_duration_ns cam_hw2mono; //!< Caches hw2mono for use in the full frame bundle
 };
@@ -166,14 +179,89 @@ receive_imu_sample(struct xrt_imu_sink *sink, struct xrt_imu_sample *s)
 	timepoint_ns now_mono = (timepoint_ns)os_monotonic_get_ns();
 	timepoint_ns ts = m_clock_offset_a2b(IMU_FREQ, now_hw, now_mono, &ws->hw2mono);
 
+	// TRIED AND REVERTED (2026-08-12): swapping this for m_clock_windowed_skew_tracker, the
+	// windowed minimum-skew estimator already in this tree (and already used by the Rift
+	// driver), documented as microsecond-accurate "even in the presence of 10s of milliseconds
+	// of jitter". It did exactly what it promises -- IMU samples rejected as "from the past"
+	// went from ~24/s to ZERO, camera bundle drops likewise -- and the tracking got WORSE, not
+	// better: static drift at 60 s went from 0.7-1.0 m to 243 m and 1002 m on two consecutive
+	// runs. So the dropped samples were never what limited accuracy. Untested hypothesis for
+	// why it hurts: to_local maps through a fitted offset+skew line, so a slightly wrong slope
+	// scales EVERY inter-sample dt, and a systematic dt bias gets integrated twice; the simple
+	// filter's offset is near-constant over short spans and preserves the true hardware dt even
+	// while its absolute offset is noisier. Do not re-apply it without measuring drift, not
+	// just the drop counters.
 	/*
 	 * Check if the timepoint does time travel, we get one or two
 	 * old samples when the device has not been cleanly shut down.
+	 *
+	 * The comment above says "one or two". Measured on a Reverb G2 on 2026-08-12, over a
+	 * 17-minute session: 17997 samples dropped here, about 7% of the whole IMU stream, in a
+	 * continuous trickle plus bursts -- one of which was a sustained 8.23 s backwards jump,
+	 * i.e. 8 seconds during which EVERY sample was dropped and the tracker got nothing.
+	 * That burst is what turned a SLAM session that had been holding 0.8 m of drift for ten
+	 * minutes into a 1000 km runaway. So this is not a shutdown curiosity on this hardware,
+	 * it is a routine, load- and USB-jitter-driven condition: hw2mono is estimated from
+	 * os_monotonic_get_ns() at arrival, so anything that perturbs when samples arrive
+	 * perturbs the estimate, and a marginal link does exactly that.
+	 *
+	 * Keep dropping (the sample really is out of order), but count it and make the counting
+	 * visible. The old message logged one line per dropped sample -- 18k lines of noise that
+	 * hid the shape of the problem rather than showing it -- and its "diff" was computed
+	 * against the raw hardware timestamp instead of the converted one, so it printed
+	 * nonsense like 18446744065481226985 (an unsigned underflow) and its "last" field was
+	 * the new sample's own raw value.
 	 */
+	//
+	// Before dropping, try to save the sample. The thing that moved is the *estimated offset*,
+	// not the device clock: the hardware timestamps arrive monotonic, and hw2mono is re-fitted
+	// on every sample from os_monotonic_get_ns() at arrival time, so USB jitter and scheduling
+	// delay push the fit around by a few milliseconds. Measured over one session: 281 backwards
+	// events, p50 3.3 ms, p99 14.7 ms, max 17.3 ms -- all jitter, no real discontinuity.
+	//
+	// Push the sample just past the last accepted timestamp instead of throwing it away. That
+	// costs one sample's worth of compressed dt and keeps the measurement; dropping loses the
+	// measurement AND leaves a hole. Only the sample that lands inside the dip is floored: the
+	// next hardware timestamp is a full period later, so it clears the floor on its own and the
+	// timeline re-syncs to the filter immediately.
+	//
+	// An earlier attempt reused the offset from the last accepted sample instead of flooring.
+	// It ratchets: that offset can only ever follow the filter upward, so it drifts above the
+	// real one and then everything looks backwards. Measured live -- 185 dropped against 1
+	// saved -- and replaced with this.
+	//
+	// A genuine discontinuity (the device clock restarting after a USB re-enumeration -- 8.23 s
+	// was measured on 2026-08-12) is far outside IMU_JITTER_MAX_NS and still falls through to
+	// the drop path below. Flooring there would freeze the timeline for the whole 8 s. That case
+	// needs the tracker reset, not a timestamp trick.
+	if (ws->last_imu_ns > ts && (ws->last_imu_ns - ts) < IMU_JITTER_MAX_NS) {
+		timepoint_ns backwards = ws->last_imu_ns - ts;
+		ts = ws->last_imu_ns + IMU_MIN_STEP_NS;
+		ws->imu_stabilised_total++;
+		if (ws->imu_stabilised_total % 1000 == 1) {
+			WMR_INFO(ws,
+			         "IMU clock-offset jitter absorbed (%" PRId64 " ns backwards, kept the sample); %" PRIu64
+			         " so far this session",
+			         backwards, ws->imu_stabilised_total);
+		}
+	}
+
 	if (ws->last_imu_ns > ts) {
-		WMR_WARN(ws, "Received sample from the past, new: %" PRIu64 ", last: %" PRIu64 ", diff: %" PRIu64, ts,
-		         s->timestamp_ns, ts - s->timestamp_ns);
+		if (ws->imu_dropped_run == 0 || ws->imu_dropped_run % 250 == 0) { // ~1 s of samples
+			WMR_WARN(ws,
+			         "IMU sample from the past by %" PRId64 " ns (t=%" PRId64 ", last accepted=%" PRId64
+			         "); dropped %" PRIu64 " in this burst, %" PRIu64 " total this session",
+			         ws->last_imu_ns - ts, ts, ws->last_imu_ns, ws->imu_dropped_run + 1,
+			         ws->imu_dropped_total + 1);
+		}
+		ws->imu_dropped_run++;
+		ws->imu_dropped_total++;
 		return;
+	}
+	if (ws->imu_dropped_run > 0) {
+		WMR_INFO(ws, "IMU clock recovered after dropping %" PRIu64 " samples (%" PRIu64 " total this session)",
+		         ws->imu_dropped_run, ws->imu_dropped_total);
+		ws->imu_dropped_run = 0;
 	}
 
 	ws->first_imu_received = true;
