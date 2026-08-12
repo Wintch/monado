@@ -289,6 +289,8 @@ struct TrackerSlam
 	// Used mainly for checking that the timestamps come in order
 	timepoint_ns last_imu_ts;                     //!< Last received IMU sample timestamp
 	vector<timepoint_ns> last_cam_ts;             //!< Last received image timestamp per cam
+	bool dropping_bundle = false;                 //!< Drop the rest of a non-monotonic frame bundle
+	int dropped_bundles = 0;                      //!< Consecutive bundles dropped for that reason
 	struct xrt_hand_masks_sample last_hand_masks; //!< Last received hand masks info
 	Mutex last_hand_masks_mutex;                  //!< Mutex for @ref last_hand_masks
 
@@ -1300,7 +1302,48 @@ receive_frame(TrackerSlam &t, struct xrt_frame *frame, uint32_t cam_index)
 	timepoint_ns &last_ts = t.last_cam_ts[cam_index];
 	timepoint_ns ts = (int64_t)frame->timestamp;
 	SLAM_TRACE("[%" PRId64 "] cam%d frame t=%" PRId64, os_monotonic_get_ns(), cam_index, ts);
+	// A non-monotonic timestamp used to be warned about and then pushed anyway. That is not
+	// survivable downstream: Basalt asserts on it and takes the whole process down
+	// (sqrt_keypoint_vio.cpp:311 "frame timestamps not monotonically increasing?!" -> SIGABRT,
+	// killing monado-service mid-session). Seen three times on 2026-08-12 with three different
+	// triggers -- disk I/O from the EuRoC recorder, CPU load from denser feature detection, and
+	// a `CamerasDmaReset` burst from the headset itself -- so it is not an exotic condition, it
+	// is whatever makes the camera clock hiccup.
+	//
+	// Drop the frame instead. It has to be dropped as a whole BUNDLE: the tracker requires every
+	// camera in one bundle to carry the same timestamp, so pushing cam1 after having dropped
+	// cam0 trades one assert for another. cam0 decides, the rest follow.
+	//
+	// Note this stalls tracking until the camera clock passes the last accepted timestamp
+	// again, which for a large backwards jump can be seconds. That is deliberate: the
+	// alternative is feeding the tracker a frame older than the one it already integrated,
+	// which is the crash. The stall is logged so it can never be silent.
+	if (cam_index == 0) {
+		bool drop = last_ts >= ts;
+		if (drop && !t.dropping_bundle) {
+			t.dropped_bundles = 0;
+		}
+		t.dropping_bundle = drop;
+	}
+	if (t.dropping_bundle) {
+		if (cam_index == 0) {
+			if (t.dropped_bundles % 30 == 0) { // ~1 s of camera frames between messages
+				SLAM_WARN("Dropping frame bundles: cam0 frame (%" PRId64
+				          ") is older than the last accepted (%" PRId64 ") by %" PRId64
+				          " ns (%d dropped so far)",
+				          ts, last_ts, last_ts - ts, t.dropped_bundles + 1);
+			}
+			t.dropped_bundles++;
+		}
+		return;
+	}
+	if (t.dropped_bundles > 0 && cam_index == 0) {
+		SLAM_INFO("Camera clock recovered after dropping %d frame bundles", t.dropped_bundles);
+		t.dropped_bundles = 0;
+	}
 	if (last_ts >= ts) {
+		// Not cam0, so the bundle was already accepted: warn but keep the timestamp coherent
+		// with cam0's rather than dropping half a bundle.
 		SLAM_WARN("Frame (%" PRId64 ") is older than last (%" PRId64 ") by %" PRId64 " ns", ts, last_ts,
 		          last_ts - ts);
 	}
