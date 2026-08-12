@@ -536,6 +536,20 @@ wmr_controller_base_get_tracked_pose(struct xrt_device *xdev,
 	// above (and drops the POSITION_*_BIT flags, exactly like before this patch) if the controller
 	// hasn't been seen by a camera recently, e.g. it's out of view or the feature is off -- a stale
 	// position silently marked "tracked" would be worse than the honest placeholder.
+	//
+	// 2026-08-12: this used to read constellation.last_pose directly and fall back to the
+	// placeholder as soon as that one sample went stale, which made the hand snap to a fixed spot
+	// the moment tracking gapped. It now comes out of the relation history, which interpolates
+	// between samples and predicts across the gaps -- the same thing rift and pssense do. The
+	// freshness window below still applies, on the newest sample rather than on a single stored
+	// one, because predicting indefinitely from an old sample is how you get a hand drifting off
+	// on its own.
+	//
+	// The clock-domain worry the previous comment described (samples reading seconds AHEAD of
+	// at_timestamp_ns) was re-measured on this build and is gone: the delta is a steady 30-37 ms,
+	// i.e. the ordinary age of the last 30 Hz camera frame. Patch 0016's clock alignment fixed it.
+	// The absolute value is kept anyway -- it costs nothing and the failure it guards against is
+	// silent.
 	static const int64_t WMR_CONSTELLATION_MAX_SAMPLE_AGE_NS = 200000000; // 200ms, ~6 frames at 30fps
 	int64_t constellation_sample_age_ns = at_timestamp_ns - wcb->constellation.last_timestamp_ns;
 	if (constellation_sample_age_ns < 0) {
@@ -549,10 +563,20 @@ wmr_controller_base_get_tracked_pose(struct xrt_device *xdev,
 	// direction" as equally stale.
 	if (wcb->constellation.tracker != NULL && wcb->constellation.sample_count > 0 &&
 	    constellation_sample_age_ns < WMR_CONSTELLATION_MAX_SAMPLE_AGE_NS) {
-		pose.position = wcb->constellation.last_pose.position;
-		relation.relation_flags = (enum xrt_space_relation_flags)(
-		    relation.relation_flags | XRT_SPACE_RELATION_POSITION_VALID_BIT |
-		    XRT_SPACE_RELATION_POSITION_TRACKED_BIT);
+		struct xrt_space_relation constellation_relation = XRT_SPACE_RELATION_ZERO;
+		m_relation_history_get(wcb->constellation.relation_history, at_timestamp_ns,
+		                       &constellation_relation);
+
+		// Position only, deliberately: the orientation in the history is the constellation
+		// solve's, and the IMU's (applied further down, under the lock) is better. Taking only
+		// the position is what this patch has always done; the history changes where the
+		// position comes from, not which parts of the pose the constellation gets to set.
+		if ((constellation_relation.relation_flags & XRT_SPACE_RELATION_POSITION_VALID_BIT) != 0) {
+			pose.position = constellation_relation.pose.position;
+			relation.relation_flags = (enum xrt_space_relation_flags)(
+			    relation.relation_flags | XRT_SPACE_RELATION_POSITION_VALID_BIT |
+			    XRT_SPACE_RELATION_POSITION_TRACKED_BIT);
+		}
 	}
 	relation.pose = pose;
 
@@ -580,9 +604,13 @@ wmr_controller_base_get_tracked_pose(struct xrt_device *xdev,
 	// instance shared across every wcb (left AND right controller both call this function), so it only
 	// ever fired for whichever device's calls happened to land on the modulo boundary -- silently hiding
 	// the other controller's output the whole time. Gate on this device's OWN sample_count instead.
+	// 2026-08-12: this used to gate on sample_count % 30, which only fires while the sample counter
+	// happens to be sitting on a multiple of 30 -- so it stayed completely silent whenever samples
+	// stopped arriving, i.e. exactly when the delta is worth reading. Gate on this device's own call
+	// count instead; sample_count > 0 still keeps it quiet until there is something to report.
 	static uint64_t get_tracked_pose_call_count = 0;
 	++get_tracked_pose_call_count;
-	if (wcb->constellation.sample_count > 0 && wcb->constellation.sample_count % 30 == 0) {
+	if (wcb->constellation.sample_count > 0 && get_tracked_pose_call_count % 90 == 0) {
 		bool pos_tracked = (out_relation->relation_flags & XRT_SPACE_RELATION_POSITION_TRACKED_BIT) != 0;
 		WMR_INFO(wcb,
 		        "get_tracked_pose: pos=(%.3f, %.3f, %.3f) position_tracked=%s at_ts=%lld "
@@ -605,6 +633,10 @@ wmr_controller_base_deinit(struct wmr_controller_base *wcb)
 	if (wcb->constellation.tracker != NULL) {
 		t_constellation_tracker_remove_device(wcb->constellation.tracker, wcb->constellation.device_id);
 	}
+
+	// After remove_device: the tracker reads this history through the device's tracking_source, so
+	// it must not be freed while the tracker can still call in.
+	m_relation_history_destroy(&wcb->constellation.relation_history);
 
 	// Remove the variable tracking.
 	u_var_remove_root(wcb);
@@ -737,19 +769,66 @@ wmr_controller_base_init(struct wmr_controller_base *wcb,
 #define WMR_CONSTELLATION_LED_RADIUS_M 0.003f
 #define WMR_CONSTELLATION_LED_VISIBILITY_ANGLE DEG_TO_RAD(75)
 
-//! @ref t_constellation_tracker_device::push_constellation_tracker_sample. Stores the sample for
-//! the debug GUI only -- nothing consumes this for the device's actual reported pose yet, that's
-//! a later patch, and orientation keeps coming exclusively from the IMU fusion as always.
+//! @ref t_constellation_tracker_device::push_constellation_tracker_sample. Feeds @ref
+//! wmr_controller_base.constellation.relation_history, which is what both the reported position and
+//! the tracker's own prior are read from. The last_* fields below are kept for the debug GUI.
+//! Orientation keeps coming exclusively from the IMU fusion, as always.
 static void
 constellation_sample_store(struct t_constellation_tracker_device *device, struct t_constellation_tracker_sample *sample)
 {
 	struct wmr_controller_base *wcb =
 	    container_of(device, struct wmr_controller_base, constellation.device);
 
+	// Position only: the constellation solve's orientation is not used for anything (the IMU's is
+	// better), but the history needs both bits set or every reader treats the entry as invalid.
+	// The orientation stored here is therefore the solve's, and deliberately never read back out
+	// as the device's orientation -- see wmr_controller_base_get_tracked_pose.
+	struct xrt_space_relation relation = {
+	    .pose = sample->pose,
+	    .relation_flags = (enum xrt_space_relation_flags)(
+	        XRT_SPACE_RELATION_POSITION_VALID_BIT | XRT_SPACE_RELATION_POSITION_TRACKED_BIT |
+	        XRT_SPACE_RELATION_ORIENTATION_VALID_BIT | XRT_SPACE_RELATION_ORIENTATION_TRACKED_BIT),
+	};
+	m_relation_history_push(wcb->constellation.relation_history, &relation, sample->timestamp_ns);
+
 	wcb->constellation.last_pose = sample->pose;
 	wcb->constellation.last_timestamp_ns = sample->timestamp_ns;
 	wcb->constellation.last_metrics = sample->metrics;
 	wcb->constellation.sample_count++;
+
+	// MEASUREMENT 2026-08-12: how far apart are the constellation solve's orientation and the IMU
+	// fusion's? The solve is bistable on this headset (two clusters 0.19 m apart for a motionless
+	// controller), and the IMU is the only independent evidence available to break the tie -- but
+	// only if the two live in the same frame. The fusion's yaw is gravity-referenced with an
+	// arbitrary heading, so agreement is NOT a given and feeding it in blind could reject the true
+	// pose. MEASURED: the gravity axis alone disagrees by 104-161 deg, and bimodally, matching the
+	// two position clusters -- so this is not the yaw question, the two orientations are in
+	// different frames entirely (the LED model is in the controller's calibration frame, the fusion
+	// in the IMU's, which has its own pose inside that model). Resolving that fixed transform from
+	// the factory calibration is what an IMU-backed prior needs first; it is NOT a drop-in.
+	if (wcb->constellation.sample_count % 15 == 0) {
+		struct xrt_quat imu_rot;
+		os_mutex_lock(&wcb->data_lock);
+		imu_rot = wcb->fusion.rot;
+		os_mutex_unlock(&wcb->data_lock);
+
+		struct xrt_quat solve_inv, delta;
+		math_quat_invert(&sample->pose.orientation, &solve_inv);
+		math_quat_rotate(&imu_rot, &solve_inv, &delta);
+
+		// Angle of the rotation that takes one to the other, and the same for gravity's direction
+		// alone (roll/pitch only, immune to the yaw question).
+		float angle_deg = (float)(2.0 * acos(fmin(1.0, fabs((double)delta.w))) * 180.0 / M_PI);
+		struct xrt_vec3 down = {0.f, -1.f, 0.f};
+		struct xrt_vec3 down_imu, down_solve;
+		math_quat_rotate_vec3(&imu_rot, &down, &down_imu);
+		math_quat_rotate_vec3(&sample->pose.orientation, &down, &down_solve);
+		float dot = down_imu.x * down_solve.x + down_imu.y * down_solve.y + down_imu.z * down_solve.z;
+		float gravity_deg = (float)(acos(fmax(-1.f, fmin(1.f, dot))) * 180.0 / M_PI);
+
+		WMR_DEBUG(wcb, "constellation vs IMU: full=%.1f deg gravity_axis=%.1f deg", angle_deg,
+		          gravity_deg);
+	}
 
 	// Throttled to ~2/s at 30fps so this is readable in the log without needing the debug GUI.
 	if (wcb->constellation.sample_count % 15 == 0) {
@@ -760,6 +839,29 @@ constellation_sample_store(struct t_constellation_tracker_device *device, struct
 		        sample->pose.position.y, sample->pose.position.z, sample->metrics.matched_blob_count,
 		        sample->metrics.visible_led_count, sample->metrics.reprojection_error);
 	}
+}
+
+/*!
+ * The prior the constellation tracker asks for before it goes looking for this controller: "where
+ * do you think you are right now?". Answered from the controller's own recent constellation
+ * samples, predicted forward to @p when_ns by @ref m_relation_history.
+ *
+ * This is what stops the tracker picking a differently-oriented pose that happens to fit the same
+ * handful of blobs. Measured on the G2 2026-08-12, before this existed: a controller lying
+ * motionless on a desk had a p99 step of 0.41-0.44 m between consecutive samples, with healthy
+ * metrics on the bad ones (8 matched blobs at 0.06 px reprojection error, 45 cm away from the
+ * truth). With few LEDs visible several poses fit almost perfectly, so no threshold on the
+ * tracker's own quality metrics can separate them -- only outside information can, and this is it.
+ */
+static void
+constellation_tracking_source_get_tracked_pose(struct t_constellation_tracker_tracking_source *tracking_source,
+                                               int64_t when_ns,
+                                               struct xrt_space_relation *out_relation)
+{
+	struct wmr_controller_base *wcb =
+	    container_of(tracking_source, struct wmr_controller_base, constellation.tracking_source);
+
+	m_relation_history_get(wcb->constellation.relation_history, when_ns, out_relation);
 }
 
 void
@@ -792,9 +894,14 @@ wmr_controller_base_add_to_constellation_tracker(struct wmr_controller_base *wcb
 
 	wcb->constellation.device.push_constellation_tracker_sample = constellation_sample_store;
 
+	if (wcb->constellation.relation_history == NULL) {
+		m_relation_history_create(&wcb->constellation.relation_history);
+	}
+	wcb->constellation.tracking_source.get_tracked_pose = constellation_tracking_source_get_tracked_pose;
+
 	struct t_constellation_tracker_device_params params = {
 	    .led_model = wcb->constellation.led_model,
-	    .tracking_source = NULL,
+	    .tracking_source = &wcb->constellation.tracking_source,
 	};
 
 	int ret = t_constellation_tracker_add_device(tracker, &params, &wcb->constellation.device,

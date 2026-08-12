@@ -16,6 +16,7 @@
 
 #include "os/os_threading.h"
 #include "math/m_imu_3dof.h"
+#include "math/m_relation_history.h"
 #include "util/u_device.h"
 #include "util/u_logging.h"
 #include "xrt/xrt_device.h"
@@ -157,6 +158,22 @@ struct wmr_controller_base
 		struct t_constellation_tracker_sample_metrics last_metrics;
 		//! Samples received since registration, so "stuck at 0" is visible at a glance in the GUI.
 		uint64_t sample_count;
+
+		/*!
+		 * Every constellation sample this controller receives, keyed by the sample's own
+		 * timestamp. This is what both the output pose and the tracker's prior are read from,
+		 * interpolated/predicted to the timestamp actually being asked about -- the same thing
+		 * the rift and pssense drivers do with their own constellation samples.
+		 */
+		struct m_relation_history *relation_history;
+
+		/*!
+		 * Handed to the tracker as this device's prior (@ref
+		 * t_constellation_tracker_device_params.tracking_source), so it can throw out pose
+		 * hypotheses that disagree with where this controller just was. Reads @ref
+		 * relation_history.
+		 */
+		struct t_constellation_tracker_tracking_source tracking_source;
 	} constellation;
 };
 
