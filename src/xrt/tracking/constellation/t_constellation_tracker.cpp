@@ -725,16 +725,41 @@ Camera::pushPose(CameraSample &camera_sample,
 	    .reprojection_error = score.matched_blobs > 0 ? sqrtf(score.reprojection_error / score.matched_blobs) : 0.0,
 	};
 
-	// Push the sample to the device
-	t_constellation_tracker_sample sample = {
-	    .timestamp_ns = camera_sample.timestamp_ns,
-	    .pose = Txr_world_device,
-	    .mosaic_index = mosaic->index,
-	    .camera_index = this->index,
-	    .average_brightness = average_brightness, // @todo compute this
-	    .metrics = metrics,
-	};
-	t_constellation_tracker_device_push_sample(device->device, &sample);
+	// Both callers gate on POSE_MATCH_GOOD before calling this function, but that is the score of
+	// the pose BEFORE the RANSAC-PnP refinement above, which moves the pose and can drop LEDs.
+	// The refined score is recomputed right after it and, until this check, was only ever used to
+	// fill in the metrics below -- so a pose the tracker's own criterion no longer considers good
+	// was still published to the driver.
+	//
+	// Measured on an HP Reverb G2, 876 samples, 2026-08-12: samples arriving at the driver with
+	// matched_blob_count == 0 (a pose supported by no observation at all) and with 2 blobs at
+	// 2.24 px reprojection error. Each one lands as a jump in the controller's position -- the
+	// worst was 1.6 m, and the wearer feels them as the hand snapping to an unexpected side.
+	// Note the giveaway that a plain reprojection-error threshold would NOT have caught: several
+	// of the bad solves have a very LOW error (0.11 px), because with few visible LEDs a wrong
+	// pose can fit the handful of blobs almost perfectly. The match flags account for that; a
+	// hand-picked error threshold does not.
+	//
+	// Only the publication is suppressed: found_pose, the marked blobs and the rest of the
+	// tracker's per-frame bookkeeping are left exactly as they were, so this changes what the
+	// device is told and nothing about how the tracker searches.
+	if (POSE_HAS_FLAGS(&score, POSE_MATCH_GOOD)) {
+		// Push the sample to the device
+		t_constellation_tracker_sample sample = {
+		    .timestamp_ns = camera_sample.timestamp_ns,
+		    .pose = Txr_world_device,
+		    .mosaic_index = mosaic->index,
+		    .camera_index = this->index,
+		    .average_brightness = average_brightness, // @todo compute this
+		    .metrics = metrics,
+		};
+		t_constellation_tracker_device_push_sample(device->device, &sample);
+	} else {
+		CT_DEBUG(tracker,
+		         "Device %d: pose no longer POSE_MATCH_GOOD after refinement (%u matched blobs, %u "
+		         "visible LEDs) -- not publishing it",
+		         device->id, score.matched_blobs, score.visible_leds);
+	}
 
 	{
 		std::unique_lock<os::Mutex> lock(device->data_lock);
