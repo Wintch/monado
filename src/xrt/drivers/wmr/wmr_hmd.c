@@ -85,7 +85,7 @@ DEBUG_GET_ONCE_BOOL_OPTION(wmr_handtracking, "WMR_HANDTRACKING", true)
 //! Whether to run the optical LED constellation tracker for controller positional tracking.
 //! Default on since 0017 (patches/monado/0017): controllers report a real fused position, not
 //! just orientation. See docs/03-controllers.md.
-DEBUG_GET_ONCE_BOOL_OPTION(wmr_constellation_controllers, "WMR_CONSTELLATION_CONTROLLERS", true)
+DEBUG_GET_ONCE_BOOL_OPTION(wmr_constellation_controllers, "WMR_CONSTELLATION_CONTROLLERS", false)
 
 #ifdef XRT_FEATURE_SLAM
 //! Whether to submit samples to the SLAM tracker from the start.
