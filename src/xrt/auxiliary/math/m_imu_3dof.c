@@ -36,7 +36,6 @@ m_imu_3dof_init(struct m_imu_3dof *f, int flags)
 	m_ff_vec3_f32_alloc(&f->gyro_ff, 1000);
 
 	f->flags = flags;
-	f->gyro_bias.auto_enabled = (flags & M_IMU_3DOF_USE_GYRO_BIAS_AUTO) != 0;
 }
 
 void
@@ -226,7 +225,13 @@ gravity_correction(struct m_imu_3dof *f,
 static void
 gyro_bias_auto(struct m_imu_3dof *f, uint64_t timestamp_ns, float gyro_length, float accel_length)
 {
-	if (!f->gyro_bias.auto_enabled) {
+	// Read the flag, do not cache it in a second bool. The first version of this kept
+	// gyro_bias.auto_enabled, and m_imu_3dof_reset() -- which U_ZERO()s the struct and restores
+	// only the ring buffers and flags -- silently switched the estimator off for the rest of the
+	// session on the first 3DoF/SLAM toggle (wmr_hmd.c:1656). Deriving it here removes the
+	// duplicate state rather than adding another line to reset() that the next field would also
+	// need.
+	if ((f->flags & M_IMU_3DOF_USE_GYRO_BIAS_AUTO) == 0) {
 		return;
 	}
 

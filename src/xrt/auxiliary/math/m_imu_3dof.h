@@ -84,8 +84,6 @@ struct m_imu_3dof
 		struct xrt_vec3 value;
 		bool manually_fire;
 
-		//! See M_IMU_3DOF_USE_GYRO_BIAS_AUTO.
-		bool auto_enabled;
 		//! When the device was first seen to be still in the current stretch, 0 if moving.
 		uint64_t still_since_ns;
 		//! When the estimate last ran, so a long still stretch re-estimates periodically.

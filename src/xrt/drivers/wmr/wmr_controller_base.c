@@ -36,7 +36,17 @@
 
 //! Apply the factory IMU-to-device rotation to the controller's fused orientation, as the HMD
 //! already does for itself. Set to 0 to compare against the old behaviour. See the use site.
-DEBUG_GET_ONCE_BOOL_OPTION(wmr_controller_imu_to_device, "WMR_CONTROLLER_IMU_TO_DEVICE", true)
+// DEFAULT OFF as of 2026-08-12, having been added default-on the same day. Three things point
+// the same way: (1) it did not fix the symptom it was written for -- "the left controller points
+// at me" turned out to be gyro drift, and the give-away is that the SAME session later had the
+// RIGHT one pointing at the wearer instead, which a fixed mirrored-calibration error could never
+// do; (2) a frame-algebra review argues it double-applies -- with eye_params=NULL, P_imu_me
+// collapses to P_imu_ht0, and the controller IMU path mirrors the HMD's PLAIN 3DOF path
+// (wmr_hmd.c:1123, which does not apply it), not its SLAM path (:1184, where it is legitimate
+// because Basalt is handed raw un-rotated samples); (3) no measurement has ever shown it helping.
+// Kept, not deleted: the transform really is computed and unused, which is a genuine gap worth
+// resolving properly rather than by leaving a 105-degree rotation switched on by default.
+DEBUG_GET_ONCE_BOOL_OPTION(wmr_controller_imu_to_device, "WMR_CONTROLLER_IMU_TO_DEVICE", false)
 
 //! How stale a constellation sample may be before the controller falls back to the placeholder
 //! pose. See the use site: 200 ms was shorter than the interval samples actually arrive at.
