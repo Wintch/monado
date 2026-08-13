@@ -131,6 +131,9 @@ struct fake_timing
 	//! Whole periods the free-running anchor has jumped forward this session.
 	int64_t phase_jump_count;
 
+	//! Present-wait ground-truth re-anchors accepted this session (see pc_info).
+	int64_t present_feedback_count;
+
 	//! Frames we keep track off.
 	struct frame frames[FRAME_COUNT];
 
@@ -387,10 +390,23 @@ pc_info(struct u_pacing_compositor *upc,
         int64_t present_margin_ns,
         int64_t when_ns)
 {
+	struct fake_timing *ft = fake_timing(upc);
+
 	/*
-	 * The compositor might call this function because it selected the
-	 * fake timing code even tho displaying timing is available.
+	 * The target feeds us the measured VK_KHR_present_wait completion time
+	 * of each frame (comp_target_swapchain_wait_for_present). Without it
+	 * the anchor's only correction was the vblank event thread, which lags
+	 * under load -- and then predict_next_frame_present_time()'s catch-up
+	 * ratchets the whole cadence forward a full period with nothing ever
+	 * pulling it back. Re-anchoring to the real present phase every frame
+	 * closes that hole. Only accept forward movement: the vblank thread
+	 * also writes this field and its timestamps are the true scanout
+	 * times, slightly earlier than a present-wait wakeup.
 	 */
+	if (actual_present_time_ns > ft->last_present_time_ns) {
+		ft->last_present_time_ns = actual_present_time_ns;
+		ft->present_feedback_count++;
+	}
 }
 
 static void
@@ -525,6 +541,8 @@ u_pc_fake_create(int64_t estimated_frame_period_ns, int64_t now_ns, struct u_pac
 	u_var_add_ro_i64(ft, &ft->frame_period_ns, "Frame period(ns)");
 	u_var_add_i64(ft, &ft->comp_time_ns, "Compositor time(ns)");
 	u_var_add_ro_i64(ft, &ft->last_present_time_ns, "Last present time(ns)");
+	u_var_add_ro_i64(ft, &ft->phase_jump_count, "Phase jumps (periods)");
+	u_var_add_ro_i64(ft, &ft->present_feedback_count, "Present-wait re-anchors");
 
 	// Return value.
 	*out_upc = &ft->base;

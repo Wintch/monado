@@ -44,6 +44,14 @@ struct comp_target_swapchain
 	//! If we should use display timing.
 	enum comp_target_display_timing_usage timing_usage;
 
+	/*!
+	 * Whether upc is the fake pacer (no VK_GOOGLE_display_timing feedback).
+	 * When it is, measured present-wait completion times are fed to it as
+	 * ground truth; a real display-timing pacer must never receive those
+	 * synthesized info calls.
+	 */
+	bool using_fake_pacer;
+
 	//! Also works as a frame index.
 	int64_t current_frame_id;
 

@@ -714,6 +714,7 @@ comp_target_swapchain_create_images(struct comp_target *ct,
 		u_pc_display_timing_create(ct->c->frame_interval_ns, &config, &cts->upc);
 	} else if (cts->upc == NULL) {
 		u_pc_fake_create(ct->c->frame_interval_ns, now_ns, &cts->upc);
+		cts->using_fake_pacer = true;
 	}
 
 	// Free old image views.
@@ -1085,6 +1086,7 @@ comp_target_swapchain_wait_for_present(struct comp_target *ct, time_duration_ns 
 {
 	struct comp_target_swapchain *cts = (struct comp_target_swapchain *)ct;
 	struct vk_bundle *vk = get_vk(cts);
+	VkResult ret = VK_ERROR_EXTENSION_NOT_PRESENT;
 
 #ifdef VK_KHR_present_wait2
 	if (cts->surface.present_wait2_supported) {
@@ -1095,7 +1097,8 @@ comp_target_swapchain_wait_for_present(struct comp_target *ct, time_duration_ns 
 		    .timeout = timeout_ns,
 		};
 
-		return vk->vkWaitForPresent2KHR(vk->device, cts->swapchain.handle, &info2);
+		ret = vk->vkWaitForPresent2KHR(vk->device, cts->swapchain.handle, &info2);
+		goto done;
 	}
 
 #endif
@@ -1106,10 +1109,35 @@ comp_target_swapchain_wait_for_present(struct comp_target *ct, time_duration_ns 
 	}
 
 	// @note current frame ID is incremented by 1 to match the ID given to Vulkan, see comp_target_swapchain_present
-	return vk->vkWaitForPresentKHR(vk->device, cts->swapchain.handle, (uint64_t)cts->current_frame_id, timeout_ns);
+	ret = vk->vkWaitForPresentKHR(vk->device, cts->swapchain.handle, (uint64_t)cts->current_frame_id, timeout_ns);
 #else
 	return VK_ERROR_EXTENSION_NOT_PRESENT;
 #endif
+
+#ifdef VK_KHR_present_wait2
+done:
+#endif
+	// The fake pacer (no VK_GOOGLE_display_timing, i.e. every NVIDIA Linux
+	// session) free-runs on a software clock whose only correction was the
+	// vblank event thread -- which lags under load, letting the anchor ratchet
+	// forward in whole periods with nothing pulling it back (measured live:
+	// one-period jumps every few seconds during gameplay, sessions locked to
+	// half rate with the GPU idle). The present wait above just returned at
+	// the moment the frame was actually presented, so the current time is
+	// per-frame ground truth for the present phase; feed it back. Never sent
+	// to a real display-timing pacer -- it has authoritative feedback already.
+	if (ret == VK_SUCCESS && cts->using_fake_pacer && cts->upc != NULL) {
+		int64_t now_ns = os_monotonic_get_ns();
+		u_pc_info(cts->upc,              //
+		          cts->current_frame_id, //
+		          0,                     // desired_present_time_ns: unknown here
+		          now_ns,                // actual present time (tight upper bound)
+		          0,                     // earliest_present_time_ns
+		          0,                     // present_margin_ns
+		          now_ns);               //
+	}
+
+	return ret;
 }
 
 static bool
