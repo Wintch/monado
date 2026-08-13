@@ -21,6 +21,7 @@
 #include "util/u_debug.h"
 #include "util/u_handles.h"
 #include "util/u_trace_marker.h"
+#include "util/u_thread_priority.h"
 #include "util/u_distortion_mesh.h"
 
 #include "multi/comp_multi_private.h"
@@ -246,6 +247,14 @@ run_func(void *ptr)
 
 	U_TRACE_SET_THREAD_NAME("Multi Client Module: Waiter");
 	os_thread_helper_name(&mc->wait_thread.oth, "Multi Client Module: Waiter");
+
+	// This thread takes slot_lock and list_and_timing_lock -- the same locks the
+	// SCHED_FIFO main loop needs every iteration. Left at SCHED_OTHER it can be
+	// preempted by any busy tracking thread while holding them, stalling the RT
+	// main loop on a lock owned by a descheduled thread (classic priority
+	// inversion; the free-running fake pacer then converts that one stall into a
+	// permanent whole-period phase shift). Raise it like the main loop does.
+	u_try_to_set_realtime_priority_on_thread(U_LOGGING_INFO, "Multi Client Module: Waiter");
 
 	os_thread_helper_lock(&mc->wait_thread.oth);
 
