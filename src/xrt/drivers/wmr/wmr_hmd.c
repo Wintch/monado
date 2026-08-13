@@ -511,9 +511,36 @@ hololens_sensors_read_packets(struct wmr_hmd *wh)
 	os_mutex_unlock(&wh->hid_lock);
 
 	if (size < 0) {
-		WMR_ERROR(wh, "Error reading from Hololens Sensors device. Call to os_hid_read returned %i", size);
-		return false;
+		// The Hololens Sensors device shares the headset's internal USB2 hub with
+		// the companion device, which is already known to transiently drop off and
+		// re-enumerate under panel load (see control_read_packets()). A single read
+		// error here used to permanently kill this thread -- and with it every IMU
+		// sample, the SLAM tracking feed, and the tunnelled controller packets --
+		// even though the device itself stays enumerated and healthy (seen live
+		// 2026-08-13: one -1, tracking frozen for the rest of the session, device
+		// still on the bus). Tolerate a bounded run of consecutive failures
+		// instead, same shape as the Bluetooth controller tunnel
+		// (wmr_bt_controller.c). Unlike the companion device this feed is
+		// load-bearing for tracking, so warn loudly and give up after a bound
+		// rather than tolerating forever.
+		wh->hololens_consecutive_read_errors++;
+		if (wh->hololens_consecutive_read_errors >= 10) {
+			WMR_ERROR(wh,
+			          "Error reading from Hololens Sensors device: %d consecutive read errors, "
+			          "giving up. Call to os_hid_read returned %i",
+			          wh->hololens_consecutive_read_errors, size);
+			return false;
+		}
+		WMR_WARN(wh,
+		         "Error reading from Hololens Sensors device (%d in a row). Call to os_hid_read returned %i",
+		         wh->hololens_consecutive_read_errors, size);
+		// The healthy path is paced by the blocking 100ms os_hid_read above, but a
+		// dead fd makes poll() return POLLNVAL instantly -- this sleep keeps the
+		// failure path from busy-spinning until the bound trips.
+		os_nanosleep(U_TIME_1MS_IN_NS * 10);
+		return true;
 	}
+	wh->hololens_consecutive_read_errors = 0;
 	if (size == 0) {
 		WMR_TRACE(wh, "No more data to read");
 		return true; // No more messages, return.

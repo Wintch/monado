@@ -89,6 +89,13 @@ struct wmr_hmd
 	struct os_mutex hid_lock;
 
 	/*!
+	 * Consecutive os_hid_read() failures on hid_hololens_sensors_dev, reset on
+	 * any successful read. Bounds how long a transient hiccup is tolerated
+	 * before giving up on the IMU/SLAM/controller-tunnel feed for good.
+	 */
+	int hololens_consecutive_read_errors;
+
+	/*!
 	 * This is the vendor specific companion device of the Hololens Sensors.
 	 * When activated, it will report the physical IPD adjustment and proximity
 	 * sensor status of the headset. It also allows enabling/disabling the HMD
