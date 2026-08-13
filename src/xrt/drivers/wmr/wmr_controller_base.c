@@ -646,9 +646,35 @@ wmr_controller_base_get_tracked_pose(struct xrt_device *xdev,
 		*out_relation = relation;
 	} else {
 		int64_t prediction_ns = at_timestamp_ns - last_imu_timestamp_ns;
-		double prediction_s = time_ns_to_s(prediction_ns);
 
-		m_predict_relation(&relation, prediction_s, out_relation);
+		// Cap the prediction horizon. WMR controllers SLEEP after minutes of stillness and stop
+		// sending IMU entirely; without a cap, this extrapolated the last known angular velocity
+		// for as long as the device stayed silent. Measured 2026-08-13: a sleeping controller's
+		// frozen residual velocity of ~0.009 rad/s painted a ~31 deg/min rotation with R^2 =
+		// 1.000 for MINUTES -- perfectly linear because it is not a measurement at all, it is
+		// arithmetic. That fake rotation was mistaken for gyro drift repeatedly, and its
+		// dependence on whatever instantaneous velocity the device fell asleep with is why
+		// consecutive "drift" measurements disagreed by up to 5x. Forensics: the fusion's own
+		// update counters stop advancing (the estimator log shows the instance going silent), so
+		// the device is provably not sampling while the output keeps turning.
+		//
+		// 100 ms covers every legitimate compositor lookahead; a device silent for longer than
+		// 1 s is asleep or gone, and the honest report is its last fused pose with zero
+		// velocities -- NOT a steady rotation, and not velocities an app would use to keep
+		// extrapolating the same fiction on its side.
+		const int64_t WMR_MAX_PREDICTION_NS = 100 * 1000 * 1000;
+		const int64_t WMR_IMU_SILENT_NS = 1000 * 1000 * 1000;
+		if (prediction_ns > WMR_IMU_SILENT_NS) {
+			relation.angular_velocity = (struct xrt_vec3){0.f, 0.f, 0.f};
+			relation.linear_velocity = (struct xrt_vec3){0.f, 0.f, 0.f};
+			*out_relation = relation;
+		} else {
+			if (prediction_ns > WMR_MAX_PREDICTION_NS) {
+				prediction_ns = WMR_MAX_PREDICTION_NS;
+			}
+			double prediction_s = time_ns_to_s(prediction_ns);
+			m_predict_relation(&relation, prediction_s, out_relation);
+		}
 	}
 
 	// Throttled log of what this function actually hands back to the app -- as opposed to
