@@ -22,6 +22,7 @@
 #include <stdio.h>
 #include <assert.h>
 #include <math.h>
+#include <inttypes.h>
 
 DEBUG_GET_ONCE_LOG_OPTION(log_level_fake, "U_PACING_COMPOSITOR_FAKE_LOG", U_LOGGING_INFO)
 
@@ -127,6 +128,9 @@ struct fake_timing
 	//! This won't run out, trust me.
 	int64_t frame_id_generator;
 
+	//! Whole periods the free-running anchor has jumped forward this session.
+	int64_t phase_jump_count;
+
 	//! Frames we keep track off.
 	struct frame frames[FRAME_COUNT];
 
@@ -189,6 +193,19 @@ predict_next_frame_present_time(struct fake_timing *ft, int64_t now_ns)
 		int64_t behind_ns = deadline_ns - predicted_present_time_ns;
 		int64_t steps = (behind_ns + period_ns - 1) / period_ns;
 		predicted_present_time_ns += steps * period_ns;
+
+		// This pacer has no real vblank feedback (it exists because
+		// VK_GOOGLE_display_timing is unavailable, e.g. every NVIDIA Linux
+		// session), so last_present_time_ns is a free-running software clock:
+		// once this catch-up fires, the whole cadence shifts forward by whole
+		// periods and NOTHING ever pulls it back -- suspected mechanism behind
+		// sessions locking to exactly half rate with the GPU idle. Logged at
+		// warn with a running count to make each shift observable against the
+		// app-side "Frame late by" lines.
+		ft->phase_jump_count += steps;
+		UPC_LOG_W("Fake pacer fell behind: jumped %" PRIi64 " period(s) forward (%" PRIi64
+		          " total this session), new anchor %" PRIi64,
+		          steps, ft->phase_jump_count, predicted_present_time_ns);
 	}
 
 	return predicted_present_time_ns;
