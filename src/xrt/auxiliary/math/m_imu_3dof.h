@@ -90,6 +90,8 @@ struct m_imu_3dof
 		uint64_t last_auto_ns;
 		//! How many times the automatic path has fired, for the GUI and for measuring.
 		uint32_t auto_fire_count;
+		//! Estimates folded into @ref value so far; the first one is taken whole, see gyro_biasing.
+		uint32_t estimate_count;
 	} gyro_bias;
 };
 

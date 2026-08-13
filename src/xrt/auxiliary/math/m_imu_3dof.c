@@ -239,13 +239,27 @@ gyro_bias_auto(struct m_imu_3dof *f, uint64_t timestamp_ns, float gyro_length, f
 	const float STILL_GYRO_RAD_S = 0.10f;
 	//! Gravity only, to within a small margin. MATH_GRAVITY_M_S2 is 9.8066.
 	const float STILL_ACCEL_TOLERANCE = 0.5f;
-	//! Long enough that the 300 ms averaging window is entirely inside the still stretch.
-	const uint64_t STILL_REQUIRED_NS = 1000 * 1000 * 1000ULL;
+	//! Long enough that the 1 s averaging window is entirely inside the still stretch, with margin.
+	const uint64_t STILL_REQUIRED_NS = 1200 * 1000 * 1000ULL;
 	//! While it stays still, keep refreshing at this interval -- bias moves with temperature.
 	const uint64_t REESTIMATE_EVERY_NS = 2000 * 1000 * 1000ULL;
 
 	bool still = gyro_length < STILL_GYRO_RAD_S &&
 	             fabsf(accel_length - MATH_GRAVITY_M_S2) < STILL_ACCEL_TOLERANCE;
+
+	// DIAGNOSTIC 2026-08-12: only one of the three devices was ever seen firing an estimate, and
+	// a stillness test that never passes is indistinguishable from one that is never reached.
+	// Print what each device actually presents, throttled, so a unit mismatch (accel in g rather
+	// than m/s^2 would sit at 1.0 and fail the gravity check forever) shows up as a number.
+	{
+		static uint32_t seen = 0;
+		if ((seen++ % 2000) == 0) {
+			U_LOG_I("gyro_bias_auto[%p]: gyro=%.4f rad/s (limit %.2f) accel=%.3f (want %.2f +-%.1f) -> %s",
+			        (void *)f, (double)gyro_length, (double)STILL_GYRO_RAD_S, (double)accel_length,
+			        (double)MATH_GRAVITY_M_S2, (double)STILL_ACCEL_TOLERANCE,
+			        still ? "STILL" : "moving");
+		}
+	}
 
 	if (!still) {
 		f->gyro_bias.still_since_ns = 0;
@@ -272,9 +286,8 @@ gyro_bias_auto(struct m_imu_3dof *f, uint64_t timestamp_ns, float gyro_length, f
 	// Say so out loud. A silent estimator is indistinguishable from one that never runs, and
 	// this whole change is only worth anything if it actually fires -- the first measurement
 	// after adding it was inconclusive precisely because there was no way to tell.
-	U_LOG_I("gyro bias auto-estimate #%u fired: bias now (%.5f, %.5f, %.5f) rad/s (%.2f deg/min)",
-	        f->gyro_bias.auto_fire_count, f->gyro_bias.value.x, f->gyro_bias.value.y,
-	        f->gyro_bias.value.z,
+	U_LOG_I("gyro bias auto-estimate[%p] #%u (smoothed: %.2f deg/min)",
+	        (void *)f, f->gyro_bias.auto_fire_count,
 	        (double)m_vec3_len(f->gyro_bias.value) * 180.0 / M_PI * 60.0);
 }
 
@@ -287,7 +300,10 @@ gyro_biasing(struct m_imu_3dof *f, uint64_t timestamp_ns)
 
 	f->gyro_bias.manually_fire = false;
 
-	uint64_t dur_ns = DUR_300MS_IN_NS;
+	// Average a full second, not 300 ms. The automatic path only fires after 1.2 s of continuous
+	// stillness (see gyro_bias_auto), so a 1 s window is entirely inside the still stretch with
+	// margin, and four times the samples is half the noise.
+	uint64_t dur_ns = DUR_1S_IN_NS;
 
 	struct xrt_vec3 gyro_mean = XRT_VEC3_ZERO;
 	m_ff_vec3_f32_filter(f->gyro_ff,            // Filter
@@ -295,7 +311,27 @@ gyro_biasing(struct m_imu_3dof *f, uint64_t timestamp_ns)
 	                     timestamp_ns,          // End time
 	                     &gyro_mean);           // Results
 
-	f->gyro_bias.value = gyro_mean;
+	// Smooth towards the new estimate instead of adopting it whole.
+	//
+	// MEASURED 2026-08-12, and this is why: three consecutive estimates of the same MOTIONLESS
+	// controller read 34.5, 63.9 and 47.9 deg/min. Replacing the bias with each of those in turn
+	// injects that spread straight back into the integration, which is why the first version of
+	// the automatic estimator only halved the drift (18.8 -> 8.9 deg/min between the two
+	// controllers) instead of removing it. A single estimate is a noisy measurement of a quantity
+	// that barely moves -- gyro bias drifts with temperature over minutes, not between samples --
+	// so it should be averaged over many, not trusted individually.
+	//
+	// The first estimate is adopted in full: there is nothing to average against, and starting
+	// from zero would take a dozen fires to converge while the pose visibly rotates away.
+	const float alpha = 0.25f;
+	if (f->gyro_bias.estimate_count == 0) {
+		f->gyro_bias.value = gyro_mean;
+	} else {
+		f->gyro_bias.value.x += alpha * (gyro_mean.x - f->gyro_bias.value.x);
+		f->gyro_bias.value.y += alpha * (gyro_mean.y - f->gyro_bias.value.y);
+		f->gyro_bias.value.z += alpha * (gyro_mean.z - f->gyro_bias.value.z);
+	}
+	f->gyro_bias.estimate_count++;
 }
 
 void
