@@ -19,6 +19,7 @@
 #include <string.h>
 #include <assert.h>
 #include <errno.h>
+#include <inttypes.h>
 
 #include "wmr_controller.h"
 
@@ -183,6 +184,8 @@ struct wmr_controller_hp_input
 		struct xrt_vec3 acc;
 		struct xrt_vec3 gyro;
 		int32_t temperature;
+		//! True when this packet carried all-zero raw IMU counts, see the parse function.
+		bool zeroed;
 	} imu;
 };
 #undef WMR_PACKED
@@ -194,6 +197,9 @@ struct wmr_controller_hp
 
 	//! The last decoded package of IMU and button data
 	struct wmr_controller_hp_input last_inputs;
+
+	//! Zeroed-IMU (idle) packets seen, for the throttled log below.
+	uint64_t zeroed_imu_count;
 };
 
 /*
@@ -299,6 +305,21 @@ wmr_controller_hp_packet_parse(struct wmr_controller_hp *ctrl, const unsigned ch
 	gyro[0] = read24(&p);
 	gyro[1] = read24(&p);
 	gyro[2] = read24(&p);
+
+	// Idle detection, on the RAW counts and before calibration. ~30 s after the controller stops
+	// moving, its firmware keeps the 44-byte packet stream alive (buttons, battery, timestamps all
+	// valid) but zeroes the six IMU fields. The calibration pipeline below then manufactures
+	// sensor data out of nothing: 0 * mix_matrix + bias_offsets = the factory bias vector, a small
+	// CONSTANT -- measured 2026-08-13 as |accel| frozen at exactly 0.171 m/s^2 on one controller
+	// and 0.121 on the other across every idle packet, values that are impossible for a real
+	// resting accelerometer (it must read ~9.81) and are precisely each device's own offsets.
+	// The matching fake constant gyro (0.006-0.021 rad/s) integrated into the 20-70 deg/min
+	// "drift" chased across two sessions. Six exact zeros cannot come from a live sensor, so this
+	// is unambiguous. The flag makes handle_input_packet skip fusion for these packets; buttons
+	// keep working.
+	last_input->imu.zeroed = acc[0] == 0 && acc[1] == 0 && acc[2] == 0 && //
+	                         gyro[0] == 0 && gyro[1] == 0 && gyro[2] == 0;
+
 	vec3_from_wmr_controller_gyro(gyro, &last_input->imu.gyro);
 	math_matrix_3x3_transform_vec3(&wcb->config.sensors.gyro.mix_matrix, &last_input->imu.gyro,
 	                               &last_input->imu.gyro);
@@ -335,7 +356,18 @@ handle_input_packet(struct wmr_controller_base *wcb, uint64_t time_ns, uint8_t *
 	struct wmr_controller_hp *ctrl = (struct wmr_controller_hp *)(wcb);
 
 	bool b = wmr_controller_hp_packet_parse(ctrl, buffer, buf_size);
-	if (b) {
+	if (b && ctrl->last_inputs.imu.zeroed) {
+		// Valid packet, but its IMU fields are the firmware's idle zeros (see the parse function)
+		// -- feeding them to the fusion integrates a fake constant rotation. Skip the fusion AND
+		// leave last_imu_timestamp_ns alone: staleness then grows past the prediction cap in
+		// get_tracked_pose, which freezes the reported pose with zero velocities. Between the two,
+		// a resting controller finally just sits still.
+		ctrl->zeroed_imu_count++;
+		if (ctrl->zeroed_imu_count == 1 || (ctrl->zeroed_imu_count % 1000) == 0) {
+			WMR_DEBUG(ctrl, "idle (zeroed) IMU packet -- fusion paused [%" PRIu64 " so far]",
+			          ctrl->zeroed_imu_count);
+		}
+	} else if (b) {
 		m_imu_3dof_update(&wcb->fusion,
 		                  ctrl->last_inputs.imu.timestamp_ticks * WMR_MOTION_CONTROLLER_NS_PER_TICK,
 		                  &ctrl->last_inputs.imu.acc, &ctrl->last_inputs.imu.gyro);
