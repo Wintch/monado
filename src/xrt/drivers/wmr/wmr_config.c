@@ -589,6 +589,23 @@ wmr_controller_config_parse(struct wmr_controller_config *c, char *json_string, 
 		c->led_count++;
 	}
 
+	// Does the factory calibration actually carry the IMU's pose inside the same frame the
+	// LED model lives in? That transform is the missing piece for an IMU-backed prior on the
+	// constellation solve -- the solve is bistable (measured 2026-08-13: ~20 cm of scatter
+	// between solutions for a motionless controller, each reporting an excellent 0.17 px
+	// reprojection error), no threshold on its own metrics can separate the two poses, and
+	// the IMU is the only independent evidence available. It was blocked on "the two live in
+	// different frames"; this line answers whether the bridge is already parsed and sitting
+	// unused, or genuinely absent. Identity here means absent.
+	WMR_INFO(log_level,
+	         "controller calib: %d LEDs | accel pose p=(%.4f %.4f %.4f) q=(%.4f %.4f %.4f %.4f) | "
+	         "gyro pose p=(%.4f %.4f %.4f)",
+	         c->led_count, c->sensors.accel.pose.position.x, c->sensors.accel.pose.position.y,
+	         c->sensors.accel.pose.position.z, c->sensors.accel.pose.orientation.x,
+	         c->sensors.accel.pose.orientation.y, c->sensors.accel.pose.orientation.z,
+	         c->sensors.accel.pose.orientation.w, c->sensors.gyro.pose.position.x,
+	         c->sensors.gyro.pose.position.y, c->sensors.gyro.pose.position.z);
+
 	cJSON_Delete(json_root);
 
 	return true;
