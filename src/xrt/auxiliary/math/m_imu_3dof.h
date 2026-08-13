@@ -22,6 +22,20 @@ extern "C" {
 #define M_IMU_3DOF_USE_GRAVITY_DUR_300MS (1 << 0)
 #define M_IMU_3DOF_USE_GRAVITY_DUR_20MS (1 << 1)
 
+/*!
+ * Estimate the gyroscope bias automatically whenever the device is held still, instead of only
+ * when something sets @ref m_imu_3dof.gyro_bias.manually_fire -- which, in practice, is a
+ * checkbox in the debug GUI that nothing in a real session ever touches.
+ *
+ * Without it the residual bias is integrated forever and the orientation simply rotates away.
+ * Measured on an HP Reverb G2's controllers, 2026-08-12, both lying untouched on a desk, two
+ * independent windows agreeing within 1%: the LEFT controller drifted 72 deg/min and the right
+ * 20 deg/min, 93% and 63% of steps monotonic. Gravity correction cannot save this -- the
+ * accelerometer establishes vertical, so pitch and roll are pulled back but YAW has no absolute
+ * reference at all and runs unbounded. That is exactly the symptom the wearer reports.
+ */
+#define M_IMU_3DOF_USE_GYRO_BIAS_AUTO (1 << 2)
+
 
 struct m_ff_vec3_f32;
 
@@ -69,6 +83,15 @@ struct m_imu_3dof
 	{
 		struct xrt_vec3 value;
 		bool manually_fire;
+
+		//! See M_IMU_3DOF_USE_GYRO_BIAS_AUTO.
+		bool auto_enabled;
+		//! When the device was first seen to be still in the current stretch, 0 if moving.
+		uint64_t still_since_ns;
+		//! When the estimate last ran, so a long still stretch re-estimates periodically.
+		uint64_t last_auto_ns;
+		//! How many times the automatic path has fired, for the GUI and for measuring.
+		uint32_t auto_fire_count;
 	} gyro_bias;
 };
 

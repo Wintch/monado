@@ -36,6 +36,7 @@ m_imu_3dof_init(struct m_imu_3dof *f, int flags)
 	m_ff_vec3_f32_alloc(&f->gyro_ff, 1000);
 
 	f->flags = flags;
+	f->gyro_bias.auto_enabled = (flags & M_IMU_3DOF_USE_GYRO_BIAS_AUTO) != 0;
 }
 
 void
@@ -98,6 +99,8 @@ m_imu_3dof_add_vars(struct m_imu_3dof *f, void *root, const char *prefix)
 	u_var_add_ro_vec3_f32(root, &f->gyro_bias.value, tmp);
 	snprintf(tmp, sizeof(tmp), "%sgyro_bias.manually_fire", prefix);
 	u_var_add_bool(root, &f->gyro_bias.manually_fire, tmp);
+	snprintf(tmp, sizeof(tmp), "%sgyro_bias.auto_fire_count", prefix);
+	u_var_add_ro_u32(root, &f->gyro_bias.auto_fire_count, tmp);
 }
 
 static void
@@ -206,6 +209,70 @@ gravity_correction(struct m_imu_3dof *f,
 	}
 }
 
+/*!
+ * Decide whether the device is being held still, and if it has been for long enough, ask for a
+ * fresh bias estimate. See M_IMU_3DOF_USE_GYRO_BIAS_AUTO for why this is needed at all.
+ *
+ * "Still" is judged from the RAW gyro, deliberately: while the device is motionless the gyro is
+ * reading its own bias and nothing else, which is the whole basis of the estimate. The threshold
+ * therefore has to sit above the bias being measured and well below real motion. Measured on this
+ * hardware the bias is ~0.021 rad/s (72 deg/min, the worse of the two controllers) and deliberate
+ * hand motion is upwards of 0.5 rad/s, so 0.10 rad/s separates them with an order of magnitude of
+ * room on the low side.
+ *
+ * The accelerometer has to agree: a device in free fall or being accelerated in a straight line
+ * can show near-zero rotation while very much not being still.
+ */
+static void
+gyro_bias_auto(struct m_imu_3dof *f, uint64_t timestamp_ns, float gyro_length, float accel_length)
+{
+	if (!f->gyro_bias.auto_enabled) {
+		return;
+	}
+
+	//! Above the bias being measured, far below intentional motion. See the comment above.
+	const float STILL_GYRO_RAD_S = 0.10f;
+	//! Gravity only, to within a small margin. MATH_GRAVITY_M_S2 is 9.8066.
+	const float STILL_ACCEL_TOLERANCE = 0.5f;
+	//! Long enough that the 300 ms averaging window is entirely inside the still stretch.
+	const uint64_t STILL_REQUIRED_NS = 1000 * 1000 * 1000ULL;
+	//! While it stays still, keep refreshing at this interval -- bias moves with temperature.
+	const uint64_t REESTIMATE_EVERY_NS = 2000 * 1000 * 1000ULL;
+
+	bool still = gyro_length < STILL_GYRO_RAD_S &&
+	             fabsf(accel_length - MATH_GRAVITY_M_S2) < STILL_ACCEL_TOLERANCE;
+
+	if (!still) {
+		f->gyro_bias.still_since_ns = 0;
+		return;
+	}
+
+	if (f->gyro_bias.still_since_ns == 0) {
+		f->gyro_bias.still_since_ns = timestamp_ns;
+		return;
+	}
+
+	if (timestamp_ns - f->gyro_bias.still_since_ns < STILL_REQUIRED_NS) {
+		return;
+	}
+
+	if (f->gyro_bias.last_auto_ns != 0 && timestamp_ns - f->gyro_bias.last_auto_ns < REESTIMATE_EVERY_NS) {
+		return;
+	}
+
+	f->gyro_bias.last_auto_ns = timestamp_ns;
+	f->gyro_bias.auto_fire_count++;
+	f->gyro_bias.manually_fire = true; // reuse the existing estimator rather than duplicating it
+
+	// Say so out loud. A silent estimator is indistinguishable from one that never runs, and
+	// this whole change is only worth anything if it actually fires -- the first measurement
+	// after adding it was inconclusive precisely because there was no way to tell.
+	U_LOG_I("gyro bias auto-estimate #%u fired: bias now (%.5f, %.5f, %.5f) rad/s (%.2f deg/min)",
+	        f->gyro_bias.auto_fire_count, f->gyro_bias.value.x, f->gyro_bias.value.y,
+	        f->gyro_bias.value.z,
+	        (double)m_vec3_len(f->gyro_bias.value) * 180.0 / M_PI * 60.0);
+}
+
 static void
 gyro_biasing(struct m_imu_3dof *f, uint64_t timestamp_ns)
 {
@@ -289,7 +356,9 @@ m_imu_3dof_update(struct m_imu_3dof *f,
 	// Gravity correction.
 	gravity_correction(f, timestamp_ns, accel, &gyro_biased, dt, gyro_biased_length);
 
-	// Gyro bias calculations.
+	// Gyro bias calculations. The automatic trigger runs first and simply asks the existing
+	// estimator to run, so both paths share one implementation.
+	gyro_bias_auto(f, timestamp_ns, gyro_length, accel_length);
 	gyro_biasing(f, timestamp_ns);
 
 	/*
