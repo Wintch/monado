@@ -779,6 +779,19 @@ constellation_sample_store(struct t_constellation_tracker_device *device, struct
 	struct wmr_controller_base *wcb =
 	    container_of(device, struct wmr_controller_base, constellation.device);
 
+	// A non-finite sample must never reach the history, because the history is ALSO the tracker's
+	// prior (see constellation_tracking_source_get_tracked_pose): one NaN would be fed back into
+	// the solver, come out as another NaN, and poison every subsequent sample with no way back.
+	// Observed live 2026-08-12 in a real game session -- both controllers stuck at (nan, nan, nan)
+	// indefinitely.
+	// Same tolerance note as the head-pose guard in wmr_hmd.c: the position check is what catches
+	// the NaN, and the quaternion is validated at 1 percent rather than at FLOAT_EPSILON.
+	if (!math_vec3_validate(&sample->pose.position) ||
+	    !math_quat_validate_within_1_percent(&sample->pose.orientation)) {
+		WMR_DEBUG(wcb, "constellation sample is not finite -- dropping it");
+		return;
+	}
+
 	// Position only: the constellation solve's orientation is not used for anything (the IMU's is
 	// better), but the history needs both bits set or every reader treats the entry as invalid.
 	// The orientation stored here is therefore the solve's, and deliberately never read back out

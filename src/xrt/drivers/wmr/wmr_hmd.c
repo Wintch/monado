@@ -1473,6 +1473,36 @@ wmr_hmd_constellation_tracking_source_get_tracked_pose(struct t_constellation_tr
 		out_relation->relation_flags = (enum xrt_space_relation_flags)(
 		    out_relation->relation_flags | XRT_SPACE_RELATION_POSITION_VALID_BIT);
 	}
+
+	// Last line of defence: this pose becomes the origin of every camera in the mosaic, so a single
+	// non-finite value here turns every controller position the tracker produces into NaN. Reported
+	// as invalid instead, which the tracker already handles by skipping the observation.
+	// NOT math_pose_validate(): its quaternion check compares the norm against 1 with a tolerance of
+	// FLOAT_EPSILON (~1.2e-7), which a perfectly usable pose fails after filtering and prediction
+	// accumulate a little numerical error. Measured 2026-08-12: it rejected 5528 consecutive SLAM
+	// head poses in 40 s -- every single one -- and with no valid origin the tracker skipped every
+	// frame, so the controllers went from noisy to nothing. math_quat_validate_within_1_percent is
+	// the in-tree validator meant for this; combined with the position check it still catches the
+	// NaN this guard exists for.
+	if (!math_vec3_validate(&out_relation->pose.position) ||
+	    !math_quat_validate_within_1_percent(&out_relation->pose.orientation)) {
+		static int reject_log_count = 0;
+		if ((reject_log_count++ % 200) == 0) {
+			WMR_WARN(wh,
+			         "Head pose for the constellation tracker is not usable (#%d): pos=(%f, %f, %f) "
+			         "quat=(%f, %f, %f, %f) norm=%f flags=0x%x xret=%d",
+			         reject_log_count, out_relation->pose.position.x, out_relation->pose.position.y,
+			         out_relation->pose.position.z, out_relation->pose.orientation.x,
+			         out_relation->pose.orientation.y, out_relation->pose.orientation.z,
+			         out_relation->pose.orientation.w,
+			         sqrt((double)out_relation->pose.orientation.x * out_relation->pose.orientation.x +
+			              (double)out_relation->pose.orientation.y * out_relation->pose.orientation.y +
+			              (double)out_relation->pose.orientation.z * out_relation->pose.orientation.z +
+			              (double)out_relation->pose.orientation.w * out_relation->pose.orientation.w),
+			         (unsigned int)out_relation->relation_flags, (int)xret);
+		}
+		*out_relation = (struct xrt_space_relation)XRT_SPACE_RELATION_ZERO;
+	}
 }
 
 /*!
