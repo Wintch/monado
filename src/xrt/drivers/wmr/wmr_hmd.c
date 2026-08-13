@@ -1900,7 +1900,10 @@ wmr_hmd_setup_trackers(struct wmr_hmd *wh, struct xrt_slam_sinks *out_sinks, str
 	wmr_hmd_fill_slam_calibration(wh);
 
 	// Initialize 3DoF tracker
-	m_imu_3dof_init(&wh->fusion.i3dof, M_IMU_3DOF_USE_GRAVITY_DUR_20MS);
+	// See the same change in wmr_controller_base.c. The headset was not measured drifting the way
+	// the controllers were, but it runs the same fusion off the same kind of sensor, and the
+	// estimate only ever runs while the device is provably still.
+	m_imu_3dof_init(&wh->fusion.i3dof, M_IMU_3DOF_USE_GRAVITY_DUR_20MS | M_IMU_3DOF_USE_GYRO_BIAS_AUTO);
 
 	// Initialize SLAM tracker
 	struct xrt_slam_sinks *slam_sinks = NULL;

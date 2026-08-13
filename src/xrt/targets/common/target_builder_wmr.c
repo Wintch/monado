@@ -296,11 +296,13 @@ wmr_open_system_impl(struct xrt_builder *xb,
 	if (constellation_tracker != NULL) {
 		if (left != NULL) {
 			wmr_controller_base_add_to_constellation_tracker((struct wmr_controller_base *)left,
-			                                                 constellation_tracker);
+			                                                 constellation_tracker,
+			                                                 head->tracking_origin);
 		}
 		if (right != NULL) {
 			wmr_controller_base_add_to_constellation_tracker((struct wmr_controller_base *)right,
-			                                                 constellation_tracker);
+			                                                 constellation_tracker,
+			                                                 head->tracking_origin);
 		}
 	}
 

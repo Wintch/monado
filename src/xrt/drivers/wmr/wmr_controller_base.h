@@ -158,6 +158,8 @@ struct wmr_controller_base
 		struct t_constellation_tracker_sample_metrics last_metrics;
 		//! Samples received since registration, so "stuck at 0" is visible at a glance in the GUI.
 		uint64_t sample_count;
+		//! Samples rejected for placing the controller implausibly far away, see the range check.
+		uint64_t out_of_range_count;
 
 		/*!
 		 * Every constellation sample this controller receives, keyed by the sample's own
@@ -186,7 +188,8 @@ struct wmr_controller_base
  */
 void
 wmr_controller_base_add_to_constellation_tracker(struct wmr_controller_base *wcb,
-                                                  struct t_constellation_tracker *tracker);
+                                                  struct t_constellation_tracker *tracker,
+                                                  struct xrt_tracking_origin *head_origin);
 
 bool
 wmr_controller_base_init(struct wmr_controller_base *wcb,
