@@ -200,6 +200,10 @@ struct wmr_controller_hp
 
 	//! Zeroed-IMU (idle) packets seen, for the throttled log below.
 	uint64_t zeroed_imu_count;
+
+	//! True once last_inputs.battery has been set at least once by a real packet -- guards
+	//! get_battery_status() from reporting a fake 0% before the controller has said anything.
+	bool has_battery_sample;
 };
 
 /*
@@ -280,7 +284,15 @@ wmr_controller_hp_packet_parse(struct wmr_controller_hp *ctrl, const unsigned ch
 	last_input->x_a = buttons & 0x02;
 	last_input->y_b = buttons & 0x01;
 
-	last_input->battery = read8(&p);
+	uint8_t new_battery = read8(&p);
+	if (!ctrl->has_battery_sample || new_battery != last_input->battery) {
+		// Scale unverified -- see the long comment in wmr_controller_hp_get_battery_status()
+		// below. Logged on every CHANGE (not every packet) specifically so a real
+		// charge/discharge cycle can be correlated against this byte later.
+		WMR_INFO(ctrl, "Controller battery raw byte: %u -> %u", last_input->battery, new_battery);
+	}
+	last_input->battery = new_battery;
+	ctrl->has_battery_sample = true;
 
 	int32_t acc[3];
 	acc[0] = read24(&p); // x
@@ -414,6 +426,48 @@ wmr_controller_hp_update_inputs(struct xrt_device *xdev)
 	return XRT_SUCCESS;
 }
 
+static xrt_result_t
+wmr_controller_hp_get_battery_status(struct xrt_device *xdev, bool *out_present, bool *out_charging, float *out_charge)
+{
+	struct wmr_controller_hp *ctrl = (struct wmr_controller_hp *)(xdev);
+	struct wmr_controller_base *wcb = (struct wmr_controller_base *)(xdev);
+
+	os_mutex_lock(&wcb->data_lock);
+	bool have_sample = ctrl->has_battery_sample;
+	uint8_t raw = ctrl->last_inputs.battery;
+	os_mutex_unlock(&wcb->data_lock);
+
+	if (!have_sample) {
+		// Never received an input packet yet (controller off/out of range/not yet connected)
+		// -- report "no data", not a fake 0%. Same spirit as u_device_ni_get_battery_status's
+		// not-implemented stub, just scoped to "not yet known" instead of "never known".
+		*out_present = false;
+		return XRT_SUCCESS;
+	}
+
+	*out_present = true;
+	// The G2 controller runs on 2x AAA batteries with no onboard charging circuit -- there is
+	// nothing to report here, unlike the Rift Touch or pssense controllers next to this driver
+	// in the tree.
+	*out_charging = false;
+
+	// UNVERIFIED SCALE, said plainly so a caller does not trust this more than it has earned.
+	// `raw` is the uint8_t this driver has parsed out of the controller's 44-byte input report
+	// since the very first version of this file (wmr_controller_hp_packet_parse above) -- it
+	// has simply never been surfaced anywhere past Monado's own debug-variable system (u_var,
+	// i.e. only visible with XRT_DEBUG_GUI=1 open and a human looking at the right panel)
+	// until this function. Nothing found so far -- not this tree, not the Windows HID capture
+	// in docs/09-oasis-driver-re.md, not any WMR community writeup -- documents whether this
+	// byte is already a 0-100 percentage, a raw ADC reading, or something else again. Treating
+	// it as a plain 0-255 range (out_charge = raw / 255) is the least-committal reading, not a
+	// confirmed calibration. wmr_controller_hp_packet_parse logs every time this byte CHANGES,
+	// specifically so the real scale can be worked out later by watching it across a real
+	// charge/discharge cycle instead of guessed at again.
+	*out_charge = (float)raw / 255.0f;
+
+	return XRT_SUCCESS;
+}
+
 static void
 wmr_controller_hp_destroy(struct xrt_device *xdev)
 {
@@ -444,6 +498,8 @@ wmr_controller_hp_create(struct wmr_controller_connection *conn,
 
 	// Only set those we want to overwrite.
 	wcb->base.update_inputs = wmr_controller_hp_update_inputs;
+	wcb->base.get_battery_status = wmr_controller_hp_get_battery_status;
+	wcb->base.supported.battery_status = true;
 	wcb->base.name = XRT_DEVICE_HP_REVERB_G2_CONTROLLER;
 
 	if (controller_type == XRT_DEVICE_TYPE_LEFT_HAND_CONTROLLER) {
