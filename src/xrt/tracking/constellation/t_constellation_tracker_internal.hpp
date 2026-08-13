@@ -27,6 +27,7 @@
 #include "math/m_api.h"
 
 #include <vector>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
@@ -215,6 +216,23 @@ public: // Fields
 		correspondence_search *cs{nullptr};
 
 		u_sink_debug debug_sink{};
+
+		/*!
+		 * Deep-search backoff, keyed by device id: consecutive deep-search
+		 * failures and the earliest monotonic time the next deep search may
+		 * run. Without it, a device with no strong match (cold start, long
+		 * occlusion, dim LEDs) runs the full combinatorial search to
+		 * completion on every frame forever -- measured on a 6-core machine
+		 * eating ~2 cores across the 4 slow threads while the solution rate
+		 * collapsed to one fix every ~3s. Only touched by the slow
+		 * processing thread (single-threaded mode included), so unlocked.
+		 */
+		struct DeepBackoff
+		{
+			int consecutive_failures{0};
+			int64_t next_attempt_ns{0};
+		};
+		std::map<int, DeepBackoff> deep_backoff{};
 	} slow_processing_thread_data;
 
 	/*!

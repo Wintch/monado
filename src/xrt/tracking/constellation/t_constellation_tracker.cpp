@@ -12,6 +12,9 @@
 #include "t_constellation_tracker_internal.hpp"
 #include "t_constellation_tracker_dataset.hpp"
 
+#include "os/os_time.h"
+#include "util/u_time.h"
+
 #ifdef XRT_FEATURE_RERUN
 #include "constellation_tracker_rerun.hpp"
 #endif
@@ -359,8 +362,40 @@ Camera::tryDeviceBlobRecovery(std::unique_ptr<Device> &device,
 	pose_metrics score;
 	// Evaluate the pose, using the prior if available
 	if (Tcv_world_device_prior.has_value()) {
+		// prior_must_match=true makes this cheap recovery path hard-reject any
+		// candidate outside the prior window -- but the window is a fixed
+		// +-10cm/30deg (MIN_POS_ERROR/MIN_ROT_ERROR, never updated anywhere)
+		// applied to a prior that extrapolates with zero velocity, i.e. it
+		// freezes at the last real fix. A hand that moved more than 10cm since
+		// then can never use this path again and every frame falls through to
+		// the expensive full search -- the mechanism behind a controller staying
+		// "anchored" for seconds after occlusion. Grow the acceptance window
+		// with the age of the last real sample instead: fresh prior keeps the
+		// tight gate (which is what protects against the known 0.19m
+		// pose-hypothesis flip), stale prior degrades smoothly toward
+		// quality-only acceptance. 0.5 m/s and 60 deg/s are conservative for a
+		// hand; both capped so the gate never disappears entirely.
+		xrt_vec3 pos_window = device->prior_pos_error;
+		xrt_vec3 rot_window = device->prior_rot_error;
+		{
+			std::unique_lock<os::Mutex> lock(device->data_lock);
+			if (device->locked_data.last_known_pose.has_value() &&
+			    sample.timestamp_ns > device->locked_data.last_known_pose->timestamp_ns) {
+				float age_s =
+				    (float)(sample.timestamp_ns - device->locked_data.last_known_pose->timestamp_ns) /
+				    1e9f;
+				float pos_grow = 0.5f * age_s;
+				float rot_grow = (float)DEG_TO_RAD(60) * age_s;
+				pos_window.x = fminf(pos_window.x + pos_grow, 0.75f);
+				pos_window.y = fminf(pos_window.y + pos_grow, 0.75f);
+				pos_window.z = fminf(pos_window.z + pos_grow, 0.75f);
+				rot_window.x = fminf(rot_window.x + rot_grow, (float)DEG_TO_RAD(150));
+				rot_window.y = fminf(rot_window.y + rot_grow, (float)DEG_TO_RAD(150));
+				rot_window.z = fminf(rot_window.z + rot_grow, (float)DEG_TO_RAD(150));
+			}
+		}
 		pose_metrics_evaluate_pose_with_prior(&score, &Tcv_cam_device, true, &Tcv_cam_device_prior,
-		                                      &device->prior_pos_error, &device->prior_rot_error, sample.blobs,
+		                                      &pos_window, &rot_window, sample.blobs,
 		                                      sample.blob_count, &device->params.led_model, device->id,
 		                                      &this->model, NULL);
 	} else {
@@ -426,8 +461,26 @@ Camera::processSampleSlow(CameraSample &sample)
 			}
 
 			if (!device_state->needs_slow_processing) {
+				// The device is tracking fine through the fast path; forget any
+				// backoff so the next genuine loss starts with fast retries.
+				data.deep_backoff.erase(device->id);
 				continue; // we already did a fast process for this device and it succeeded, no need to
 				          // do a slow one
+			}
+
+			// Deep-search backoff: the full-depth combinatorial search is the most
+			// expensive thing this tracker does, and for a device that keeps failing
+			// it (cold start, occlusion, dim LEDs) running it to completion on every
+			// frame both saturates this thread and starves every other device's
+			// search -- measured as ~2 cores across the 4 slow threads with the
+			// solution rate collapsed to one fix every ~3 s. The shallow pass still
+			// runs on every sample so acquisition is attempted continuously; only
+			// the deep escalation is rate-limited, doubling from 50 ms up to a
+			// ceiling of 800 ms while it keeps failing.
+			auto &backoff = data.deep_backoff[device->id];
+			if (i == 1 && backoff.next_attempt_ns != 0 &&
+			    os_monotonic_get_ns() < backoff.next_attempt_ns) {
+				continue;
 			}
 
 			xrt_pose Tcv_cam_device = XRT_POSE_IDENTITY;
@@ -487,9 +540,19 @@ Camera::processSampleSlow(CameraSample &sample)
 
 				// We found a pose for this device in this sample
 				device_state->needs_slow_processing = false;
+				data.deep_backoff.erase(device->id);
 			} else {
 				CT_TRACE(tracker, "Camera %p slow processing for device %d failed to find a pose",
 				         (void *)this, device->id);
+				if (i == 1) {
+					backoff.consecutive_failures++;
+					int shift = backoff.consecutive_failures - 1;
+					if (shift > 4) {
+						shift = 4; // 50ms << 4 = 800ms ceiling
+					}
+					backoff.next_attempt_ns =
+					    os_monotonic_get_ns() + (int64_t)(50 * U_TIME_1MS_IN_NS << shift);
+				}
 			}
 		}
 	}
