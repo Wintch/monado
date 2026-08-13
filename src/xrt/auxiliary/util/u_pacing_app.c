@@ -32,6 +32,7 @@ DEBUG_GET_ONCE_BOOL_OPTION(immediate_wait_frame_return_below_refresh,
 DEBUG_GET_ONCE_BOOL_OPTION(align_predicted_display_time_to_app_period,
                            "U_PACING_APP_ALIGN_PREDICTED_DISPLAY_TIME_TO_APP_PERIOD",
                            false)
+DEBUG_GET_ONCE_BOOL_OPTION(pipelined_pacing, "U_PACING_APP_PIPELINED", false)
 
 #define UPA_LOG_T(...) U_LOG_IFL_T(debug_get_log_option_log_level(), __VA_ARGS__)
 #define UPA_LOG_D(...) U_LOG_IFL_D(debug_get_log_option_log_level(), __VA_ARGS__)
@@ -288,6 +289,65 @@ total_app_and_compositor_time_ns(const struct pacing_app *pa)
 	return total_app_time_ns(pa) + total_compositor_time_ns(pa);
 }
 
+/*!
+ * The lead time pa_predict requires between "now" and the promised display
+ * slot. The default model is SERIAL: the full cpu+draw+gpu sum must fit before
+ * the slot, which silently forbids the CPU-vs-GPU overlap OpenXR frame pacing
+ * is designed around -- an app whose serial pipeline is, say, 14 ms on a
+ * 11.1 ms panel gets every other slot forever (45 of 90 fps) even though no
+ * single stage exceeds a period. Measured live on a Reverb G2 before this:
+ * 45-60 fps with the compositor idle half the budget.
+ *
+ * U_PACING_APP_PIPELINED=true switches the gate to cpu+draw+margin only --
+ * the GPU stage of frame N overlaps the CPU stage of frame N+1, one period
+ * per frame, one extra period of latency. Only engages when the serial sum
+ * doesn't fit in a period; apps that fit keep the serial model's lower
+ * latency. (The free-run escape hatch, IMMEDIATE_WAIT_FRAME_RETURN, was
+ * measured to be WORSE here: unpaced rendering burned the cores tracking
+ * needed and fps fell to 30 then 18 -- pacing must stay, only the overlap
+ * assumption changes.)
+ */
+static int64_t
+predict_lead_time_ns(const struct pacing_app *pa, int64_t display_period_ns)
+{
+	int64_t serial_ns = total_app_and_compositor_time_ns(pa);
+
+	if (!debug_get_bool_option_pipelined_pacing()) {
+		return serial_ns;
+	}
+	if (serial_ns <= display_period_ns) {
+		return serial_ns; // Fits serially: keep the lower-latency model.
+	}
+
+	int64_t pipelined_ns = pa->app.cpu_time_ns + pa->app.draw_time_ns + total_compositor_time_ns(pa);
+	if (pipelined_ns > serial_ns) {
+		pipelined_ns = serial_ns; // Paranoia only; gpu_time is never negative.
+	}
+	return pipelined_ns;
+}
+
+/*!
+ * Extra display periods the promise must shift forward when pipelined pacing
+ * is engaged. The gate only reserves cpu+draw before the slot, but the frame
+ * still needs its GPU stage after submit -- it actually reaches the screen
+ * one period later than the gate's slot. Promising that later slot keeps the
+ * predicted display time honest; measured with the promise left one period
+ * optimistic, 69-71%% of frames logged late by exactly one period (pure
+ * bookkeeping), pose prediction aimed at the wrong time, and the delivery
+ * queue churned drop/replace cycles hard enough to inflate compositor CPU
+ * window over window.
+ */
+static int64_t
+pipelined_promise_shift_ns(const struct pacing_app *pa, int64_t display_period_ns)
+{
+	int64_t serial_ns = total_app_and_compositor_time_ns(pa);
+
+	if (!debug_get_bool_option_pipelined_pacing() || serial_ns <= display_period_ns) {
+		return 0;
+	}
+	return display_period_ns;
+}
+
 static int64_t
 calc_app_period(const struct pacing_app *pa, int64_t display_period_ns)
 {
@@ -322,8 +382,10 @@ static int64_t
 predict_display_time(const struct pacing_app *pa, int64_t now_ns, int64_t display_period_ns, int64_t app_period_ns)
 {
 
-	// Total app and compositor time to produce a frame
-	int64_t app_and_compositor_time_ns = total_app_and_compositor_time_ns(pa);
+	// Lead time required before the promised slot -- the full serial
+	// pipeline by default, cpu+draw only in pipelined mode (see
+	// predict_lead_time_ns for the why and the measurements).
+	int64_t lead_time_ns = predict_lead_time_ns(pa, display_period_ns);
 
 	// Start from the last time that the driver displayed something.
 	int64_t val = last_sample_displayed(pa);
@@ -343,9 +405,13 @@ predict_display_time(const struct pacing_app *pa, int64_t now_ns, int64_t displa
 	}
 
 	// Have to have enough time to perform app work.
-	while ((val - app_and_compositor_time_ns) <= now_ns) {
+	while ((val - lead_time_ns) <= now_ns) {
 		val += period_ns;
 	}
+
+	// In pipelined mode the frame reaches the screen one period after the
+	// gate's slot (the GPU stage runs after submit) -- promise that slot.
+	val += pipelined_promise_shift_ns(pa, display_period_ns);
 
 	return val;
 }
@@ -511,7 +577,14 @@ pa_predict(struct u_pacing_app *upa,
 	if (should_return_immediately(frame_time_ns, display_period_ns)) {
 		wake_up_time_ns = now_ns;
 	} else {
-		wake_up_time_ns = predict_ns - total_app_and_compositor_time_ns(pa);
+		// Same lead the prediction gate used: serial by default, cpu+draw
+		// only in pipelined mode so the wake leaves the GPU stage to overlap
+		// the next frame's CPU work. The pipelined promise shift is display
+		// bookkeeping, not extra work time -- subtract it back out so the
+		// wake still lands one lead before the gate's slot, not the
+		// promised (one period later) one.
+		wake_up_time_ns = predict_ns - pipelined_promise_shift_ns(pa, display_period_ns) -
+		                  predict_lead_time_ns(pa, display_period_ns);
 	}
 
 	// When the client's GPU work should have completed.
