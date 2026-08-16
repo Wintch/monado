@@ -627,12 +627,35 @@ control_read_packets(struct wmr_hmd *wh)
 		// headset display is powering up. Don't kill the whole read thread over a
 		// read error here: the same thread also reads the hololens sensors device
 		// (IMU and tunnelled controller packets), which is typically still healthy.
-		// No extra pacing: a failing read is one cheap syscall, and each loop
-		// iteration is already paced by the blocking hololens read.
-		WMR_DEBUG(wh, "Error reading from companion (HMD control) device. Call to os_hid_read returned %i",
-		          size);
+		//
+		// This read is non-blocking, so in isolation a single failure is one cheap
+		// syscall. But a *sustained* dropout is not rare -- confirmed under real
+		// gameplay load (SLAM + constellation + app, docs/pruebas.jsonl T188) --
+		// and the assumption that the outer loop is always paced by the hololens
+		// device's blocking 100ms read doesn't hold once real IMU data is arriving
+		// fast enough that read to stop blocking. Left unbounded, that measured
+		// 472175 consecutive failures and monado-service pinned at 400%+ CPU for
+		// the whole ~17-minute session, recovering only on SIGTERM. Back off once
+		// a dropout looks sustained rather than transient. Unlike the hololens
+		// sensors read, never give up -- the companion device isn't load-bearing
+		// for tracking, so slowing the retry rate is enough.
+		wh->companion_consecutive_read_errors++;
+		if (wh->companion_consecutive_read_errors == 1 || wh->companion_consecutive_read_errors % 1000 == 0) {
+			WMR_WARN(wh,
+			         "Error reading from companion (HMD control) device (%d in a row). Call to "
+			         "os_hid_read returned %i",
+			         wh->companion_consecutive_read_errors, size);
+		} else {
+			WMR_DEBUG(wh,
+			          "Error reading from companion (HMD control) device. Call to os_hid_read returned %i",
+			          size);
+		}
+		if (wh->companion_consecutive_read_errors > 50) {
+			os_nanosleep(U_TIME_1MS_IN_NS * 10);
+		}
 		return true;
 	}
+	wh->companion_consecutive_read_errors = 0;
 	if (size == 0) {
 		WMR_TRACE(wh, "No more data to read");
 		return true; // No more messages, return.
