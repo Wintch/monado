@@ -54,6 +54,12 @@ DEBUG_GET_ONCE_BOOL_OPTION(wmr_controller_full_cal_right, "WMR_CONTROLLER_FULL_C
 DEBUG_GET_ONCE_BOOL_OPTION(wmr_controller_right_roll_180, "WMR_CONTROLLER_RIGHT_ROLL_180", false)
 DEBUG_GET_ONCE_BOOL_OPTION(wmr_controller_left_yaw_minus90, "WMR_CONTROLLER_LEFT_YAW_MINUS90", false)
 DEBUG_GET_ONCE_BOOL_OPTION(wmr_controller_full_cal_left, "WMR_CONTROLLER_FULL_CAL_LEFT", false)
+//! Diagnostic candidate (2026-08-17, T206/docs/pruebas.jsonl): the wearer reported EVERY
+//! rotation axis inverted on BOTH controllers with constellation position tracking active
+//! and every option above left at its default off -- i.e. the untouched default path
+//! (`relation.pose.orientation = fusion_orientation`, verbatim, no correction) is what's
+//! wrong. See the use site for the full reasoning; off by default, for a live A/B.
+DEBUG_GET_ONCE_BOOL_OPTION(wmr_controller_orient_fix, "WMR_CONTROLLER_ORIENT_FIX", false)
 
 //! How stale a constellation sample may be before the controller falls back to the placeholder
 //! pose. See the use site: 200 ms was shorter than the interval samples actually arrive at.
@@ -730,6 +736,29 @@ wmr_controller_base_get_tracked_pose(struct xrt_device *xdev,
 	fusion_orientation = wcb->fusion.rot;
 	fusion_timestamp_ns = wcb->last_imu_timestamp_ns;
 	relation.pose.orientation = fusion_orientation;
+
+	// WMR_CONTROLLER_ORIENT_FIX candidate (2026-08-17, T206): a clean, total inversion of
+	// every rotation axis on BOTH controllers, reported with every option below still at its
+	// default off -- so the bug lives in this untouched default path, which mirrors the
+	// HMD's own proven-good plain-3DoF path exactly (wmr_hmd.c, wh->fusion.i3dof.rot used
+	// verbatim, no correction -- see the long comment above WMR_CONTROLLER_IMU_TO_DEVICE).
+	// Every rotation-composition fix tried so far (this file's whole A/B menu, plus T181's
+	// live WMR_CONTROLLER_WMR_AXES try) ADDS a fixed proper rotation on top of
+	// fusion_orientation and none of them cleared the symptom -- composing more proper
+	// rotations cannot undo a systematic direction reversal, only a genuine conjugate can.
+	// A quaternion conjugate is also the one operation that is hand-symmetric by
+	// construction (no per-hand tuning), matching "both hands, every axis" exactly, and it
+	// is consistent with the delivered orientation being the inverse (device-from-world
+	// instead of world-from-device) of what XRT_SPACE_RELATION expects -- plausible if the
+	// controller's factory mix_matrix (cross-axis calibration) encodes a reflection
+	// (negative determinant) rather than a pure rotation, which no amount of composing
+	// further proper rotations (what every option below does) could ever correct.
+	// NOT confirmed as the true root cause -- no live q_imu/q_out capture
+	// (WMR_CONTROLLER_CALIBRATION_LOG=1) has been taken with this flag on yet. This is the
+	// most direct compensating flip for the reported signature, off by default.
+	if (debug_get_bool_option_wmr_controller_orient_fix()) {
+		math_quat_invert(&relation.pose.orientation, &relation.pose.orientation);
+	}
 
 	// Convert the IMU-frame orientation the fusion produces into the controller's own frame, the
 	// same conversion wmr_hmd.c:1184 applies to the headset with the same field. The controllers
