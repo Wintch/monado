@@ -16,6 +16,7 @@
 #include <unistd.h>
 #include <sched.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 #define LOG_D(...) U_LOG_IFL_D(log_level, __VA_ARGS__)
 #define LOG_I(...) U_LOG_IFL_I(log_level, __VA_ARGS__)
@@ -135,6 +136,73 @@ u_linux_try_to_set_realtime_priority_on_thread(enum u_logging_level log_level, c
 		LOG_W("%s", sink.buffer);
 	} else {
 		LOG_I("%s", sink.buffer);
+	}
+
+	return ret == 0;
+}
+
+/*!
+ * Pin this thread to a set of CPUs, if @p env_var_name is set in the environment. Written
+ * for the round-2 item T204 left open: "compositor thread priority/affinity under
+ * tracking load" -- every Monado-owned compositor thread already runs SCHED_FIFO max
+ * priority (see u_linux_try_to_set_realtime_priority_on_thread and its call sites), so
+ * more priority has nothing left to buy; separating WHICH cores the compositor and the
+ * WMR/tracking side land on is the other half of "scheduling", untried before this. A
+ * strict no-op with the env var unset: no syscall, no behaviour change on the healthy path.
+ *
+ * @p env_var_name's value is a comma-separated list of CPU ids, e.g. "0,1". Unset or empty
+ * leaves the thread's affinity exactly as the OS gave it.
+ */
+bool
+u_linux_try_to_set_thread_affinity_from_env(enum u_logging_level log_level, const char *name, const char *env_var_name)
+{
+	pthread_t this_thread = pthread_self();
+	char str[NAME_LENGTH];
+
+	if (name == NULL) {
+		get_name(str, ARRAY_SIZE(str));
+		name = str;
+	}
+
+	const char *list = getenv(env_var_name);
+	if (list == NULL || list[0] == '\0') {
+		return true;
+	}
+
+	cpu_set_t set;
+	CPU_ZERO(&set);
+
+	int count = 0;
+	const char *p = list;
+	while (*p != '\0') {
+		char *end = NULL;
+		long cpu = strtol(p, &end, 10);
+		if (end == p) {
+			// Not a number where one was expected: stop parsing rather than guess
+			// at what the rest of a malformed value might mean.
+			break;
+		}
+		if (cpu >= 0 && cpu < CPU_SETSIZE) {
+			CPU_SET((int)cpu, &set);
+			count++;
+		}
+		p = end;
+		while (*p == ',' || *p == ' ') {
+			p++;
+		}
+	}
+
+	if (count == 0) {
+		LOG_W("%s='%s' did not parse to any valid CPU id, leaving '%s' unpinned", env_var_name, list, name);
+		return false;
+	}
+
+	int ret = pthread_setaffinity_np(this_thread, sizeof(set), &set);
+	if (ret != 0) {
+		LOG_W("Could not pin thread '%s' to CPU set '%s' (%s), errno-style ret=%i", name, list, env_var_name,
+		      ret);
+	} else {
+		LOG_I("Pinned thread '%s' to CPU set '%s' (%s)", name, list, env_var_name);
 	}
 
 	return ret == 0;

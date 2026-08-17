@@ -532,6 +532,12 @@ multi_main_loop(struct multi_system_compositor *msc)
 	// Try to raise priority of this thread.
 	u_try_to_set_realtime_priority_on_thread(U_LOGGING_INFO, "Multi Client Module");
 
+	// T204's open round-2 item: this thread is already SCHED_FIFO max priority above, so
+	// more priority has nothing left to buy against Basalt/constellation load -- try
+	// separating WHICH cores it lands on instead. No-op unless XRT_COMPOSITOR_CPU_AFFINITY
+	// is set (e.g. "0,1"); see u_linux_try_to_set_thread_affinity_from_env.
+	u_try_to_set_thread_affinity_from_env(U_LOGGING_INFO, "Multi Client Module", "XRT_COMPOSITOR_CPU_AFFINITY");
+
 	struct xrt_compositor *xc = &msc->xcn->base;
 
 	// For wait frame.

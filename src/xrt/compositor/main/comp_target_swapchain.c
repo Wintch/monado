@@ -575,6 +575,10 @@ run_vblank_event_thread(void *ptr)
 	// Try to raise priority of this thread.
 	u_try_to_set_realtime_priority_on_thread(U_LOGGING_INFO, "VBlank Events");
 
+	// See the matching call in comp_multi_system.c -- same XRT_COMPOSITOR_CPU_AFFINITY,
+	// no-op unless set.
+	u_try_to_set_thread_affinity_from_env(U_LOGGING_INFO, "VBlank Events", "XRT_COMPOSITOR_CPU_AFFINITY");
+
 	os_thread_helper_lock(&cts->vblank.event_thread);
 
 	while (os_thread_helper_is_running_locked(&cts->vblank.event_thread)) {

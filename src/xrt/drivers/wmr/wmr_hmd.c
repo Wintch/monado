@@ -749,6 +749,37 @@ control_read_packets(struct wmr_hmd *wh)
  *
  */
 
+//! Drive the WMR_CONTROLLER_KEEPALIVE_S v2 tick (wmr_controller_base.c) for both tunnelled
+//! controllers, once per wmr_run_thread loop iteration. This thread runs for the entire life of
+//! the HMD device regardless of whether any OpenXR client is connected -- see the call site in
+//! wmr_run_thread and wmr_controller_base_send_keepalive_if_due()'s own comment for why that
+//! property is exactly what v1 (driven from get_tracked_pose) was missing.
+static void
+wmr_hmd_send_controller_keepalives(struct wmr_hmd *wh)
+{
+	// controller_status_lock also guards these two pointers against hololens_ensure_controller
+	// (same thread, but taken there too -- stay consistent) and against wmr_hmd_destroy (a
+	// different thread, though by the time it touches wh->controller[] this thread has already
+	// been joined via os_thread_helper_destroy, so that case can't actually race here).
+	os_mutex_lock(&wh->controller_status_lock);
+	struct wmr_hmd_controller_connection *left = wh->controller[0];
+	struct wmr_hmd_controller_connection *right = wh->controller[1];
+	os_mutex_unlock(&wh->controller_status_lock);
+
+	if (left != NULL) {
+		struct xrt_device *xdev = wmr_hmd_controller_connection_get_controller(left);
+		if (xdev != NULL) {
+			wmr_controller_base_send_keepalive_if_due(xdev);
+		}
+	}
+	if (right != NULL) {
+		struct xrt_device *xdev = wmr_hmd_controller_connection_get_controller(right);
+		if (xdev != NULL) {
+			wmr_controller_base_send_keepalive_if_due(xdev);
+		}
+	}
+}
+
 static void *
 wmr_run_thread(void *ptr)
 {
@@ -765,6 +796,11 @@ wmr_run_thread(void *ptr)
 	if (getenv("WMR_HMD_THREAD_NO_RT") == NULL) {
 		u_linux_try_to_set_realtime_priority_on_thread(wh->log_level, "WMR: USB-HMD");
 	}
+
+	// T204 round-2 item: pair with XRT_COMPOSITOR_CPU_AFFINITY (comp_multi_system.c and
+	// friends) to partition cores between the compositor and the WMR/tracking side instead
+	// of only fighting over priority. No-op unless WMR_CPU_AFFINITY is set (e.g. "2,3,4,5").
+	u_linux_try_to_set_thread_affinity_from_env(wh->log_level, "WMR: USB-HMD", "WMR_CPU_AFFINITY");
 #endif
 
 
@@ -781,6 +817,12 @@ wmr_run_thread(void *ptr)
 		if (!hololens_sensors_read_packets(wh)) {
 			break;
 		}
+
+		// WMR_CONTROLLER_KEEPALIVE_S v2: client-independent, ticks every loop iteration.
+		// No locks are held here (both read_packets calls above only hold hid_lock briefly
+		// around the raw HID read itself) -- see wmr_hmd_send_controller_keepalives.
+		wmr_hmd_send_controller_keepalives(wh);
+
 		os_thread_helper_lock(&wh->oth);
 	}
 	os_thread_helper_unlock(&wh->oth);

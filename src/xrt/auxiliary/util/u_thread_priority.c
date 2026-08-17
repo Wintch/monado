@@ -43,3 +43,17 @@ u_try_to_set_realtime_priority_on_thread(enum u_logging_level log_level, const c
 
 	return false;
 }
+
+bool
+u_try_to_set_thread_affinity_from_env(enum u_logging_level log_level, const char *name, const char *env_var_name)
+{
+#if defined(XRT_OS_LINUX)
+	return u_linux_try_to_set_thread_affinity_from_env(log_level, name, env_var_name);
+#else
+	// Not implemented on this OS. Same as the env var being unset: a no-op, not a failure.
+	(void)log_level;
+	(void)name;
+	(void)env_var_name;
+	return true;
+#endif
+}

@@ -14,6 +14,7 @@
 
 #include "os/os_time.h"
 #include "util/u_time.h"
+#include "util/u_thread_priority.h"
 
 #ifdef XRT_FEATURE_RERUN
 #include "constellation_tracker_rerun.hpp"
@@ -1186,6 +1187,13 @@ constellation_tracker_camera_slow_thread(void *ptr)
 {
 	Camera *camera = (Camera *)ptr;
 
+	// T204 round-2 item: this is the num_blobs=29-class correspondence-search work T197
+	// found competing with the compositor for CPU. It runs at default SCHED_OTHER (no RT
+	// change here -- it is bulk compute, not a deadline), but can be kept off whichever
+	// cores XRT_COMPOSITOR_CPU_AFFINITY reserves for the compositor by setting
+	// WMR_CPU_AFFINITY to the complement set. No-op unless set.
+	u_try_to_set_thread_affinity_from_env(U_LOGGING_INFO, "Constellation: Slow", "WMR_CPU_AFFINITY");
+
 	os_thread_helper_lock(&camera->slow_processing_thread);
 	while (os_thread_helper_is_running_locked(&camera->slow_processing_thread)) {
 		os_thread_helper_wait_locked(&camera->slow_processing_thread);
@@ -1210,6 +1218,10 @@ void *
 constellation_tracker_camera_fast_thread(void *ptr)
 {
 	Camera *camera = (Camera *)ptr;
+
+	// See the matching call in the slow thread above -- same WMR_CPU_AFFINITY, no-op
+	// unless set.
+	u_try_to_set_thread_affinity_from_env(U_LOGGING_INFO, "Constellation: Fast", "WMR_CPU_AFFINITY");
 
 	os_thread_helper_lock(&camera->fast_processing_thread);
 	while (os_thread_helper_is_running_locked(&camera->fast_processing_thread)) {

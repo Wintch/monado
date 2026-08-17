@@ -73,6 +73,13 @@ DEBUG_GET_ONCE_FLOAT_OPTION(wmr_stick_deadzone, "WMR_STICK_DEADZONE", 0.0f)
 //! ~15 min idle window is still pending. Seconds between resends per controller; 0 (default)
 //! disables it entirely. Suggested cadence for a live test: 600 (10 min), comfortably inside
 //! the ~15 min window without spamming the shared HID tunnel.
+//!
+//! v2 (T204's open item): v1 drove this from get_tracked_pose, which self-invalidated the whole
+//! A/B (T203) -- that path simply never runs with zero OpenXR clients, exactly the unattended
+//! case this exists for. The tick now lives in wmr_hmd.c's own read thread (see
+//! wmr_controller_base_send_keepalive_if_due and its call site in wmr_run_thread), which runs
+//! for the life of the HMD device regardless of clients. The env var and the two commands sent
+//! are unchanged.
 DEBUG_GET_ONCE_NUM_OPTION(wmr_controller_keepalive_s, "WMR_CONTROLLER_KEEPALIVE_S", 0)
 #include <string.h>
 #include <assert.h>
@@ -558,6 +565,10 @@ read_controller_config(struct wmr_controller_base *wcb)
 //! and are not known to be safe to repeat mid-session. Suggested cadence for a live test: 600s
 //! (10 min), comfortably inside the ~15 min window without adding much traffic to the shared
 //! HID tunnel.
+//!
+//! v2, called from wmr_controller_base_send_keepalive_if_due() below -- see that function's
+//! comment for WHERE this is now driven from and why the packet-receive callback was considered
+//! and rejected as the tick source (a real deadlock, not just a style preference).
 static void
 wmr_controller_send_keepalive(struct wmr_controller_base *wcb)
 {
@@ -594,6 +605,35 @@ wmr_controller_send_keepalive(struct wmr_controller_base *wcb)
 	WMR_INFO(wcb, "keepalive: resent status/imu enable to %s", wcb->base.str);
 }
 
+//! Public entry point for the WMR_CONTROLLER_KEEPALIVE_S tick, called once per iteration of
+//! wmr_hmd.c's own read thread (wmr_run_thread) for each connected controller -- see the call
+//! site there. That thread runs for the entire life of the HMD device, independent of whether
+//! any OpenXR client is connected, which is exactly the case v1 of this prototype missed: it
+//! drove from wmr_controller_base_get_tracked_pose, a path the OpenXR runtime only ever calls
+//! WITH a client attached, so it never ran during the unattended-idle window the whole feature
+//! exists for (docs/pruebas.jsonl T203/T204 in the reverb-g2 repo). No functional change to the
+//! cadence or the commands sent -- wmr_controller_send_keepalive still does its own due-check
+//! against WMR_CONTROLLER_KEEPALIVE_S and is a no-op unless it's set, so calling this every loop
+//! iteration (easily >1/s, even throttled under a companion-read storm) costs one relaxed
+//! monotonic-clock read and a mutex trylock-equivalent when the env var is off.
+//!
+//! v2 rationale for NOT using the packet-receive path (the other candidate): this controller's
+//! own receive_bytes callback (wmr_hmd_controller.c's receive_bytes_from_controller, or the
+//! equivalent for a direct-BT connection) is invoked while holding that connection's own lock,
+//! and actually sending from inside it would need to re-take that SAME lock one call down
+//! (wmr_controller_send_bytes -> wcc->send_bytes -> send_bytes_to_controller's
+//! os_mutex_lock(&conn->lock)) -- a guaranteed self-deadlock on the first keepalive send, not a
+//! hypothetical one. The run thread has no such conflict: it never holds hid_lock or any
+//! connection lock across this call (both control_read_packets and hololens_sensors_read_packets
+//! only hold hid_lock around the raw HID read itself, released well before dispatch returns
+//! here), so wmr_hmd_send_controller_packet's own brief hid_lock is free to take.
+void
+wmr_controller_base_send_keepalive_if_due(struct xrt_device *xdev)
+{
+	struct wmr_controller_base *wcb = wmr_controller_base(xdev);
+	wmr_controller_send_keepalive(wcb);
+}
+
 static xrt_result_t
 wmr_controller_base_get_tracked_pose(struct xrt_device *xdev,
                                      enum xrt_input_name name,
@@ -603,12 +643,6 @@ wmr_controller_base_get_tracked_pose(struct xrt_device *xdev,
 	DRV_TRACE_MARKER();
 
 	struct wmr_controller_base *wcb = wmr_controller_base(xdev);
-
-	// WMR_CONTROLLER_KEEPALIVE_S prototype: get_tracked_pose runs continuously for the life of
-	// the session (this is the same path that computes IMU-age/prediction below), which makes
-	// it a convenient place to drive a periodic, rate-limited resend. No-op unless the env var
-	// is set. See wmr_controller_send_keepalive for the full rationale and its open questions.
-	wmr_controller_send_keepalive(wcb);
 
 	// Variables needed for prediction.
 	int64_t last_imu_timestamp_ns = 0;

@@ -256,6 +256,11 @@ run_func(void *ptr)
 	// permanent whole-period phase shift). Raise it like the main loop does.
 	u_try_to_set_realtime_priority_on_thread(U_LOGGING_INFO, "Multi Client Module: Waiter");
 
+	// See the matching call in the main loop (comp_multi_system.c) -- same
+	// XRT_COMPOSITOR_CPU_AFFINITY, no-op unless set.
+	u_try_to_set_thread_affinity_from_env(U_LOGGING_INFO, "Multi Client Module: Waiter",
+	                                      "XRT_COMPOSITOR_CPU_AFFINITY");
+
 	os_thread_helper_lock(&mc->wait_thread.oth);
 
 	// Signal the start function that we are enterting the loop.

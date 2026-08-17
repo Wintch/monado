@@ -216,6 +216,20 @@ wmr_controller_base_deinit(struct wmr_controller_base *wcb);
 void
 wmr_controller_base_apply_stick_deadzone(struct xrt_vec2 *stick);
 
+/*!
+ * WMR_CONTROLLER_KEEPALIVE_S v2 (UNVALIDATED PROTOTYPE, default off): resend the two
+ * connect-time enable commands to this controller if the configured interval has elapsed.
+ * No-op, cheap, if the env var is unset. Meant to be called from a context that ticks
+ * regardless of connected OpenXR clients -- currently wmr_hmd.c's own read thread, once per
+ * loop iteration for each connected controller. Do NOT call this from a connection's
+ * receive_bytes callback: see the implementation's comment for why that specific call site
+ * deadlocks.
+ *
+ * @param xdev A device created by wmr_controller_base_init().
+ */
+void
+wmr_controller_base_send_keepalive_if_due(struct xrt_device *xdev);
+
 static inline void
 wmr_controller_connection_receive_bytes(struct wmr_controller_connection *wcc,
                                         uint64_t time_ns,

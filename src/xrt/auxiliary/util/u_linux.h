@@ -35,6 +35,23 @@ extern "C" {
 bool
 u_linux_try_to_set_realtime_priority_on_thread(enum u_logging_level log_level, const char *name);
 
+/*!
+ * Try to pin this thread to a set of CPUs named by the comma-separated list of CPU ids in
+ * the environment variable @p env_var_name (e.g. "0,1"). Unset or empty is a strict no-op:
+ * no syscall, thread affinity left exactly as the OS gave it.
+ *
+ * @param name          Thread name to be used in logging, can be NULL.
+ * @param log_level     Logging level to control chattiness.
+ * @param env_var_name  Name of the environment variable holding the CPU list.
+ *
+ * @return          Returns true if either nothing was requested, or the requested affinity
+ *                   was applied successfully; false if a set was requested and rejected.
+ *
+ * @ingroup aux_util
+ */
+bool
+u_linux_try_to_set_thread_affinity_from_env(enum u_logging_level log_level, const char *name, const char *env_var_name);
+
 
 #ifdef __cplusplus
 }
