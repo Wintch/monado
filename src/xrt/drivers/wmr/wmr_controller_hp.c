@@ -405,17 +405,16 @@ wmr_controller_hp_packet_parse(struct wmr_controller_hp *ctrl, const unsigned ch
 	if (wcb->base.device_type == XRT_DEVICE_TYPE_LEFT_HAND_CONTROLLER &&
 	    debug_get_bool_option_wmr_controller_left_yaw_gyro_invert()) {
 		last_input->imu.gyro.y = -last_input->imu.gyro.y;
-		// The accel MUST get the same reflection (2026-08-17, T207 reconciliation
-		// analysis): the factory Rt matrices of the two hands differ by ~178.6 deg
-		// about Y (computed from the 0063 determinant log; all matrices proper, so
-		// no factory reflection exists to recover), and the numerically-derived
-		// left-to-right correction is exactly diag(1,-1,1) applied to BOTH
-		// post-calibration sensor vectors. Negating only the gyro fed m_imu_3dof
-		// two INCONSISTENT conventions -- the gravity correction (driven by this
-		// accel) then fights the corrected gyro, which is what the wearer felt as
-		// still-wrong with the gyro-only fix active. Same gate, both sensors,
-		// coherent frame.
-		last_input->imu.acc.y = -last_input->imu.acc.y;
+		// MEASURED NEGATIVE RESULT, do not re-add (2026-08-17, T207): negating the
+		// accel Y here too -- which the frame-reconciliation algebra suggested as
+		// the "coherent" diag(1,-1,1) on both sensors -- made the left controller
+		// PRECESS: a 3D figure-8 wound up whole extra turns instead of closing
+		// ("sigue pegando vueltas completas"), while the right's closed exactly.
+		// A flipped gravity reference fighting a correct gyro never settles. The
+		// empirical truth is gyro-only: with just the gyro negation the wearer
+		// reported all three axes rotating correctly ("los ejes parecen estar
+		// bien"), leaving only a constant heading offset -- which is the separate
+		// no-absolute-yaw-reference problem, not a frame error.
 	}
 
 	uint32_t prev_ticks = last_input->imu.timestamp_ticks & UINT32_C(0xFFFFFFFF);
