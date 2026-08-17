@@ -1279,6 +1279,32 @@ apply_solve_yaw_correction(struct wmr_controller_base *wcb,
 	// and the result stays well-defined all the way through +-180 deg.
 	float yaw_error_rad = 2.0f * atan2f(yaw_only.y, yaw_only.w);
 
+	// WRAP to (-pi, pi] -- 2*atan2 spans (-2pi, 2pi], and an unwrapped error beyond +-180
+	// steps the LONG way around the circle. Caught live on first hardware contact (T208):
+	// the log showed error=-352.7 deg (really +7.3) and error=245.5 (really -114.5), and the
+	// anchor drove BOTH controllers into endless rotation chasing the long way.
+	if (yaw_error_rad > (float)M_PI) {
+		yaw_error_rad -= 2.0f * (float)M_PI;
+	} else if (yaw_error_rad < -(float)M_PI) {
+		yaw_error_rad += 2.0f * (float)M_PI;
+	}
+
+	// Ghost-solve trust window (0047's open near-pure-yaw mis-assignments produce solves at
+	// wildly different headings with equally-good reprojection): before the heading has ever
+	// locked, trust any error (the boot offset can legitimately be up to 180). Once the
+	// error has been observed small (<15 deg = locked), a sudden huge error (>60 deg) is far
+	// more likely a ghost cluster than a real re-offset -- skip it rather than un-locking a
+	// good heading. A REAL large re-offset cannot physically happen without a tracker reset.
+	const float yaw_lock_rad = 15.0f * ((float)M_PI / 180.0f);
+	const float yaw_distrust_rad = 60.0f * ((float)M_PI / 180.0f);
+	if (wcb->constellation.solve_yaw_locked && fabsf(yaw_error_rad) > yaw_distrust_rad) {
+		os_mutex_unlock(&wcb->data_lock);
+		return;
+	}
+	if (fabsf(yaw_error_rad) < yaw_lock_rad) {
+		wcb->constellation.solve_yaw_locked = true;
+	}
+
 	float step_rad = gain * yaw_error_rad;
 	if (step_rad > max_step_rad) {
 		step_rad = max_step_rad;

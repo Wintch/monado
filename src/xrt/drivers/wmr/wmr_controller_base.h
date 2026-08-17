@@ -168,6 +168,9 @@ struct wmr_controller_base
 		uint64_t gravity_gate_drop_count;
 		//! Gate-accepted solves that fed WMR_CONTROLLER_SOLVE_YAW_CORRECT (0 while off).
 		uint64_t solve_yaw_correction_count;
+		//! Set once the solve-yaw error has been observed small (heading acquired);
+		//! afterwards, huge sudden errors are distrusted as 0047's yaw-ghost solves.
+		bool solve_yaw_locked;
 
 		/*!
 		 * Every constellation sample this controller receives, keyed by the sample's own
