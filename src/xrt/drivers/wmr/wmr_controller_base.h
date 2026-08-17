@@ -166,6 +166,8 @@ struct wmr_controller_base
 		uint64_t out_of_range_count;
 		//! Samples rejected by the IMU gravity gate (wrong lobe of the solve's bistability).
 		uint64_t gravity_gate_drop_count;
+		//! Gate-accepted solves that fed WMR_CONTROLLER_SOLVE_YAW_CORRECT (0 while off).
+		uint64_t solve_yaw_correction_count;
 
 		/*!
 		 * Every constellation sample this controller receives, keyed by the sample's own
