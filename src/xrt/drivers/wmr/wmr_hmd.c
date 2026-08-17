@@ -617,6 +617,21 @@ control_read_packets(struct wmr_hmd *wh)
 
 	unsigned char buffer[WMR_FEATURE_BUFFER_SIZE];
 
+	// 0049 follow-up (2026-08-17, docs/44, T199): the backoff below used to be a 10ms
+	// os_nanosleep INSIDE this shared read loop. With the (universal) companion storm
+	// active, that capped the whole loop -- hololens sensors reads included -- at
+	// ~100 iterations/s against ~250 IMU packets/s produced, so the kernel-side ring
+	// filled and the IMU stream ran a pinned ~630ms stale. hw2mono (fit from IMU
+	// arrivals) absorbed the lag, pushing the camera stamps ~630ms into the FUTURE:
+	// that one number is the 632-666ms "magic number" behind the T192/T194 collapse
+	// (docs/39's image-ahead-of-IMU stall) and the constant ~1s perceived latency
+	// (prediction trusts the stamps, so it cannot bridge staleness it cannot see).
+	// Back off by SKIPPING the companion attempt until a deadline instead: same
+	// <=100Hz retry ceiling for the companion, zero impact on the loop's pace.
+	if (wh->companion_backoff_until_ns != 0 && os_monotonic_get_ns() < wh->companion_backoff_until_ns) {
+		return true;
+	}
+
 	// Do not block
 	os_mutex_lock(&wh->hid_lock);
 	int size = os_hid_read(wh->hid_control_dev, buffer, sizeof(buffer), 0);
@@ -651,11 +666,23 @@ control_read_packets(struct wmr_hmd *wh)
 			          size);
 		}
 		if (wh->companion_consecutive_read_errors > 50) {
-			os_nanosleep(U_TIME_1MS_IN_NS * 10);
+			// WMR_COMPANION_BACKOFF_BLOCKING=1 restores the old in-loop sleep for
+			// an A/B against the skip-based backoff (see the comment at the top of
+			// this function for why the sleep is the wrong shape).
+			static int backoff_blocking = -1;
+			if (backoff_blocking == -1) {
+				backoff_blocking = getenv("WMR_COMPANION_BACKOFF_BLOCKING") != NULL;
+			}
+			if (backoff_blocking) {
+				os_nanosleep(U_TIME_1MS_IN_NS * 10);
+			} else {
+				wh->companion_backoff_until_ns = os_monotonic_get_ns() + U_TIME_1MS_IN_NS * 10;
+			}
 		}
 		return true;
 	}
 	wh->companion_consecutive_read_errors = 0;
+	wh->companion_backoff_until_ns = 0;
 	if (size == 0) {
 		WMR_TRACE(wh, "No more data to read");
 		return true; // No more messages, return.

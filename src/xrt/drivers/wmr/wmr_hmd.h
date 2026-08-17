@@ -114,6 +114,13 @@ struct wmr_hmd
 	 * never gives up -- the companion device isn't load-bearing for tracking.
 	 */
 	int companion_consecutive_read_errors;
+	/*!
+	 * When nonzero, skip companion read attempts until this monotonic timestamp instead
+	 * of sleeping in the shared read loop. See control_read_packets: the old in-loop
+	 * 10ms sleep throttled the hololens sensors reads and let the IMU stream fall a
+	 * fixed ~630ms behind (docs/44, T199).
+	 */
+	uint64_t companion_backoff_until_ns;
 
 	//! Current desired HMD screen state.
 	bool hmd_screen_enable;
