@@ -19,6 +19,7 @@
 #include "constellation_tracker_rerun.hpp"
 #endif
 
+#include <cinttypes>
 #include <string>
 
 
@@ -32,6 +33,15 @@ DEBUG_GET_ONCE_BOOL_OPTION(constellation_tracker_enable_rerun, "CONSTELLATION_TR
 #ifdef XRT_FEATURE_RERUN
 DEBUG_GET_ONCE_BOOL_OPTION(constellation_tracker_rerun_spawn, "CONSTELLATION_TRACKER_RERUN_SPAWN", true)
 #endif
+
+// Blob-count / swamping guard (reverb-g2 docs/40 "Refined fix direction"; see the long
+// comment in Camera::processSampleSlow for the calibration story). Default 0 = off:
+// deliberately no built-in guess at N, see that comment for why.
+DEBUG_GET_ONCE_NUM_OPTION(constellation_max_blobs, "WMR_CONSTELLATION_MAX_BLOBS", 0)
+
+// Lost-controller search decimation (reverb-g2 docs/40 "controller-present gate", T197).
+// Default 0 = off. See the long comment in Camera::processSampleSlow.
+DEBUG_GET_ONCE_NUM_OPTION(constellation_lost_search_div, "WMR_CONSTELLATION_LOST_SEARCH_DIV", 0)
 
 /*
  *
@@ -428,6 +438,40 @@ Camera::processSampleSlow(CameraSample &sample)
 
 	CT_TRACE(tracker, "Starting slow processing for camera %p with %u blobs", (void *)this, sample.blob_count);
 
+	// Blob-count / swamping guard (docs/40 "Refined fix direction", option 1;
+	// WMR_CONSTELLATION_MAX_BLOBS, default 0 = off). The exhaustive correspondence search
+	// below is combinatorial in blob count (see correspondence_search.c's file comment), so
+	// a frame with an unusually high blob count both costs the most CPU and is the least
+	// likely to yield a reliable match -- exactly the pathological case
+	// WMR_CONSTELLATION_SEARCH_BUDGET_US (0051) was found NOT to be safe to default on for
+	// (it cuts real matches too). Skipping the search entirely for a swamped frame avoids
+	// that tradeoff: acquisition just tries again next frame.
+	//
+	// IMPORTANT, do not set N to "number of LEDs on a controller": the lab rig measured
+	// num_blobs=29 with BOTH controllers legitimately in view (2x16 LEDs) -- a threshold
+	// anywhere near ~16 would reject real dual-controller frames. There is no universal
+	// safe default: the everyday system's own *swamped* baseline (controllers OFF, room
+	// light only, i.e. zero real LEDs) measured 22-27 blobs, which overlaps the legitimate
+	// dual-controller count above. This guard therefore defaults OFF; enable it with a
+	// value measured on the box it runs on, above the highest legitimate blob count that
+	// box ever produces.
+	long max_blobs = debug_get_num_option_constellation_max_blobs();
+	if (max_blobs > 0 && (long)sample.blob_count > max_blobs) {
+		auto &swamp_log = data.swamped_blobs_log;
+		swamp_log.skipped_since_log++;
+		int64_t now_ns = os_monotonic_get_ns();
+		if (now_ns >= swamp_log.next_log_ns) {
+			CT_INFO(tracker,
+			        "Camera %p: skipped %" PRIu64
+			        " swamped frame(s) in the last ~5s (blob count over WMR_CONSTELLATION_MAX_BLOBS=%ld, "
+			        "latest frame had %u)",
+			        (void *)this, swamp_log.skipped_since_log, max_blobs, sample.blob_count);
+			swamp_log.skipped_since_log = 0;
+			swamp_log.next_log_ns = now_ns + 5 * (int64_t)U_TIME_1S_IN_NS;
+		}
+		return;
+	}
+
 	correspondence_search_set_blobs(data.cs, sample.blobs, sample.blob_count);
 
 	std::shared_ptr<CameraMosaic> mosaic = this->mosaic.lock();
@@ -464,8 +508,53 @@ Camera::processSampleSlow(CameraSample &sample)
 				// The device is tracking fine through the fast path; forget any
 				// backoff so the next genuine loss starts with fast retries.
 				data.deep_backoff.erase(device->id);
+				data.lost_search_decimation.erase(device->id);
 				continue; // we already did a fast process for this device and it succeeded, no need to
 				          // do a slow one
+			}
+
+			// Lost-controller search decimation (WMR_CONSTELLATION_LOST_SEARCH_DIV, default 0 =
+			// off; docs/40's "controller-present gate" idea, made safe). T197 (live gdb stacks
+			// taken during a sustained no-match session) caught pose_metrics' own
+			// project_led_points/find_best_matching_led pegging cores -- the cost lives in the
+			// model search itself, both shallow and deep passes, not only in the deep-search
+			// escalation the backoff below already throttles. The shallow pass runs on every
+			// sample "so acquisition is attempted continuously" (see that comment) -- exactly
+			// what needs decimating for a device that's genuinely not there (controllers off,
+			// long occlusion), not one mid-reacquisition. So: skip the whole per-device search
+			// attempt (both passes) outright, but only for N-1 out of every N eligible frames, so
+			// it keeps reacquiring -- just at 1/N the cost. E.g. N=10 against 30 Hz cameras still
+			// tries reacquisition at ~3 Hz, plenty to catch a controller entering view.
+			// "Recently matched" reuses last_known_pose.timestamp_ns, the same last-successful-
+			// pose stamp pushPose() already maintains below (no new per-model state needed): within
+			// 1s of a real match, decimation never engages, so a controller that IS being tracked
+			// is never throttled -- only one that's been lost for a while. Computed once per sample
+			// on the i==0 (shallow) pass and re-read on i==1 (deep) so both passes agree; otherwise
+			// a decimated shallow pass could still be followed by a full deep pass the same frame.
+			auto &decim = data.lost_search_decimation[device->id];
+			if (i == 0) {
+				bool recently_matched = false;
+				{
+					std::unique_lock<os::Mutex> lock(device->data_lock);
+					if (device->locked_data.last_known_pose.has_value() &&
+					    sample.timestamp_ns > device->locked_data.last_known_pose->timestamp_ns) {
+						int64_t age_ns = sample.timestamp_ns -
+						                 device->locked_data.last_known_pose->timestamp_ns;
+						recently_matched = age_ns < (int64_t)U_TIME_1S_IN_NS;
+					}
+				}
+
+				long lost_search_div = debug_get_num_option_constellation_lost_search_div();
+				if (recently_matched || lost_search_div <= 0) {
+					decim.frame_count = 0;
+					decim.skip_this_sample = false;
+				} else {
+					decim.frame_count++;
+					decim.skip_this_sample = (decim.frame_count % (uint32_t)lost_search_div) != 0;
+				}
+			}
+			if (decim.skip_this_sample) {
+				continue;
 			}
 
 			// Deep-search backoff: the full-depth combinatorial search is the most
@@ -541,6 +630,7 @@ Camera::processSampleSlow(CameraSample &sample)
 				// We found a pose for this device in this sample
 				device_state->needs_slow_processing = false;
 				data.deep_backoff.erase(device->id);
+				data.lost_search_decimation.erase(device->id);
 			} else {
 				CT_TRACE(tracker, "Camera %p slow processing for device %d failed to find a pose",
 				         (void *)this, device->id);

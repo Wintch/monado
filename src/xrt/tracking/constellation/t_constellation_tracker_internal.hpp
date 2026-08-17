@@ -233,6 +233,35 @@ public: // Fields
 			int64_t next_attempt_ns{0};
 		};
 		std::map<int, DeepBackoff> deep_backoff{};
+
+		/*!
+		 * Lost-controller search decimation state, keyed by device id
+		 * (WMR_CONSTELLATION_LOST_SEARCH_DIV, docs/40 "controller-present gate", T197).
+		 * @c frame_count counts eligible (needs_slow_processing) frames seen while the
+		 * device has not matched recently; @c skip_this_sample is the decimation
+		 * decision for the current sample, computed once on the i==0 (shallow) pass in
+		 * processSampleSlow and re-read on the i==1 (deep) pass so both agree. Only
+		 * touched by the slow processing thread, so unlocked (same rationale as
+		 * deep_backoff above).
+		 */
+		struct LostSearchDecimation
+		{
+			uint32_t frame_count{0};
+			bool skip_this_sample{false};
+		};
+		std::map<int, LostSearchDecimation> lost_search_decimation{};
+
+		/*!
+		 * Rate limiter for the blob-count/swamping guard's summary log line
+		 * (WMR_CONSTELLATION_MAX_BLOBS). Per-camera so concurrent slow-processing
+		 * threads on different cameras never race the same counter.
+		 */
+		struct SwampedBlobsLog
+		{
+			uint64_t skipped_since_log{0};
+			int64_t next_log_ns{0};
+		};
+		SwampedBlobsLog swamped_blobs_log{};
 	} slow_processing_thread_data;
 
 	/*!
