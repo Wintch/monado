@@ -123,6 +123,10 @@ struct wmr_controller_base
 
 	//! Time of last IMU sample, in CPU time.
 	uint64_t last_imu_timestamp_ns;
+	//! Monotonic time of the last WMR_CONTROLLER_KEEPALIVE_S resend, or 0 before the first one.
+	//! See the keepalive prototype in wmr_controller_base_get_tracked_pose. Diagnostic-only,
+	//! off by default.
+	uint64_t last_keepalive_ns;
 	//! Main fusion calculator.
 	struct m_imu_3dof fusion;
 	//! The last angular velocity from the IMU, for prediction.

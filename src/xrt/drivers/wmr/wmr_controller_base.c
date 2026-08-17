@@ -62,6 +62,18 @@ DEBUG_GET_ONCE_FLOAT_OPTION(wmr_constellation_gravity_gate_deg, "WMR_CONSTELLATI
 
 //! Radial thumbstick deadzone, applied by the per-model packet parsers. Off by default.
 DEBUG_GET_ONCE_FLOAT_OPTION(wmr_stick_deadzone, "WMR_STICK_DEADZONE", 0.0f)
+
+//! UNVALIDATED PROTOTYPE, off by default. docs/03 in the reverb-g2 repo documents the WMR
+//! controllers powering off after ~15 min motionless. This resends the two connect-time
+//! commands (status-report enable + IMU-on, wmr_controller_base_init) periodically, in the
+//! same order, on the theory that host traffic on the tunnel might postpone the sleep timer
+//! the same way real activity does. This is NOT confirmed to work: the sleep timer may be
+//! purely motion/IMU-activity based on the controller's own side, in which case resending
+//! these two commands is inert and does nothing to the timer -- the A/B against a real
+//! ~15 min idle window is still pending. Seconds between resends per controller; 0 (default)
+//! disables it entirely. Suggested cadence for a live test: 600 (10 min), comfortably inside
+//! the ~15 min window without spamming the shared HID tunnel.
+DEBUG_GET_ONCE_NUM_OPTION(wmr_controller_keepalive_s, "WMR_CONTROLLER_KEEPALIVE_S", 0)
 #include <string.h>
 #include <assert.h>
 #include <errno.h>
@@ -531,6 +543,57 @@ read_controller_config(struct wmr_controller_base *wcb)
 	return true;
 }
 
+//! UNVALIDATED PROTOTYPE (WMR_CONTROLLER_KEEPALIVE_S, default 0/off). docs/03 (reverb-g2 repo)
+//! documents the WMR controllers powering off after ~15 min motionless. This resends the same
+//! two connect-time commands wmr_controller_base_init sends once at startup -- status-report
+//! enable {0x06,0x03,0x01,0x00,0x02} and IMU-on {0x06,0x03,0x02,0xe1,0x02}, in that same order,
+//! via the same wmr_controller_send_bytes() -- on the theory that host traffic on the tunnel
+//! might postpone the controller's own idle-sleep timer, the same way real motion does.
+//!
+//! This is NOT confirmed to help. The sleep timer may be gated purely on the controller's own
+//! motion/IMU-activity sensing, in which case unsolicited host->controller traffic on an
+//! unrelated command is simply inert -- a live A/B against a real ~15 min idle window is still
+//! pending. Never resend the zero command {0x06,0x00,...} or the quiesce command {0x06,0x04,...}
+//! sent earlier in wmr_controller_base_init -- those are one-shot (re)init commands, not status,
+//! and are not known to be safe to repeat mid-session. Suggested cadence for a live test: 600s
+//! (10 min), comfortably inside the ~15 min window without adding much traffic to the shared
+//! HID tunnel.
+static void
+wmr_controller_send_keepalive(struct wmr_controller_base *wcb)
+{
+	long keepalive_s = debug_get_num_option_wmr_controller_keepalive_s();
+	if (keepalive_s <= 0) {
+		return;
+	}
+
+	uint64_t now_ns = os_monotonic_get_ns();
+	uint64_t keepalive_interval_ns = (uint64_t)keepalive_s * U_TIME_1S_IN_NS;
+
+	// Guard the shared timestamp with data_lock, same as last_imu_timestamp_ns -- get_tracked_pose
+	// can be called for the same device from more than one caller/thread. Do the actual send
+	// outside the lock: wmr_controller_send_bytes takes conn_lock itself, and there's no need to
+	// hold both.
+	bool due = false;
+	os_mutex_lock(&wcb->data_lock);
+	if (wcb->last_keepalive_ns == 0 || (now_ns - wcb->last_keepalive_ns) >= keepalive_interval_ns) {
+		wcb->last_keepalive_ns = now_ns;
+		due = true;
+	}
+	os_mutex_unlock(&wcb->data_lock);
+
+	if (!due) {
+		return;
+	}
+
+	// Same two commands, same order, as the connect-time send in wmr_controller_base_init.
+	const unsigned char wmr_controller_status_enable_cmd[64] = {0x06, 0x03, 0x01, 0x00, 0x02};
+	wmr_controller_send_bytes(wcb, wmr_controller_status_enable_cmd, sizeof(wmr_controller_status_enable_cmd));
+	const unsigned char wmr_controller_imu_on_cmd[64] = {0x06, 0x03, 0x02, 0xe1, 0x02};
+	wmr_controller_send_bytes(wcb, wmr_controller_imu_on_cmd, sizeof(wmr_controller_imu_on_cmd));
+
+	WMR_INFO(wcb, "keepalive: resent status/imu enable to %s", wcb->base.str);
+}
+
 static xrt_result_t
 wmr_controller_base_get_tracked_pose(struct xrt_device *xdev,
                                      enum xrt_input_name name,
@@ -540,6 +603,12 @@ wmr_controller_base_get_tracked_pose(struct xrt_device *xdev,
 	DRV_TRACE_MARKER();
 
 	struct wmr_controller_base *wcb = wmr_controller_base(xdev);
+
+	// WMR_CONTROLLER_KEEPALIVE_S prototype: get_tracked_pose runs continuously for the life of
+	// the session (this is the same path that computes IMU-age/prediction below), which makes
+	// it a convenient place to drive a periodic, rate-limited resend. No-op unless the env var
+	// is set. See wmr_controller_send_keepalive for the full rationale and its open questions.
+	wmr_controller_send_keepalive(wcb);
 
 	// Variables needed for prediction.
 	int64_t last_imu_timestamp_ns = 0;
