@@ -1738,6 +1738,15 @@ wmr_hmd_get_imu_calib(struct wmr_hmd *wh)
 	            .noise_std = {gn.x, gn.y, gn.z},
 	        },
 	};
+
+	// T204 blind spot: nothing in this project had ever printed the factory IMU calibration
+	// actually in use (Basalt's print_calibration() is dead code), yet a wrong/degenerate
+	// gyro mix_matrix would manifest EXACTLY as the measured motion-proportional roll drift
+	// (+0.9 deg/min worn vs ~0 at rest) and the yaw->tilt coupling. One INFO block per boot.
+	WMR_INFO(wh, "IMU factory calib: gyro mix [%f %f %f; %f %f %f; %f %f %f] bias [%f %f %f]", //
+	         gt[0], gt[1], gt[2], gt[3], gt[4], gt[5], gt[6], gt[7], gt[8], go.x, go.y, go.z);
+	WMR_INFO(wh, "IMU factory calib: accel mix [%f %f %f; %f %f %f; %f %f %f] bias [%f %f %f]", //
+	         at[0], at[1], at[2], at[3], at[4], at[5], at[6], at[7], at[8], ao.x, ao.y, ao.z);
 	return calib;
 }
 
