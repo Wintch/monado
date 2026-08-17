@@ -99,6 +99,7 @@ DEBUG_GET_ONCE_FLOAT_OPTION(slam_pos_deadzone, "SLAM_POS_DEADZONE_M", 0)
 DEBUG_GET_ONCE_OPTION(slam_filter, "SLAM_FILTER", nullptr)
 DEBUG_GET_ONCE_NUM_OPTION(slam_auto_reset_max_speed, "SLAM_AUTO_RESET_MAX_SPEED", 10)
 DEBUG_GET_ONCE_BOOL_OPTION(slam_reset_offset_carry, "SLAM_RESET_OFFSET_CARRY", true)
+DEBUG_GET_ONCE_NUM_OPTION(slam_correction_spread_ms, "SLAM_CORRECTION_SPREAD_MS", 0)
 DEBUG_GET_ONCE_BOOL_OPTION(euroc_record, "EUROC_RECORD", false)
 DEBUG_GET_ONCE_OPTION(euroc_record_path, "EUROC_RECORD_PATH", nullptr)
 DEBUG_GET_ONCE_OPTION(slam_csv_path, "SLAM_CSV_PATH", "evaluation/")
@@ -347,6 +348,37 @@ struct TrackerSlam
 		//! previous pose is the last one known to still be good.
 		struct xrt_pose anchor = XRT_POSE_IDENTITY;
 	} reset_offset;
+
+	//! Error-feedback smoothing of the DELIVERED pose stream across SLAM anchor arrivals
+	//! (SLAM_CORRECTION_SPREAD_MS, default 0/off). T202's wearer characterization: the
+	//! ~200ms "readjustment" snaps ("se siente como jittering de casco") happen at 4-4.6 Hz
+	//! while worn but are only weakly tied to which pose was the arriving anchor (x1.10
+	//! correlation) and are rare at rest (0.088 Hz) -- so the fix has to smooth the
+	//! DELIVERED stream continuously, not gate on anchor arrival the way the one euro
+	//! filter already does upstream of prediction (SLAM_FILTER_BEFORE_PREDICT). This is a
+	//! separate, later mechanism: every time a new anchor lands (see flush_poses), it
+	//! measures how far the raw prediction basis just jumped -- comparing what dead
+	//! reckoning would still be delivering from the OLD anchor at the new anchor's own
+	//! timestamp against the new anchor itself -- and folds that jump into this
+	//! accumulator, applied on top of every subsequently delivered pose (see
+	//! apply_correction_spread) and decayed back to zero over @ref spread_s instead of
+	//! landing in one frame. Position and YAW only: roll/pitch are gravity-referenced and
+	//! must never lag, so they are left to jump exactly as before (see the swing-discard
+	//! note in flush_poses, same trade-off 0057 already accepted for the reset-offset
+	//! transform this mirrors). Bypassed entirely across a divergence auto-reset (see
+	//! @ref TrackerSlam::reset_offset) -- a delta computed across two unrelated tracker
+	//! frames is meaningless, not merely stale.
+	struct
+	{
+		bool enabled = false;
+		double spread_s = 0.0; //!< Decay time constant, SLAM_CORRECTION_SPREAD_MS / 1000
+		xrt_vec3 pos_offset = XRT_VEC3_ZERO;
+		float yaw_offset_rad = 0.0f;
+		timepoint_ns last_decay_ns = 0; //!< Host monotonic clock, NOT when_ns -- see decay_correction_locked
+		bool have_last_decay = false;
+		Mutex mutex; //!< Same cross-thread hazard as @ref filter::mutex: compositor and the
+		             //!< WMR constellation tracker both call get_tracked_pose.
+	} correction;
 
 	int dropped_bundles = 0;                      //!< Consecutive bundles dropped for that reason
 	//! Candidate timestamp of a rejected insane forward jump (INT64_MIN = none). A single
@@ -962,6 +994,49 @@ gt_ui_push(TrackerSlam &t, timepoint_ns ts, xrt_pose tracked_pose)
  *
  */
 
+//! Forward declaration -- flush_poses needs to query "what would still be delivered from
+//! the OLD anchor" for correction spreading (see below), and predict_pose is defined
+//! further down in this file.
+static void
+predict_pose(TrackerSlam &t, timepoint_ns when_ns, struct xrt_space_relation *out_relation);
+
+//! Advances TrackerSlam::correction's decay by however long it's been since the last
+//! touch (either this call or the previous one, from either flush_poses below or
+//! apply_correction_spread further down -- both callers, on possibly different threads),
+//! and updates the "last touched" cursor. Must be called with @ref TrackerSlam::correction
+//! "t.correction".mutex held.
+//!
+//! Deliberately reads the HOST monotonic clock, not when_ns: when_ns is a query timestamp
+//! that can legitimately run backwards across callers (the WMR constellation tracker asks
+//! about past camera frames interleaved with the compositor's forward-marching predicted
+//! display time -- see TrackerSlam::filter::last_filtered_when_ns for the exact bug this
+//! sidesteps: a filter that divides by when_ns-delta blew up permanently on exactly this).
+//! Real elapsed wall-clock time is also the conceptually correct thing to decay against --
+//! the correction represents how wrong a real dead-reckoning belief turned out to be, and
+//! that staleness resolves in real time regardless of which timestamp happens to be
+//! queried next.
+static void
+decay_correction_locked(TrackerSlam &t)
+{
+	timepoint_ns now_ns = (timepoint_ns)os_monotonic_get_ns();
+
+	if (!t.correction.have_last_decay) {
+		t.correction.last_decay_ns = now_ns;
+		t.correction.have_last_decay = true;
+		return;
+	}
+
+	double dt_s = time_ns_to_s(now_ns - t.correction.last_decay_ns);
+	t.correction.last_decay_ns = now_ns;
+	if (dt_s <= 0.0 || t.correction.spread_s <= 0.0) {
+		return;
+	}
+
+	float decay = (float)exp(-dt_s / t.correction.spread_s);
+	t.correction.pos_offset *= decay;
+	t.correction.yaw_offset_rad *= decay;
+}
+
 //! Dequeue all tracked poses from the SLAM system and update prediction data with them.
 static bool
 flush_poses(TrackerSlam &t)
@@ -992,6 +1067,12 @@ flush_poses(TrackerSlam &t)
 		xrt_vec3 npos{data.px, data.py, data.pz};
 		xrt_quat nrot{data.ox, data.oy, data.oz, data.ow};
 		xrt_vec3 nvel{data.vx, data.vy, data.vz};
+
+		// Captured BEFORE the reset_offset block below, which clears this flag the
+		// instant it consumes it -- correction spreading further down needs to know
+		// whether THIS pose is the reset's first post-reset anchor, and by the time it
+		// runs the flag would already read false either way.
+		bool was_awaiting_reset_anchor = t.reset_offset.enabled && t.reset_offset.awaiting_anchor;
 
 		// Divergence-reset frame continuity (SLAM_RESET_OFFSET_CARRY, default on -- see
 		// TrackerSlam::reset_offset's doc comment, and the auto_reset block further down
@@ -1167,6 +1248,57 @@ flush_poses(TrackerSlam &t)
 
 		// Push to relationship history unless we are debugging prediction
 		if (t.dbg_pred_counter % t.dbg_pred_every == 0) {
+			// Error-feedback correction spreading (SLAM_CORRECTION_SPREAD_MS -- see
+			// TrackerSlam::correction's doc comment). Has to run against the OLD,
+			// pre-push slam_rels/IMU state, so it captures exactly the jump THIS
+			// anchor is about to introduce -- hence strictly before the push below,
+			// not after.
+			if (t.correction.enabled) {
+				if (was_awaiting_reset_anchor) {
+					// This pose is the reset's own first post-reset anchor --
+					// the world just got rebased by the block above, and any
+					// correction accumulated against the OLD frame no longer
+					// means anything. Drop it rather than fold a delta computed
+					// across two unrelated tracker frames into the accumulator.
+					unique_lock corr_lock(t.correction.mutex);
+					t.correction.pos_offset = XRT_VEC3_ZERO;
+					t.correction.yaw_offset_rad = 0.0f;
+				} else {
+					// "What would still be delivered from the OLD anchor, dead
+					// reckoned up to THIS anchor's own timestamp" -- i.e. exactly
+					// predict_pose's normal job, called one query early, before
+					// slam_rels sees the new pose.
+					xrt_space_relation prev_rel{};
+					predict_pose(t, nts, &prev_rel);
+					bool prev_valid =
+					    (prev_rel.relation_flags & XRT_SPACE_RELATION_POSITION_VALID_BIT) &&
+					    (prev_rel.relation_flags & XRT_SPACE_RELATION_ORIENTATION_VALID_BIT);
+					if (prev_valid) {
+						xrt_vec3 pos_delta = prev_rel.pose.position - rel.pose.position;
+
+						// Yaw-only relative rotation from the new anchor to
+						// what was still being delivered -- same swing-discard
+						// trade-off as the reset-offset transform above: roll/
+						// pitch are gravity-truth and must jump instantly, only
+						// heading gets spread.
+						xrt_quat new_rot_inv;
+						math_quat_invert(&rel.pose.orientation, &new_rot_inv);
+						xrt_quat full_delta;
+						math_quat_rotate(&prev_rel.pose.orientation, &new_rot_inv,
+						                 &full_delta);
+						xrt_vec2 swing_discarded;
+						float yaw_delta_rad;
+						math_quat_to_swing_twist(&full_delta, &swing_discarded,
+						                          &yaw_delta_rad);
+
+						unique_lock corr_lock(t.correction.mutex);
+						decay_correction_locked(t);
+						t.correction.pos_offset += pos_delta;
+						t.correction.yaw_offset_rad += yaw_delta_rad;
+					}
+				}
+			}
+
 			t.slam_rels.push(rel, nts);
 		}
 		t.dbg_pred_counter = (t.dbg_pred_counter + 1) % t.dbg_pred_every;
@@ -1297,6 +1429,43 @@ predict_pose(TrackerSlam &t, timepoint_ns when_ns, struct xrt_space_relation *ou
 	m_predict_relation(&rel, slam_to_now_dt, &predicted_relation);
 
 	*out_relation = predicted_relation;
+}
+
+//! Adds TrackerSlam::correction's decaying position/yaw offset on top of a freshly
+//! predicted pose (SLAM_CORRECTION_SPREAD_MS -- see that struct's doc comment). Called
+//! between predict_pose and filter_pose in t_slam_get_tracked_pose: after predict_pose so
+//! pred_traj_writer/pred_traj.csv keeps meaning "raw prediction, no correction spreading"
+//! for anyone diffing against it (same discipline this file already applies to
+//! tracking.csv), before filter_pose so the correction is included in what
+//! filt_traj_writer/filt_traj.csv and the application both actually receive -- and so a
+//! post-predict one euro filter (SLAM_FILTER_BEFORE_PREDICT=0) gets a chance to smooth it
+//! rather than the two mechanisms operating on disjoint pieces of the stream.
+static void
+apply_correction_spread(TrackerSlam &t, struct xrt_space_relation *out_relation)
+{
+	if (!t.correction.enabled) {
+		return;
+	}
+
+	// Nothing to add on top of a relation that isn't actually tracked.
+	if (!(out_relation->relation_flags & XRT_SPACE_RELATION_POSITION_VALID_BIT) ||
+	    !(out_relation->relation_flags & XRT_SPACE_RELATION_ORIENTATION_VALID_BIT)) {
+		return;
+	}
+
+	unique_lock corr_lock(t.correction.mutex);
+	decay_correction_locked(t);
+
+	out_relation->pose.position += t.correction.pos_offset;
+
+	if (t.correction.yaw_offset_rad != 0.0f) {
+		xrt_vec2 zero_swing{0, 0};
+		xrt_quat yaw_quat;
+		math_quat_from_swing_twist(&zero_swing, t.correction.yaw_offset_rad, &yaw_quat);
+		xrt_quat corrected;
+		math_quat_rotate(&yaw_quat, &out_relation->pose.orientation, &corrected);
+		out_relation->pose.orientation = corrected;
+	}
 }
 
 //! Various filters to remove noise from the predicted trajectory.
@@ -1674,6 +1843,8 @@ t_slam_get_tracked_pose(struct xrt_tracked_slam *xts, timepoint_ns when_ns, stru
 
 	predict_pose(t, when_ns, out_relation);
 	t.pred_traj_writer->push({when_ns, out_relation->pose});
+
+	apply_correction_spread(t, out_relation);
 
 	filter_pose(t, when_ns, out_relation);
 	t.filt_traj_writer->push({when_ns, out_relation->pose});
@@ -2151,6 +2322,16 @@ t_slam_create(struct xrt_frame_context *xfctx,
 	if (t.reset_offset.enabled) {
 		SLAM_INFO("Divergence-reset frame continuity on: an auto-reset above will carry its offset "
 		          "into the output pose instead of teleporting (SLAM_RESET_OFFSET_CARRY=0 disables)");
+	}
+
+	long correction_spread_ms = debug_get_num_option_slam_correction_spread_ms();
+	t.correction.enabled = correction_spread_ms > 0;
+	t.correction.spread_s = (double)correction_spread_ms / 1000.0;
+	if (t.correction.enabled) {
+		SLAM_INFO("Correction spreading on: anchor-arrival jumps folded into a %ld ms decaying "
+		          "offset on the delivered pose instead of landing in one frame "
+		          "(SLAM_CORRECTION_SPREAD_MS=0 disables)",
+		          correction_spread_ms);
 	}
 
 	t.filter.one_euro_before_predict = debug_get_bool_option_slam_filter_before_predict();
