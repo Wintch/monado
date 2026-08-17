@@ -1092,6 +1092,18 @@ predict_pose(TrackerSlam &t, timepoint_ns when_ns, struct xrt_space_relation *ou
 
 
 	if (t.pred_type == SLAM_PRED_DEAD_RECKONING) {
+		// Diagnostic for the 2026-08-17 constant ~1 s wearer lag: the integrator never
+		// fails (zero SLAM_ERROR hits) yet the delivered stream matches the filtered
+		// anchor exactly, so either the anchor's stamp is near-now (timestamp-domain
+		// skew: nothing to integrate, staleness unbridgeable) or the gap is real and
+		// integration is inert some other way. Log the one number that discriminates:
+		// the anchor age the integrator actually sees. Rate-limited, ~1 line/s at 250 Hz.
+		static int aage_counter = 0;
+		if ((aage_counter++ % 256) == 0) {
+			SLAM_INFO("pred: anchor age %.1f ms (when_ns=%" PRId64 " rel_ts=%" PRId64 ")",
+			          (double)(when_ns - (int64_t)rel_ts) / 1e6, when_ns, (int64_t)rel_ts);
+		}
+
 		os_mutex_lock(&t.lock_ff);
 
 		if (!t_apply_dead_reckoning(   //
