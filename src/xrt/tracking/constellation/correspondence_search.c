@@ -842,7 +842,28 @@ search_pose_for_model(struct correspondence_search *cs, struct cs_model_info *mi
 
 	// Start correspondence search for this model.
 	// At this stage, each image point has a list of the nearest neighbours filtered for this model
+	//
+	// Bound the worst-case search cost so the constellation matcher cannot starve the SLAM frontend
+	// of CPU. Without a deadline the search runs the full combinatorial LED<->blob expansion on every
+	// frame that yields no strong match -- e.g. controllers powered off, or spurious blobs from room
+	// light -- which was measured pegging 3 CPU cores and dropping ~1/3 of SLAM frames (reverb-g2
+	// docs/40). A real target normally produces a strong match (early return below) long before the
+	// budget, so the deadline only bites the pathological no-match case; a pose missed on one frame is
+	// recovered on the next. WMR_CONSTELLATION_SEARCH_BUDGET_US=0 (default) keeps the original unbounded
+	// behaviour; set e.g. 3000 to cap each per-model search at 3 ms.
+	static int64_t search_budget_ns = -1;
+	if (search_budget_ns < 0) {
+		const char *env = getenv("WMR_CONSTELLATION_SEARCH_BUDGET_US");
+		// Benign race if two search threads init concurrently: both write the same deterministic value.
+		search_budget_ns = (env != NULL) ? (int64_t)atoll(env) * 1000 : 0;
+	}
+	const uint64_t search_deadline =
+	    (search_budget_ns > 0) ? os_monotonic_get_ns() + (uint64_t)search_budget_ns : 0;
+
 	for (l = 0; l < model->num_points; l++) {
+		if (search_deadline != 0 && os_monotonic_get_ns() > search_deadline) {
+			break; // Search budget exhausted for this model this frame; keep the best match so far.
+		}
 		struct t_constellation_search_led_candidate *c = model->points[l];
 		mi->led_index = l;
 
