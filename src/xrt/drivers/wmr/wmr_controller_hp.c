@@ -10,6 +10,7 @@
  */
 #include "math/m_api.h"
 
+#include "util/u_debug.h"
 #include "util/u_device.h"
 #include "util/u_trace_marker.h"
 #include "util/u_var.h"
@@ -22,6 +23,19 @@
 #include <inttypes.h>
 
 #include "wmr_controller.h"
+
+// WMR_CONTROLLER_LEFT_YAW_GYRO_INVERT (2026-08-17, T206/T207 live derivation): the LEFT G2
+// controller's calibrated gyro Y-component has the wrong sign, and ONLY that axis -- pitch and
+// roll are correct on both hands, and the RIGHT controller's gyro is correct on all three axes.
+// See the long derivation comment at the use site below (wmr_controller_hp_packet_parse) for the
+// measured numbers and the proof that this canNOT be fixed downstream as an output-orientation
+// rotation/reflection composed in wmr_controller_base_get_tracked_pose (a single flipped body
+// axis is a reflection with an odd sign-flip count, which no rotation OR reflection conjugation
+// of the delivered quaternion can reproduce without also disturbing the other two, already-good,
+// axes -- that is exactly why WMR_CONTROLLER_ORIENT_FIX's plain conjugate made things worse
+// instead of better). The only mathematically sound fix is to correct the sign at the point the
+// bad axis enters the fusion filter, before it gets integrated. Default off; LEFT hand only.
+DEBUG_GET_ONCE_BOOL_OPTION(wmr_controller_left_yaw_gyro_invert, "WMR_CONTROLLER_LEFT_YAW_GYRO_INVERT", false)
 
 #define WMR_TRACE(ctrl, ...) U_LOG_XDEV_IFL_T(&ctrl->base.base, ctrl->base.log_level, __VA_ARGS__)
 #define WMR_TRACE_HEX(ctrl, ...) U_LOG_XDEV_IFL_T_HEX(&ctrl->base.base, ctrl->base.log_level, __VA_ARGS__)
@@ -339,6 +353,59 @@ wmr_controller_hp_packet_parse(struct wmr_controller_hp *ctrl, const unsigned ch
 	math_quat_rotate_vec3(&wcb->config.sensors.transforms.P_oxr_gyr.orientation, &last_input->imu.gyro,
 	                      &last_input->imu.gyro);
 
+	// WMR_CONTROLLER_LEFT_YAW_GYRO_INVERT (2026-08-17, T206/T207): live labeled A/B/C motion
+	// captures (WMR_CONTROLLER_CALIBRATION_LOG=1; still 10s -> 5x pure pitch -> still ->
+	// 5x pure roll -> still -> 5x pure yaw -> still, RIGHT then LEFT controller, same session,
+	// same wearer, same physical motions) measured the dominant post-calibration gyro axis
+	// (this exact .imu.gyro vector, after mix_matrix + bias + P_oxr_gyr above) per phase:
+	//
+	//               RIGHT (known-good, wearer-confirmed)   LEFT (wearer-confirmed wrong)
+	//   PITCH  ->    +X   (rms 2.09 vs 0.48/0.56 other)     +X   (rms 1.77 vs 0.18/0.29 other)
+	//   ROLL   ->    -Z   (rms 1.79 vs 0.52/0.52 other)     -Z   (rms 1.59 vs 0.48/0.68 other)
+	//   YAW    ->    +Y   (rms 1.70 vs 0.57/0.63 other)     -Y   (rms 1.57 vs 0.55/0.64 other)
+	//
+	// Pitch and roll already match the target OpenXR grip convention (physical pitch about
+	// +X, physical roll about the forward axis Z) IDENTICALLY on both hands, sign included --
+	// R = identity is the right answer there, matching the live wearer report that the right
+	// controller needs no fix at all. Yaw is the ONE axis that differs between hands, by a
+	// pure sign flip, with pitch/roll on that same hand otherwise unaffected.
+	//
+	// That is NOT something any output-side orientation transform can correct, and this is
+	// provable, not just empirically likely. Any candidate fix of the existing A/B menu's
+	// shape -- q_out = q_imu * R, or R * q_imu, or q_imu^-1, for some fixed quaternion R --
+	// composes only PROPER rotations (determinant +1 by construction: quaternions can only
+	// ever represent rotations, never reflections) with q_imu (also a proper rotation). The
+	// determinant of a product is the product of the determinants, so any such q_out is
+	// related to q_imu by an overall map whose determinant is always +1*+1 = +1. But the
+	// map this bug actually needs -- leave X and Z exactly alone, flip only Y -- has
+	// determinant (+1)*(-1)*(+1) = -1: a REFLECTION. No composition of proper rotations can
+	// ever equal a reflection (+1 can never equal -1). This is exactly why
+	// WMR_CONTROLLER_ORIENT_FIX's plain conjugate (patch 0061, itself a proper rotation:
+	// q^-1 has determinant +1 too) made the symptom WORSE ("rotates about unseen
+	// intermediate axes") instead of fixing it -- it was mathematically incapable of
+	// reproducing this fault no matter how it's tuned, and so is every other knob in this
+	// file's existing A/B menu. The only place a single-axis sign defect like this CAN be
+	// fixed is before it becomes part of a rotation at all -- i.e. on the raw vector, here.
+	//
+	// It also explains WHY only yaw is affected: m_imu_3dof's accelerometer/gravity
+	// correction (M_IMU_3DOF_USE_GRAVITY_DUR_20MS, wcb->fusion) continuously re-anchors pitch
+	// and roll against gravity every update, so a wrong-signed gyro axis feeding those two
+	// gets corrected out almost immediately. Yaw has no such reference -- gravity cannot
+	// observe heading -- so a sign error on the yaw-carrying axis integrates uncorrected
+	// forever. The fix therefore has to happen HERE, before m_imu_3dof_update ever sees the
+	// sample, not as a post-hoc rotation of its output.
+	//
+	// NOT yet hardware-root-caused (still open whether the true defect is in the factory
+	// gyro.mix_matrix, the bias_offsets, or P_oxr_gyr.orientation for this specific unit --
+	// none of those raw values are logged today) -- this is the smallest, most direct,
+	// numerically-verified compensating fix at the one point in the pipeline where the
+	// measured symptom (post-calibration .imu.gyro) already matches the target exactly once
+	// Y is negated. Left hand only; right hand's pipeline is untouched. Default off, for a
+	// live A/B.
+	if (wcb->base.device_type == XRT_DEVICE_TYPE_LEFT_HAND_CONTROLLER &&
+	    debug_get_bool_option_wmr_controller_left_yaw_gyro_invert()) {
+		last_input->imu.gyro.y = -last_input->imu.gyro.y;
+	}
 
 	uint32_t prev_ticks = last_input->imu.timestamp_ticks & UINT32_C(0xFFFFFFFF);
 
