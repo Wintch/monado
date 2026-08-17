@@ -732,7 +732,12 @@ wmr_run_thread(void *ptr)
 
 #ifdef XRT_OS_LINUX
 	// Try to raise priority of this thread.
-	u_linux_try_to_set_realtime_priority_on_thread(wh->log_level, "WMR: USB-HMD");
+	// T194 experiment: WMR_HMD_THREAD_NO_RT=1 skips this to test whether SCHED_FIFO max
+	// priority combined with 0049's 10ms backoff sleep is what starves Basalt's own
+	// threads (see docs/pruebas.jsonl T194). Temporary, not a real fix either way.
+	if (getenv("WMR_HMD_THREAD_NO_RT") == NULL) {
+		u_linux_try_to_set_realtime_priority_on_thread(wh->log_level, "WMR: USB-HMD");
+	}
 #endif
 
 
