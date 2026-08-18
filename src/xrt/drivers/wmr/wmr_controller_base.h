@@ -171,6 +171,9 @@ struct wmr_controller_base
 		//! Set once the solve-yaw error has been observed small (heading acquired);
 		//! afterwards, huge sudden errors are distrusted as 0047's yaw-ghost solves.
 		bool solve_yaw_locked;
+		//! Gate-accepted solves further rejected by WMR_CONSTELLATION_YAW_PRIOR_DEG for
+		//! disagreeing with the locked fusion heading (0 while off, or before lock).
+		uint64_t yaw_prior_reject_count;
 
 		/*!
 		 * Every constellation sample this controller receives, keyed by the sample's own
