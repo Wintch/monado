@@ -328,7 +328,8 @@ wmr_controller_hp_packet_parse(struct wmr_controller_hp *ctrl, const unsigned ch
 		// Scale unverified -- see the long comment in wmr_controller_hp_get_battery_status()
 		// below. Logged on every CHANGE (not every packet) specifically so a real
 		// charge/discharge cycle can be correlated against this byte later.
-		WMR_INFO(ctrl, "Controller battery raw byte: %u -> %u", last_input->battery, new_battery);
+		WMR_INFO(ctrl, "Controller battery raw byte [%s]: %u -> %u", ctrl->base.base.str,
+		         last_input->battery, new_battery);
 	}
 	last_input->battery = new_battery;
 	ctrl->has_battery_sample = true;
