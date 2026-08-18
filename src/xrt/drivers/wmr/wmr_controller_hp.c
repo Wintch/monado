@@ -37,6 +37,22 @@
 // bad axis enters the fusion filter, before it gets integrated. Default off; LEFT hand only.
 DEBUG_GET_ONCE_BOOL_OPTION(wmr_controller_left_yaw_gyro_invert, "WMR_CONTROLLER_LEFT_YAW_GYRO_INVERT", false)
 
+// WMR_CONTROLLER_LEFT_GYRO_FIT (2026-08-17, T208 followup): WMR_CONTROLLER_LEFT_YAW_GYRO_INVERT
+// above corrects the dominant sign flip on the left controller's yaw axis, but the wearer's own
+// figure-8 test (T208) found a residual: the left gizmo "sigue acumulando algo y rotando de a
+// poco drifteando sobre un eje fantasma medio combinado" -- a small cross-axis misalignment that
+// a pure per-axis sign flip cannot remove, because non-commutative integration of even a 1-3
+// degree axis tilt winds up over a multi-turn motion instead of cancelling. This flag replaces
+// the sign-only correction with the full fitted left-to-right rotation matrix below (applied
+// AFTER the Y-invert above, on top of it, not instead of it -- see the gating assert at the use
+// site). Fitted from a labeled RIGHT-then-LEFT capture (WMR_CONTROLLER_CALIBRATION_LOG=1; each
+// hand: still 10s / 8x pure pitch / still / 8x pure roll / still / 8x pure yaw / still) taken
+// WITH WMR_CONTROLLER_LEFT_YAW_GYRO_INVERT=1 already active, so this matrix is relative to the
+// already-sign-fixed left stream, not the raw one. Default off, for a live wearer A/B. Gyro only
+// -- WMR_CONTROLLER_LEFT_YAW_GYRO_INVERT's own comment above already measured (T207) that the
+// analogous accel extension made things worse (precession), so this stays gyro-only too.
+DEBUG_GET_ONCE_BOOL_OPTION(wmr_controller_left_gyro_fit, "WMR_CONTROLLER_LEFT_GYRO_FIT", false)
+
 #define WMR_TRACE(ctrl, ...) U_LOG_XDEV_IFL_T(&ctrl->base.base, ctrl->base.log_level, __VA_ARGS__)
 #define WMR_TRACE_HEX(ctrl, ...) U_LOG_XDEV_IFL_T_HEX(&ctrl->base.base, ctrl->base.log_level, __VA_ARGS__)
 #define WMR_DEBUG(ctrl, ...) U_LOG_XDEV_IFL_D(&ctrl->base.base, ctrl->base.log_level, __VA_ARGS__)
@@ -415,6 +431,42 @@ wmr_controller_hp_packet_parse(struct wmr_controller_hp *ctrl, const unsigned ch
 		// reported all three axes rotating correctly ("los ejes parecen estar
 		// bien"), leaving only a constant heading offset -- which is the separate
 		// no-absolute-yaw-reference problem, not a frame error.
+
+		// WMR_CONTROLLER_LEFT_GYRO_FIT (2026-08-17, T208 followup): the exact left-to-right
+		// fitted matrix, composed on top of the Y-invert above (FIT requires INVERT=1, as
+		// captured -- it is meaningless applied to the raw un-inverted stream, hence nested
+		// inside this same `if`). Derivation: per-hand, per-phase (pitch/roll/yaw) dominant
+		// rotation axis was estimated from WMR_CONTROLLER_CALIBRATION_LOG=1 samples with
+		// |gyro| > 1 rad/s, sign-aligned to a running mean, averaged and normalized to a
+		// unit vector; M0 = A_right @ inv(A_left) over the 3 phase pairs, then orthogonalized
+		// via SVD (M = U @ Vt, det(M) landed at +1.0 without forcing it -- consistent with
+		// this being a small residual on top of an already sign-corrected stream, not a
+		// second reflection). Fitted 2026-08-17 (T208 followup capture, ~vr/jack-in-
+		// wayland.log). Per-phase residual angle between M @ a_left and a_right, RIGHT
+		// controller's own axis as ground truth: pitch 6.3 deg, roll 9.7 deg, yaw 11.0 deg
+		// (down from 6.8/31.4/11.8 deg raw, before this fit). NOTE, measured honestly: those
+		// residuals, and M's own 21.8 deg axis-angle deviation from identity, are much larger
+		// than the "1-3 degree" cross-axis residual the figure-8 test's own qualitative
+		// description suggested -- the roll phase alone contributed a 31 deg raw mismatch
+		// between hands. This is a single 8-rep capture per axis with no repeat trials, and
+		// both hands independently show real, systematic off-axis leakage during the roll
+		// phase (confirmed via PCA on the raw samples, ~90%+ variance explained by one axis,
+		// i.e. not sensor noise) -- some of what M is fitting here may be this session's own
+		// left/right hand biomechanical asymmetry rather than a fixed hardware property of
+		// the controller. Do not treat this as a settled correction the way the Y-invert is;
+		// it needs the wearer's live A/B, precisely because the numbers here are bigger than
+		// expected.
+		if (debug_get_bool_option_wmr_controller_left_gyro_fit()) {
+			static const struct xrt_matrix_3x3 left_gyro_fit = {
+			    .v =
+			        {
+			            0.992832054f,  0.017066473f,  0.118293056f,
+			            0.025801456f,  0.935808594f,  -0.351563024f,
+			            -0.116699600f, 0.352095172f,  0.928660429f,
+			        },
+			};
+			math_matrix_3x3_transform_vec3(&left_gyro_fit, &last_input->imu.gyro, &last_input->imu.gyro);
+		}
 	}
 
 	uint32_t prev_ticks = last_input->imu.timestamp_ticks & UINT32_C(0xFFFFFFFF);
