@@ -31,6 +31,7 @@
 #include "wmr_config_key.h"
 
 #include <ctype.h>
+#include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 
@@ -78,6 +79,11 @@ DEBUG_GET_ONCE_FLOAT_OPTION(wmr_controller_solve_yaw_correct, "WMR_CONTROLLER_SO
 
 //! Radial thumbstick deadzone, applied by the per-model packet parsers. Off by default.
 DEBUG_GET_ONCE_FLOAT_OPTION(wmr_stick_deadzone, "WMR_STICK_DEADZONE", 0.0f)
+
+//! Per-stick center auto-calibration (WS2.2 of the 2026-08-17/18 closing plan; see @ref
+//! wmr_controller_base_apply_stick_autocenter). Default off for an A/B against plain
+//! WMR_STICK_DEADZONE before the launcher flips it on.
+DEBUG_GET_ONCE_BOOL_OPTION(wmr_stick_autocenter, "WMR_STICK_AUTOCENTER", false)
 
 //! UNVALIDATED PROTOTYPE, off by default. docs/03 in the reverb-g2 repo documents the WMR
 //! controllers powering off after ~15 min motionless. This resends the two connect-time
@@ -1001,6 +1007,71 @@ wmr_controller_base_apply_stick_deadzone(struct xrt_vec2 *stick)
 	const float rescale = (mag - deadzone) / (1.0f - deadzone) / mag;
 	stick->x = fminf(fmaxf(stick->x * rescale, -1.0f), 1.0f);
 	stick->y = fminf(fmaxf(stick->y * rescale, -1.0f), 1.0f);
+}
+
+//! Sampling window for WMR_STICK_AUTOCENTER: closes at whichever of the two comes first, so a
+//! slow-arriving stream (unlikely on this tunnel, but not load-bearing to assume otherwise)
+//! still gets a bounded wait instead of never freezing.
+#define WMR_STICK_AUTOCENTER_WINDOW_NS (5 * (uint64_t)U_TIME_1S_IN_NS)
+#define WMR_STICK_AUTOCENTER_WINDOW_SAMPLES 500
+//! Plausible resting-stick bound: large enough to include the wearer's own measured drifted
+//! centers (~0.15-0.3 off zero on either axis), small enough that a real half-deflection during
+//! the window reads as "grabbed it", not "resting".
+#define WMR_STICK_AUTOCENTER_RESTING_BOUND 0.35f
+
+void
+wmr_controller_base_apply_stick_autocenter(struct wmr_controller_base *wcb, struct xrt_vec2 *stick, bool clicked)
+{
+	if (!debug_get_bool_option_wmr_stick_autocenter()) {
+		return;
+	}
+
+	const char *hand = wcb->base.device_type == XRT_DEVICE_TYPE_LEFT_HAND_CONTROLLER ? "left" : "right";
+
+	if (wcb->stick_autocenter.locked) {
+		stick->x = fminf(fmaxf(stick->x - wcb->stick_autocenter.offset.x, -1.0f), 1.0f);
+		stick->y = fminf(fmaxf(stick->y - wcb->stick_autocenter.offset.y, -1.0f), 1.0f);
+		return;
+	}
+
+	if (wcb->stick_autocenter.aborted) {
+		// Fell back to plain deadzone already; nothing left to do here.
+		return;
+	}
+
+	uint64_t now_ns = os_monotonic_get_ns();
+	if (wcb->stick_autocenter.window_start_ns == 0) {
+		wcb->stick_autocenter.window_start_ns = now_ns;
+	}
+
+	const float mag = sqrtf(stick->x * stick->x + stick->y * stick->y);
+	if (clicked || mag > WMR_STICK_AUTOCENTER_RESTING_BOUND) {
+		wcb->stick_autocenter.aborted = true;
+		WMR_WARN(wcb,
+		         "stick autocenter %s: aborted (%s during the sampling window) -- falling back to plain "
+		         "deadzone",
+		         hand, clicked ? "clicked" : "moved past the resting bound");
+		return;
+	}
+
+	wcb->stick_autocenter.accum.x += stick->x;
+	wcb->stick_autocenter.accum.y += stick->y;
+	wcb->stick_autocenter.sample_count++;
+
+	bool window_elapsed = (now_ns - wcb->stick_autocenter.window_start_ns) >= WMR_STICK_AUTOCENTER_WINDOW_NS;
+	bool window_full = wcb->stick_autocenter.sample_count >= WMR_STICK_AUTOCENTER_WINDOW_SAMPLES;
+	if (!window_elapsed && !window_full) {
+		// Still sampling -- this sample was folded into the mean above, not corrected itself.
+		return;
+	}
+
+	wcb->stick_autocenter.offset.x = wcb->stick_autocenter.accum.x / (float)wcb->stick_autocenter.sample_count;
+	wcb->stick_autocenter.offset.y = wcb->stick_autocenter.accum.y / (float)wcb->stick_autocenter.sample_count;
+	wcb->stick_autocenter.locked = true;
+
+	WMR_INFO(wcb, "stick autocenter %s: offset=(%.4f, %.4f) [%u samples, %" PRIu64 " ms]", hand,
+	         (double)wcb->stick_autocenter.offset.x, (double)wcb->stick_autocenter.offset.y,
+	         wcb->stick_autocenter.sample_count, (now_ns - wcb->stick_autocenter.window_start_ns) / U_TIME_1MS_IN_NS);
 }
 
 /*

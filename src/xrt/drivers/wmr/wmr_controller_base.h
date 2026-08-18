@@ -188,6 +188,30 @@ struct wmr_controller_base
 		 */
 		struct t_constellation_tracker_tracking_source tracking_source;
 	} constellation;
+
+	/*!
+	 * Per-stick center auto-calibration state (WMR_STICK_AUTOCENTER, default off). WMR
+	 * thumbstick configs carry no factory center calibration, so a resting stick can read
+	 * up to ~0.3 off zero on either axis -- see @ref wmr_controller_base_apply_stick_autocenter.
+	 */
+	struct
+	{
+		//! Set once the sampling window has closed with a frozen @ref offset, which is then
+		//! subtracted from every later sample. Mutually exclusive with @ref aborted.
+		bool locked;
+		//! Set if the window ever saw the stick move past the resting bound, or get clicked,
+		//! before it could close -- autocenter gives up for this controller's lifetime and
+		//! @ref wmr_controller_base_apply_stick_autocenter passes the stick through unmodified.
+		bool aborted;
+		//! CPU monotonic time of this controller's first stick sample, 0 before it arrives.
+		uint64_t window_start_ns;
+		//! Number of samples accumulated into @ref accum so far.
+		uint32_t sample_count;
+		//! Running sum of raw (pre-deadzone) stick x/y while the window is open.
+		struct xrt_vec2 accum;
+		//! Frozen per-stick center offset, valid only once @ref locked is true.
+		struct xrt_vec2 offset;
+	} stick_autocenter;
 };
 
 /*!
@@ -220,6 +244,31 @@ wmr_controller_base_deinit(struct wmr_controller_base *wcb);
  */
 void
 wmr_controller_base_apply_stick_deadzone(struct xrt_vec2 *stick);
+
+/*!
+ * Optional per-stick center auto-calibration (WMR_STICK_AUTOCENTER, default off). WMR
+ * controller configs carry no factory stick-center calibration (see @ref
+ * wmr_controller_base_apply_stick_deadzone above), so a resting stick can read up to ~0.3
+ * off zero on either axis -- the wearer's own symptom was the left stick self-pressing
+ * up+left and the right pressing hard-left + slightly up. During the first ~5s (or 500
+ * samples, whichever closes the window first) after @p wcb's first stick sample, while the
+ * raw magnitude stays under a plausible resting bound and the stick isn't clicked, this
+ * accumulates the mean raw position; once the window closes, that mean freezes as this
+ * stick's center offset and is subtracted (then clamped to [-1,1]) from every later sample.
+ * If the window instead sees the stick move past the resting bound, or get clicked, first
+ * (the wearer grabbed it during boot) -- autocenter aborts for this controller's lifetime,
+ * logs a WARN, and @p stick passes through unmodified from then on: a wrong center is worse
+ * than none. Call this BEFORE @ref wmr_controller_base_apply_stick_deadzone, with the same
+ * raw per-packet stick vector, so the deadzone can later shrink now that it's not also
+ * covering the factory center offset. Logs one INFO per controller when the center freezes
+ * (per-unit health data, like the battery roster).
+ *
+ * @param wcb      This controller.
+ * @param stick    Raw (pre-deadzone) stick vector for this packet, corrected in place once locked.
+ * @param clicked  Whether the stick is currently pressed in (click); aborts the window.
+ */
+void
+wmr_controller_base_apply_stick_autocenter(struct wmr_controller_base *wcb, struct xrt_vec2 *stick, bool clicked);
 
 /*!
  * WMR_CONTROLLER_KEEPALIVE_S v2 (UNVALIDATED PROTOTYPE, default off): resend the two

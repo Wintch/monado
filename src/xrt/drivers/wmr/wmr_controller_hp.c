@@ -306,6 +306,10 @@ wmr_controller_hp_packet_parse(struct wmr_controller_hp *ctrl, const unsigned ch
 		last_input->thumbstick.values.y = 1.0f;
 	}
 
+	// WMR_STICK_AUTOCENTER (default off, T209 tail): must run BEFORE the deadzone below --
+	// it corrects the factory-less stick center so the deadzone can eventually shrink to
+	// just covering noise instead of also masking the center offset.
+	wmr_controller_base_apply_stick_autocenter(wcb, &last_input->thumbstick.values, last_input->thumbstick.click);
 	wmr_controller_base_apply_stick_deadzone(&last_input->thumbstick.values);
 
 	// Read trigger value (0x00 - 0xFF)
