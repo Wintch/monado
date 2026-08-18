@@ -104,6 +104,15 @@ DEBUG_GET_ONCE_NUM_OPTION(right_view_y_offset, "WMR_RIGHT_DISPLAY_VIEW_Y_OFFSET"
 //! (docs/pruebas.jsonl T211/T212); see the derivation comment on wmr_hmd_get_imu_calib().
 DEBUG_GET_ONCE_BOOL_OPTION(wmr_hmd_gyro_mount_fix, "WMR_HMD_GYRO_MOUNT_FIX", false)
 
+//! Surface the G2's companion-device proximity sensor (docs/12-g2-protocol.md
+//! WMR_CONTROL_MSG_IPD_VALUE) as Monado's generic XR_EXT_user_presence input
+//! (XRT_INPUT_GENERIC_HEAD_DETECT). Default off: this project's own docs/22 notes the
+//! proximity byte's worn/not-worn semantics were never actually confirmed with a clean
+//! cover/uncover gesture (the one session that tried it hit the companion device
+//! mid-USB2-storm and couldn't read anything), so ship it opt-in until live data
+//! validates the threshold in wmr_hmd_update_inputs(). Zero behavior change when unset.
+DEBUG_GET_ONCE_BOOL_OPTION(wmr_user_presence, "WMR_USER_PRESENCE", false)
+
 
 #define WMR_TRACE(d, ...) U_LOG_XDEV_IFL_T(&d->base, d->log_level, __VA_ARGS__)
 #define WMR_DEBUG(d, ...) U_LOG_XDEV_IFL_D(&d->base, d->log_level, __VA_ARGS__)
@@ -2215,6 +2224,52 @@ get_compositor_info_wmr(struct xrt_device *xdev,
 	return XRT_SUCCESS;
 }
 
+/*!
+ * Feeds @ref wmr_hmd::proximity_sensor (updated by @ref control_ipd_value_decode as
+ * WMR_CONTROL_MSG_IPD_VALUE packets arrive) into the XRT_INPUT_GENERIC_HEAD_DETECT input
+ * that Monado's state tracker reads for XR_EXT_user_presence -- see
+ * GET_STATIC_XDEV_BY_ROLE()/XRT_INPUT_GENERIC_HEAD_DETECT handling in oxr_session.c,
+ * which calls xrt_device_update_inputs() (this function) and pushes
+ * XrEventDataUserPresenceChangedEXT whenever the returned boolean flips. Only installed
+ * as @ref xrt_device::update_inputs when WMR_USER_PRESENCE=1 (see wmr_hmd_create());
+ * otherwise the base u_device_noop_update_inputs stays in place, so this is a strict
+ * opt-in with no cost or behavior change by default.
+ */
+static xrt_result_t
+wmr_hmd_update_inputs(struct xrt_device *xdev)
+{
+	struct wmr_hmd *wh = wmr_hmd(xdev);
+
+	for (size_t i = 0; i < wh->base.input_count; i++) {
+		struct xrt_input *input = &wh->base.inputs[i];
+		if (input->name != XRT_INPUT_GENERIC_HEAD_DETECT) {
+			continue;
+		}
+
+		// PROVISIONAL threshold (2026-08-18): treat any nonzero raw proximity byte as
+		// "worn". This matches the informal convention already used offline by
+		// scripts/hmd-watch.py ("PROXIMITY %d -> %d ... WORN if new else removed"),
+		// but per docs/22-cable-connector-diagnosis.md that convention itself was
+		// never confirmed against a clean live cover/uncover gesture -- treat this as
+		// a best guess, not a validated calibration, until a real donning/doffing
+		// session confirms whether the sensor is genuinely binary or an analog value
+		// that merely idles at 0. The raw value is always logged on change (below) so
+		// a real threshold can be picked from live data without a rebuild.
+		bool worn = wh->proximity_sensor != 0;
+
+		if (input->value.boolean != worn) {
+			WMR_INFO(wh, "User presence: %s (raw proximity sensor value %u)",
+			         worn ? "WORN" : "NOT WORN", wh->proximity_sensor);
+		}
+
+		input->value.boolean = worn;
+		input->timestamp = os_monotonic_get_ns();
+		break;
+	}
+
+	return XRT_SUCCESS;
+}
+
 void
 wmr_hmd_create(enum wmr_headset_type hmd_type,
                struct os_hid_device *hid_holo,
@@ -2234,13 +2289,17 @@ wmr_hmd_create(enum wmr_headset_type hmd_type,
 	int i;
 	int eye;
 
-	struct wmr_hmd *wh = U_DEVICE_ALLOCATE(struct wmr_hmd, flags, 1, 0);
+	// See the DEBUG_GET_ONCE_BOOL_OPTION comment above: default off, zero regression risk.
+	bool user_presence_enabled = debug_get_bool_option_wmr_user_presence();
+	size_t input_count = user_presence_enabled ? 2 : 1;
+
+	struct wmr_hmd *wh = U_DEVICE_ALLOCATE(struct wmr_hmd, flags, input_count, 0);
 	if (!wh) {
 		return;
 	}
 
 	// Populate the base members.
-	wh->base.update_inputs = u_device_noop_update_inputs;
+	wh->base.update_inputs = user_presence_enabled ? wmr_hmd_update_inputs : u_device_noop_update_inputs;
 	wh->base.get_tracked_pose = wmr_hmd_get_tracked_pose;
 	wh->base.get_view_poses = u_device_get_view_poses;
 	wh->base.destroy = wmr_hmd_destroy;
@@ -2298,6 +2357,14 @@ wmr_hmd_create(enum wmr_headset_type hmd_type,
 
 	// Setup input.
 	wh->base.inputs[0].name = XRT_INPUT_GENERIC_HEAD_POSE;
+	if (user_presence_enabled) {
+		wh->base.inputs[1].name = XRT_INPUT_GENERIC_HEAD_DETECT;
+		wh->base.supported.presence = true;
+		WMR_INFO(wh,
+		         "User presence enabled (WMR_USER_PRESENCE=1): surfacing the companion "
+		         "proximity sensor as XR_EXT_user_presence. Threshold is provisional, see "
+		         "wmr_hmd_update_inputs().");
+	}
 
 	// Read config file from HMD
 	if (wmr_read_config(wh) < 0) {
