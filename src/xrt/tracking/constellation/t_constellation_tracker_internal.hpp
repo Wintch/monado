@@ -326,12 +326,42 @@ public: // Methods (t_constellation_tracker.cpp)
 	              xrt_pose &Tcv_world_device_candidate,
 	              const pose_metrics_trusted_orientation *trusted_orientation = nullptr);
 
+	//! Continuity-based recovery: refines whatever blobs are still labeled for @p device from a
+	//! previous frame via RANSAC-PnP. @p Tcv_world_device_seed_override, when non-null (reverb-g2
+	//! T215, "assignment-prior SEEDING"), replaces BOTH the PnP solver's initial guess AND the
+	//! prior window @ref pose_metrics_evaluate_pose_with_prior validates the refined result
+	//! against -- normally both of those come from @p Tcv_world_device_prior (or identity). @p
+	//! trusted_orientation, when non-null, is threaded through to the pose_metrics evaluation (and
+	//! to @ref pushPose) exactly like @ref tryDevicePose already does; the ordinary call site
+	//! (processSampleFast) passes neither and is therefore byte-identical to before this feature
+	//! existed.
 	bool
 	tryDeviceBlobRecovery(std::unique_ptr<Device> &device,
 	                      CameraSample &sample,
 	                      DeviceState &device_state,
 	                      xrt_pose &Tcv_cam_world,
-	                      std::optional<xrt_pose> &Tcv_world_device_prior);
+	                      std::optional<xrt_pose> &Tcv_world_device_prior,
+	                      const xrt_pose *Tcv_world_device_seed_override = nullptr,
+	                      const pose_metrics_trusted_orientation *trusted_orientation = nullptr);
+
+	//! Assignment-prior SEEDING (reverb-g2 T215, WMR_CONSTELLATION_SEED_PRIOR, default off):
+	//! composes a candidate WORLD pose from the device's TRUSTED fusion orientation (fresh, not
+	//! subject to the yaw-ghost problem this whole feature exists to route around) plus a POSITION
+	//! taken from an existing prior (@p Tcv_world_device_last_known preferred, @p
+	//! Tcv_world_device_prior as fallback) and tries it via the two existing fast-recovery
+	//! mechanisms in turn -- @ref tryDeviceBlobRecovery (PnP-refined, if continuity has left this
+	//! device's blobs labeled) then @ref tryDevicePose (pure reprojection-derived assignment
+	//! otherwise). No-op (returns false immediately) unless the option is on AND @p
+	//! trusted_orientation is non-null, i.e. unless @ref getTrustedOrientation already found a
+	//! locked, trusted heading for this device this frame -- see that function's own gating.
+	bool
+	trySeededRecovery(std::unique_ptr<Device> &device,
+	                  CameraSample &sample,
+	                  DeviceState &device_state,
+	                  xrt_pose &Tcv_cam_world,
+	                  std::optional<xrt_pose> &Tcv_world_device_prior,
+	                  std::optional<xrt_pose> &Tcv_world_device_last_known,
+	                  const pose_metrics_trusted_orientation *trusted_orientation);
 
 	void
 	processSampleSlow(CameraSample &sample);
@@ -359,6 +389,16 @@ public: // Methods (t_constellation_tracker.cpp)
 	//! nothing trustworthy to report right now.
 	std::optional<pose_metrics_trusted_orientation>
 	getTrustedOrientation(std::unique_ptr<Device> &device, xrt_pose &Tcv_world_cam, int64_t when_ns);
+
+	//! The WORLD-frame (OpenCV convention, i.e. Tcv_world_*, matching Tcv_world_device_predicted/
+	//! Tcv_world_device_last_known's own convention) half of @ref getTrustedOrientation's own
+	//! conversion chain, factored out so @ref trySeededRecovery can build a WORLD candidate pose
+	//! from the trusted orientation without duplicating the raw tracking-source callback query and
+	//! its yaw_threshold_rad validity check. @ref getTrustedOrientation itself is implemented in
+	//! terms of this helper (same behavior as before this function existed, just factored). Returns
+	//! std::nullopt under the identical conditions @ref getTrustedOrientation would.
+	std::optional<xrt_pose>
+	getTrustedWorldPose(std::unique_ptr<Device> &device, int64_t when_ns, float *out_yaw_threshold_rad);
 
 public: // Methods (constellation_debug_scribble.cpp)
 	void
