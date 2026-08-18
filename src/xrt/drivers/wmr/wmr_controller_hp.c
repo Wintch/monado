@@ -681,6 +681,7 @@ wmr_controller_hp_create(struct wmr_controller_connection *conn,
 
 	// Only set those we want to overwrite.
 	wcb->base.update_inputs = wmr_controller_hp_update_inputs;
+	wcb->base.set_output = wmr_controller_base_set_output;
 	wcb->base.get_battery_status = wmr_controller_hp_get_battery_status;
 	wcb->base.supported.battery_status = true;
 	wcb->base.name = XRT_DEVICE_HP_REVERB_G2_CONTROLLER;

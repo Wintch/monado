@@ -429,6 +429,7 @@ wmr_controller_og_create(struct wmr_controller_connection *conn,
 
 	// Only set those we want to overwrite.
 	wcb->base.update_inputs = wmr_controller_og_update_inputs;
+	wcb->base.set_output = wmr_controller_base_set_output;
 
 	if (pid == ODYSSEY_CONTROLLER_PID) {
 		wcb->base.name = XRT_DEVICE_SAMSUNG_ODYSSEY_CONTROLLER;

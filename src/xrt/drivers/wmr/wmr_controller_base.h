@@ -215,6 +215,21 @@ struct wmr_controller_base
 		//! Frozen per-stick center offset, valid only once @ref locked is true.
 		struct xrt_vec2 offset;
 	} stick_autocenter;
+
+	/*!
+	 * WMR_CONTROLLER_HAPTICS state (default off, UNVALIDATED PROTOTYPE -- see @ref
+	 * wmr_controller_base_set_output's own comment for the wire-format caveat).
+	 */
+	struct
+	{
+		//! Monotonic time of the last haptic report actually written to the tunnel, 0
+		//! before the first one. Throttles @ref wmr_controller_base_set_output so a
+		//! per-frame-called app can't flood the shared HID tunnel.
+		uint64_t last_send_ns;
+		//! Set once the first haptic report has been sent for this device, so later
+		//! ones can log at DEBUG instead of INFO.
+		bool logged_first;
+	} haptics;
 };
 
 /*!
@@ -286,6 +301,23 @@ wmr_controller_base_apply_stick_autocenter(struct wmr_controller_base *wcb, stru
  */
 void
 wmr_controller_base_send_keepalive_if_due(struct xrt_device *xdev);
+
+/*!
+ * WMR_CONTROLLER_HAPTICS (UNVALIDATED PROTOTYPE, default off): xrt_device::set_output
+ * implementation shared by wmr_controller_hp.c (HP Reverb G2) and wmr_controller_og.c
+ * (Odyssey/Odyssey+) -- both already declare a single output at @ref
+ * wmr_controller_base::base's outputs[0] (XRT_OUTPUT_NAME_G2_CONTROLLER_HAPTIC or
+ * XRT_OUTPUT_NAME_ODYSSEY_CONTROLLER_HAPTIC / XRT_OUTPUT_NAME_WMR_HAPTIC respectively), so
+ * this only needs to compare @p name against that. See the implementation's own comment
+ * for the full picture: the OUTPUT NAME resolves and is throttled/rate-limited correctly
+ * regardless of the env var, but the actual wire report bytes sent when
+ * WMR_CONTROLLER_HAPTICS=1 are a best-candidate GUESS, not a confirmed reverse-engineered
+ * format -- see docs/03-controllers.md and docs/09-oasis-driver-re.md in the reverb-g2 repo.
+ *
+ * @param xdev  A device created by wmr_controller_hp_create() or wmr_controller_og_create().
+ */
+xrt_result_t
+wmr_controller_base_set_output(struct xrt_device *xdev, enum xrt_output_name name, const struct xrt_output_value *value);
 
 static inline void
 wmr_controller_connection_receive_bytes(struct wmr_controller_connection *wcc,

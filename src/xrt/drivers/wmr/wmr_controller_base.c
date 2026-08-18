@@ -121,6 +121,45 @@ DEBUG_GET_ONCE_BOOL_OPTION(wmr_stick_autocenter, "WMR_STICK_AUTOCENTER", false)
 //! for the life of the HMD device regardless of clients. The env var and the two commands sent
 //! are unchanged.
 DEBUG_GET_ONCE_NUM_OPTION(wmr_controller_keepalive_s, "WMR_CONTROLLER_KEEPALIVE_S", 0)
+
+//! WMR_CONTROLLER_HAPTICS (UNVALIDATED PROTOTYPE, default off, 2026-08-18). docs/03 in the
+//! reverb-g2 repo has said since this project's early days: "Haptics dead for a double
+//! reason: an output name that the bindings never reference + set_output never
+//! implemented." The first half was fixed in patch 0003 -- XRT_OUTPUT_NAME_G2_CONTROLLER_
+//! HAPTIC / _ODYSSEY_CONTROLLER_HAPTIC / _WMR_HAPTIC are already declared at outputs[0] and
+//! referenced from every binding_profiles[] table in wmr_controller_hp.c / wmr_controller_
+//! og.c. This flag closes the second half: xrt_device::set_output now exists (@ref
+//! wmr_controller_base_set_output) and resolves the binding cleanly regardless of this
+//! var's value.
+//!
+//! What's gated by the var specifically is whether any bytes actually go on the wire, and
+//! that gate exists because the wire format is NOT confirmed. What IS confirmed
+//! (docs/09-oasis-driver-re.md, read straight out of driver_oasis.dll's disassembly via
+//! this project's own xref.py method): Windows drives WMR controller haptics through the
+//! standard USB HID Haptics page (Usage Page 0x0E), Usage 0x21 ("Manual Trigger") and Usage
+//! 0x23 ("Intensity"), ReportType Output -- HidP_SetUsageValue resolves the actual report
+//! ID from the device's live HID report descriptor at runtime, so the wire-level report ID
+//! and byte offsets never appear in the disassembly, only the logical HID usages being
+//! written. No community writeup (OpenHMD's drv_wmr -- HMD-only, no controller haptics at
+//! all; the Monado gitlab tracker; general web search) has ever published the raw
+//! tunnelled byte layout either -- searched 2026-08-18, nothing found. docs/03's own rule
+//! stands: "we're not going to invent bytes against a firmware."
+//!
+//! What @ref wmr_controller_base_set_output sends when this IS on is therefore a
+//! pattern-matched guess, not a capture: cmd_id 0x03 is the one command family this driver
+//! already knows works on real hardware (the status/IMU "enable" class sent in
+//! wmr_controller_base_init and resent by the keepalive above -- {0x06, 0x03, 0x01, 0x00,
+//! 0x02} = status enable, {0x06, 0x03, 0x02, 0xe1, 0x02} = IMU on), extended with subtype
+//! 0x03 as the next slot in that same sequence. If a live test shows no effect (most likely
+//! outcome) or a bad one, the byte to fuzz next session is buf[2] (the subtype byte) --
+//! try 0x05, 0x06, 0x07... and watch for a real pulse or, worse, a controller hang/
+//! disconnect. AVOID buf[1]=0x00 (zero/reinit) and 0x04 (quiesce/restart) as full command
+//! IDs on a live controller outside their known init-time use -- those are the two commands
+//! already known to disrupt controller state, unlike 0x02 (fw read, read-only) and 0x03
+//! (enable, additive). Worst case of a bad guess: the controller ignores the packet
+//! (silent no-op, the safe failure) or drops offline; recovery is a power cycle (battery
+//! out/in), same as every other WMR controller wedge documented in docs/03.
+DEBUG_GET_ONCE_BOOL_OPTION(wmr_controller_haptics, "WMR_CONTROLLER_HAPTICS", false)
 #include <string.h>
 #include <assert.h>
 #include <errno.h>
@@ -690,6 +729,104 @@ wmr_controller_base_send_keepalive_if_due(struct xrt_device *xdev)
 {
 	struct wmr_controller_base *wcb = wmr_controller_base(xdev);
 	wmr_controller_send_keepalive(wcb);
+}
+
+//! Minimum spacing between haptic reports actually written to the shared tunnel
+//! (WMR_CONTROLLER_HAPTICS). Many OpenXR apps call xrApplyHapticFeedback every render frame
+//! to sustain a "continuous" rumble (90 Hz+ on this headset); the same tunnel also carries
+//! HMD IMU/camera timestamps, and this project has already measured how badly it degrades
+//! under unrelated storms of traffic (docs/pruebas.jsonl in the reverb-g2 repo, the whole
+//! T183-T201 companion-storm saga). 20 ms (50 Hz) is comfortably above human perceptual
+//! resolution for vibration amplitude steps and comfortably below the ~100 Hz ceiling patch
+//! 0049/0055's own companion backoff treats as this tunnel's safe steady-state rate -- not
+//! measured against the controller's own tolerance (unknown), chosen as a conservative
+//! starting point pending a live test.
+#define WMR_HAPTIC_MIN_INTERVAL_NS ((uint64_t)20 * U_TIME_1MS_IN_NS)
+
+//! See the long WMR_CONTROLLER_HAPTICS comment above (with the env option declaration) for
+//! the full picture: this is the second half of "haptics dead for a double reason" from
+//! docs/03 -- set_output now exists, resolves the binding cleanly either way, but the wire
+//! bytes sent when the env var is on are a best-candidate guess, not a confirmed format.
+xrt_result_t
+wmr_controller_base_set_output(struct xrt_device *xdev, enum xrt_output_name name, const struct xrt_output_value *value)
+{
+	struct wmr_controller_base *wcb = wmr_controller_base(xdev);
+
+	if (wcb->base.output_count == 0 || name != wcb->base.outputs[0].name) {
+		U_LOG_XDEV_UNSUPPORTED_OUTPUT(&wcb->base, wcb->log_level, name);
+		return XRT_ERROR_OUTPUT_UNSUPPORTED;
+	}
+
+	if (value->type != XRT_OUTPUT_VALUE_TYPE_VIBRATION) {
+		U_LOG_XDEV_UNSUPPORTED_OUTPUT(&wcb->base, wcb->log_level, name);
+		return XRT_ERROR_OUTPUT_UNSUPPORTED;
+	}
+
+	if (!debug_get_bool_option_wmr_controller_haptics()) {
+		// Feature off (default): resolve the binding cleanly -- an app that probes for
+		// haptic support, or that always fires a pulse on some event, shouldn't see an
+		// error just because this prototype is disabled -- but never touch the wire.
+		return XRT_SUCCESS;
+	}
+
+	float amplitude = CLAMP(value->vibration.amplitude, 0.0f, 1.0f);
+	if (amplitude <= 0.01f) {
+		// No known "stop" command exists to send (see the env option comment: not
+		// inventing bytes against a firmware beyond the one guessed "fire" report
+		// below). Pulses are fire-and-forget and self-bounded by their own duration
+		// byte, so a zero/near-zero request is simply a no-op, same as vive/survive's
+		// own set_output in this tree.
+		return XRT_SUCCESS;
+	}
+
+	uint64_t now_ns = os_monotonic_get_ns();
+	bool throttled = false;
+	bool first = false;
+	os_mutex_lock(&wcb->data_lock);
+	throttled = wcb->haptics.last_send_ns != 0 && (now_ns - wcb->haptics.last_send_ns) < WMR_HAPTIC_MIN_INTERVAL_NS;
+	if (!throttled) {
+		wcb->haptics.last_send_ns = now_ns;
+		first = !wcb->haptics.logged_first;
+		wcb->haptics.logged_first = true;
+	}
+	os_mutex_unlock(&wcb->data_lock);
+
+	if (throttled) {
+		// Silently swallow: the calling app will very likely call again next frame to
+		// sustain the effect, and this is not an error from its point of view.
+		return XRT_SUCCESS;
+	}
+
+	int64_t duration_ns = value->vibration.duration_ns;
+	float duration_ms_f =
+	    duration_ns == XRT_MIN_HAPTIC_DURATION ? 5.0f : (float)(duration_ns / (int64_t)U_TIME_1MS_IN_NS);
+	uint8_t duration_ms = (uint8_t)CLAMP(duration_ms_f, 1.0f, 255.0f);
+	uint8_t intensity = (uint8_t)(amplitude * 255.0f + 0.5f);
+
+	// UNVERIFIED CANDIDATE REPORT -- see the WMR_CONTROLLER_HAPTICS env option comment above
+	// for exactly what this guess is grounded in and what it isn't. Layout: {0x06, cmd_id=
+	// 0x03 (the known-working "enable" class), subtype=0x03 (guessed next slot after
+	// 0x01=status enable, 0x02=IMU on), intensity 0-255, duration in ms 1-255, zero-padded
+	// to 64 bytes}. wmr_controller_send_bytes() -> the tunnel connection adds this
+	// controller's own hmd_cmd_base (0x05 left / 0x0d right, see wmr_hmd.c's
+	// hololens_ensure_controller) to byte 0 before it goes on the wire, exactly like every
+	// other command in this file.
+	uint8_t cmd[64] = {0x06, 0x03, 0x03, intensity, duration_ms};
+	bool sent = wmr_controller_send_bytes(wcb, cmd, sizeof(cmd));
+
+	if (first) {
+		WMR_INFO(wcb,
+		         "haptics (WMR_CONTROLLER_HAPTICS, UNVERIFIED wire format): first pulse to %s -- "
+		         "amplitude=%.2f (intensity byte=%u), duration=%" PRId64 "ns (byte=%u ms), sent=%s",
+		         wcb->base.str, (double)amplitude, intensity, duration_ns, duration_ms, sent ? "yes" : "NO (write failed)");
+	} else {
+		WMR_DEBUG(wcb,
+		          "haptics: pulse to %s -- amplitude=%.2f (intensity byte=%u), duration=%" PRId64
+		          "ns (byte=%u ms), sent=%s",
+		          wcb->base.str, (double)amplitude, intensity, duration_ns, duration_ms, sent ? "yes" : "NO (write failed)");
+	}
+
+	return sent ? XRT_SUCCESS : XRT_ERROR_OUTPUT_REQUEST_FAILURE;
 }
 
 static xrt_result_t
