@@ -38,6 +38,12 @@ enum correspondence_search_flags
 	CS_FLAG_HAVE_POSE_PRIOR = 0x10,
 	//! Use the provided gravity vector to check pose verticality. Depends on CS_FLAG_HAVE_POSE_PRIOR.
 	CS_FLAG_MATCH_GRAVITY = 0x20,
+	//! If the input trusted_orientation (passed to correspondence_search_find_one_pose) contains a
+	//! trusted yaw reference candidates should be checked against. Independent of
+	//! CS_FLAG_HAVE_POSE_PRIOR/CS_FLAG_MATCH_GRAVITY -- a trusted orientation can be available even
+	//! for an ab-initio search with no position prior at all. See pose_metrics.h's
+	//! pose_metrics_trusted_orientation.
+	CS_FLAG_HAVE_TRUSTED_ORIENTATION = 0x40,
 };
 
 struct cs_image_point
@@ -86,6 +92,9 @@ struct cs_model_info
 	struct xrt_vec3 gravity_vector;
 	struct xrt_quat gravity_swing;
 	float gravity_tolerance_rad;
+
+	/* Valid when CS_FLAG_HAVE_TRUSTED_ORIENTATION is set */
+	struct pose_metrics_trusted_orientation trusted_orientation;
 };
 
 struct correspondence_search
@@ -124,7 +133,8 @@ correspondence_search_find_one_pose(struct correspondence_search *cs,
                                     struct xrt_vec3 *rot_error_thresh,
                                     struct xrt_vec3 *gravity_vector,
                                     float gravity_tolerance_rad,
-                                    struct pose_metrics *score);
+                                    struct pose_metrics *score,
+                                    const struct pose_metrics_trusted_orientation *trusted_orientation);
 
 #ifdef __cplusplus
 }

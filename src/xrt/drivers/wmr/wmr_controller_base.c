@@ -1328,18 +1328,25 @@ wmr_controller_base_init(struct wmr_controller_base *wcb,
 //! wmr_constellation_solve_yaw_error_rad, shared with the WMR_CONSTELLATION_YAW_PRIOR_DEG reject
 //! gate in constellation_sample_store -- see that function's own comment for why a second,
 //! independent consumer of the same measurement exists.
+// Rx180: the WMR y/z axes-swap convention this whole driver already applies elsewhere
+// (wmr_hmd.c's "Correct swapped axes", and WMR_CONTROLLER_WMR_AXES's own comment above) -- 0047's
+// identified LED-model <-> IMU-fusion body frame bridge, self-inverse (q*q reduces to -identity,
+// which is the same rotation as identity under the quaternion double cover). File-scope so both
+// wmr_constellation_solve_yaw_error_rad below (solve -> fusion frame, right-multiplied) and
+// constellation_tracking_source_get_trusted_orientation (fusion -> solve frame, same
+// right-multiplication -- valid because the bridge is self-inverse, and because the file's own
+// derivation just above states the identity directly both ways: "solve_orientation ~=
+// imu_orientation * Rx180") share one definition instead of two copies that could drift apart.
+static const struct xrt_quat wmr_constellation_rx180_bridge = {1.f, 0.f, 0.f, 0.f};
+
 static float
 wmr_constellation_solve_yaw_error_rad(const struct xrt_quat *solve_orientation, const struct xrt_quat *fusion_rot)
 {
-	// Rx180: the WMR y/z axes-swap convention this whole driver already applies elsewhere
-	// (wmr_hmd.c's "Correct swapped axes", and WMR_CONTROLLER_WMR_AXES's own comment above) --
-	// 0047's identified LED-model <-> IMU-fusion body frame bridge, self-inverse.
-	static const struct xrt_quat rx180 = {1.f, 0.f, 0.f, 0.f};
 	// xrt world is Y-up in this file (see the gravity gate's own `down = {0,-1,0}` below).
 	static const struct xrt_vec3 world_up = {0.f, 1.f, 0.f};
 
 	struct xrt_quat solve_in_fusion_frame;
-	math_quat_rotate(solve_orientation, &rx180, &solve_in_fusion_frame);
+	math_quat_rotate(solve_orientation, &wmr_constellation_rx180_bridge, &solve_in_fusion_frame);
 
 	// World-frame rotation taking the fusion's CURRENT belief to the solve's belief -- same
 	// "target * inverse(current)" pattern t_tracker_slam.cpp's reset-offset transform (0057)
@@ -1727,6 +1734,62 @@ constellation_tracking_source_get_tracked_pose(struct t_constellation_tracker_tr
 	m_relation_history_get(wcb->constellation.relation_history, when_ns, out_relation);
 }
 
+/*!
+ * @ref t_constellation_tracker_tracking_source::get_trusted_orientation implementation (reverb-g2
+ * T213, the tracker-side deep fix following on from this file's own WMR_CONSTELLATION_YAW_PRIOR_DEG
+ * device-side gate above): hands the tracker's search a trusted heading straight off the IMU
+ * fusion -- unlike @ref constellation_tracking_source_get_tracked_pose's own answer (predicted
+ * from past constellation solves via @ref m_relation_history, which can go stale between real
+ * fixes, or in principle still carry a poisoned entry), the fusion is always current and, once
+ * locked, its YAW specifically is trustworthy (0057/0059's gyro-Y correction work). Reuses
+ * WMR_CONSTELLATION_YAW_PRIOR_DEG for the threshold -- no new env var -- and the exact same
+ * solve_yaw_locked gate the device-side reject uses, so this is a no-op (returns false) under the
+ * identical conditions that already make that gate a no-op: the option unset/0, or heading not yet
+ * locked. When the option is set but heading isn't locked yet, false is still correct (there's
+ * nothing trustworthy to hand over yet), matching apply_solve_yaw_correction's own reasoning for
+ * why an unlocked heading isn't a meaningful reference.
+ *
+ * Frame conversion: out_orientation must come back in the tracker's SOLVE/LED-model convention
+ * (same convention @ref constellation_tracking_source_get_tracked_pose's own poses use --
+ * confirmed by reading that function's own m_relation_history_push call site, which stores
+ * sample->pose verbatim). This file's own derivation, a few hundred lines up
+ * (wmr_constellation_solve_yaw_error_rad's header comment), states the bridge directly BOTH ways:
+ * "solve_orientation ~= imu_orientation * Rx180" -- i.e. fusion -> solve is a single
+ * right-multiply by the same self-inverse wmr_constellation_rx180_bridge constant
+ * wmr_constellation_solve_yaw_error_rad uses for the opposite (solve -> fusion) direction. Not an
+ * inversion of that helper's math: the identity is already stated in the fusion -> solve direction
+ * in the source comment, this just applies it directly instead of the other direction.
+ */
+static bool
+constellation_tracking_source_get_trusted_orientation(struct t_constellation_tracker_tracking_source *tracking_source,
+                                                       int64_t when_ns,
+                                                       struct xrt_quat *out_orientation,
+                                                       float *out_yaw_threshold_rad)
+{
+	struct wmr_controller_base *wcb =
+	    container_of(tracking_source, struct wmr_controller_base, constellation.tracking_source);
+
+	(void)when_ns; // Fusion is read live below; there is no history to predict forward from here.
+
+	float yaw_prior_deg = debug_get_float_option_wmr_constellation_yaw_prior_deg();
+	if (yaw_prior_deg <= 0.0f) {
+		return false;
+	}
+
+	os_mutex_lock(&wcb->data_lock);
+	bool locked = wcb->constellation.solve_yaw_locked;
+	struct xrt_quat fusion_rot = wcb->fusion.rot;
+	os_mutex_unlock(&wcb->data_lock);
+
+	if (!locked) {
+		return false;
+	}
+
+	math_quat_rotate(&fusion_rot, &wmr_constellation_rx180_bridge, out_orientation);
+	*out_yaw_threshold_rad = yaw_prior_deg * ((float)M_PI / 180.0f);
+	return true;
+}
+
 void
 wmr_controller_base_add_to_constellation_tracker(struct wmr_controller_base *wcb,
                                                  struct t_constellation_tracker *tracker,
@@ -1762,6 +1825,7 @@ wmr_controller_base_add_to_constellation_tracker(struct wmr_controller_base *wcb
 		m_relation_history_create(&wcb->constellation.relation_history);
 	}
 	wcb->constellation.tracking_source.get_tracked_pose = constellation_tracking_source_get_tracked_pose;
+	wcb->constellation.tracking_source.get_trusted_orientation = constellation_tracking_source_get_trusted_orientation;
 
 	struct t_constellation_tracker_device_params params = {
 	    .led_model = wcb->constellation.led_model,

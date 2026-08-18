@@ -222,6 +222,38 @@ struct t_constellation_tracker_tracking_source
 	void (*get_tracked_pose)(struct t_constellation_tracker_tracking_source *,
 	                         int64_t when_ns,
 	                         struct xrt_space_relation *out_relation);
+
+	/*!
+	 * OPTIONAL, may be NULL. If set, called by the constellation tracker before searching for
+	 * this device to ask for a TRUSTED absolute orientation -- independent of, and not required
+	 * to agree with, whatever @ref get_tracked_pose's own predicted/history-based pose currently
+	 * says. The motivating case (reverb-g2 project, T213/patch 0074 follow-up) is a tracking
+	 * source whose visual prior can go stale between real fixes or get poisoned by a bad past
+	 * correspondence match, but which also has a SEPARATE, always-fresh reference -- e.g. a WMR
+	 * controller's gyro-integrated IMU fusion heading -- worth trusting for orientation (yaw
+	 * specifically) even when the ordinary prior can't be trusted tightly.
+	 *
+	 * @param[in]  when_ns               Timestamp the orientation is wanted for, same clock as
+	 *                                   @ref get_tracked_pose's own @c when_ns.
+	 * @param[out] out_orientation       The trusted orientation, in the SAME xrt world/tracking-
+	 *                                   origin frame and body-frame convention as the poses
+	 *                                   @ref get_tracked_pose returns (NOT necessarily the same
+	 *                                   convention as whatever internal reference the tracking
+	 *                                   source computed this from -- converting between the two
+	 *                                   is this callback's job, not the tracker's).
+	 * @param[out] out_yaw_threshold_rad Maximum |yaw error| (about the local up/gravity axis,
+	 *                                   see @ref pose_metrics_trusted_orientation) the tracker
+	 *                                   should tolerate before rejecting/deprioritising a
+	 *                                   candidate pose against this reference.
+	 *
+	 * @return true if both out params were filled in and should be trusted right now, false if
+	 * no trustworthy reference is available yet (e.g. not converged/locked) -- the tracker then
+	 * behaves exactly as if this callback were NULL for this call.
+	 */
+	bool (*get_trusted_orientation)(struct t_constellation_tracker_tracking_source *,
+	                                int64_t when_ns,
+	                                struct xrt_quat *out_orientation,
+	                                float *out_yaw_threshold_rad);
 };
 
 /*!
@@ -238,6 +270,28 @@ t_constellation_tracker_tracking_source_get_tracked_pose(
     struct xrt_space_relation *out_relation)
 {
 	tracking_source->get_tracked_pose(tracking_source, when_ns, out_relation);
+}
+
+/*!
+ * Helper function for @ref t_constellation_tracker_tracking_source::get_trusted_orientation.
+ * Handles NULL (the common case: most tracking sources don't implement this), returning false.
+ *
+ * @copydoc t_constellation_tracker_tracking_source::get_trusted_orientation
+ *
+ * @public @memberof t_constellation_tracker_tracking_source
+ */
+XRT_NONNULL_ALL static inline bool
+t_constellation_tracker_tracking_source_get_trusted_orientation(
+    struct t_constellation_tracker_tracking_source *tracking_source,
+    int64_t when_ns,
+    struct xrt_quat *out_orientation,
+    float *out_yaw_threshold_rad)
+{
+	if (tracking_source->get_trusted_orientation == NULL) {
+		return false;
+	}
+	return tracking_source->get_trusted_orientation(tracking_source, when_ns, out_orientation,
+	                                                out_yaw_threshold_rad);
 }
 
 

@@ -295,7 +295,8 @@ Camera::tryDevicePose(std::unique_ptr<Device> &device,
                       DeviceState &device_state,
                       xrt_pose &Tcv_cam_world,
                       std::optional<xrt_pose> &Tcv_world_device_prior,
-                      xrt_pose &Tcv_world_device_candidate)
+                      xrt_pose &Tcv_world_device_candidate,
+                      const pose_metrics_trusted_orientation *trusted_orientation)
 {
 	xrt_pose Tcv_cam_device_candidate;
 	math_pose_transform(&Tcv_cam_world, &Tcv_world_device_candidate, &Tcv_cam_device_candidate);
@@ -308,10 +309,11 @@ Camera::tryDevicePose(std::unique_ptr<Device> &device,
 		pose_metrics_evaluate_pose_with_prior(&score, &Tcv_cam_device_candidate, false, &Tcv_cam_device_prior,
 		                                      &device->prior_pos_error, &device->prior_rot_error, sample.blobs,
 		                                      sample.blob_count, &device->params.led_model, device->id,
-		                                      &this->model, NULL);
+		                                      &this->model, NULL, trusted_orientation);
 	} else {
 		pose_metrics_evaluate_pose(&score, &Tcv_cam_device_candidate, sample.blobs, sample.blob_count,
-		                           &device->params.led_model, device->id, &this->model, NULL);
+		                           &device->params.led_model, device->id, &this->model, NULL,
+		                           trusted_orientation);
 	}
 
 
@@ -321,7 +323,8 @@ Camera::tryDevicePose(std::unique_ptr<Device> &device,
 		               device,                   //
 		               score,                    //
 		               Tcv_cam_device_candidate, //
-		               false);                   //
+		               false,                    //
+		               trusted_orientation);      //
 		return true;
 	}
 
@@ -408,10 +411,10 @@ Camera::tryDeviceBlobRecovery(std::unique_ptr<Device> &device,
 		pose_metrics_evaluate_pose_with_prior(&score, &Tcv_cam_device, true, &Tcv_cam_device_prior,
 		                                      &pos_window, &rot_window, sample.blobs,
 		                                      sample.blob_count, &device->params.led_model, device->id,
-		                                      &this->model, NULL);
+		                                      &this->model, NULL, NULL);
 	} else {
 		pose_metrics_evaluate_pose(&score, &Tcv_cam_device, sample.blobs, sample.blob_count,
-		                           &device->params.led_model, device->id, &this->model, NULL);
+		                           &device->params.led_model, device->id, &this->model, NULL, NULL);
 	}
 
 	if (POSE_HAS_FLAGS(&score, POSE_MATCH_GOOD)) {
@@ -483,6 +486,17 @@ Camera::processSampleSlow(CameraSample &sample)
 	std::shared_lock lock(tracker->device_lock);
 
 	auto Txr_world_cam = sample.Txr_world_cam;
+
+	// OpenCV-convention camera pose in world, computed once per sample (not per device/pass) --
+	// used both by the CS_FLAG_MATCH_GRAVITY block below (which used to compute its own copy
+	// inline) and by getTrustedOrientation's frame conversion, which needs it regardless of
+	// whether a gravity-matching pose prior happens to be available this frame.
+	std::optional<xrt_pose> Tcv_world_cam = std::nullopt;
+	if (Txr_world_cam.has_value()) {
+		xrt_pose tmp;
+		math_pose_convert_opencv(&Txr_world_cam.value(), &tmp);
+		Tcv_world_cam = tmp;
+	}
 
 	for (int i = 0; i < 2; i++) {
 		for (std::unique_ptr<Device> &device : tracker->devices) {
@@ -596,18 +610,31 @@ Camera::processSampleSlow(CameraSample &sample)
 			    device->gravity_error_rad < DEG_TO_RAD(gravity_error_threshold_deg)) {
 				// If we have a pose for the camera and we have a prior pose
 				// (required by correspondence for search gravity matching)
-				if (Txr_world_cam.has_value()) {
-					xrt_pose Tcv_world_cam;
-					math_pose_convert_opencv(&Txr_world_cam.value(), &Tcv_world_cam);
-
+				if (Tcv_world_cam.has_value()) {
 					// Acquire the camera's gravity vector under the processing lock
-					get_pose_gravity_vector(Tcv_world_cam, cv_camera_gravity_vector);
+					get_pose_gravity_vector(Tcv_world_cam.value(), cv_camera_gravity_vector);
 
 					// Add in to check gravity
 					search_flags =
 					    (correspondence_search_flags)(search_flags | CS_FLAG_MATCH_GRAVITY);
 				}
 			}
+
+			// Trusted-orientation yaw reference (reverb-g2 T213, patch 0074 follow-up), if the
+			// device's tracking source has one available -- independent of CS_FLAG_HAVE_POSE_PRIOR/
+			// CS_FLAG_MATCH_GRAVITY above (a device can have a locked fusion heading well before it
+			// ever has a position prior). See getTrustedOrientation's own doc comment.
+			std::optional<pose_metrics_trusted_orientation> trusted_orientation = std::nullopt;
+			if (Tcv_world_cam.has_value()) {
+				trusted_orientation =
+				    this->getTrustedOrientation(device, Tcv_world_cam.value(), sample.timestamp_ns);
+			}
+			if (trusted_orientation.has_value()) {
+				search_flags =
+				    (correspondence_search_flags)(search_flags | CS_FLAG_HAVE_TRUSTED_ORIENTATION);
+			}
+			const pose_metrics_trusted_orientation *trusted_orientation_ptr =
+			    trusted_orientation.has_value() ? &trusted_orientation.value() : nullptr;
 
 			pose_metrics score;
 			bool found_pose = correspondence_search_find_one_pose( //
@@ -619,14 +646,16 @@ Camera::processSampleSlow(CameraSample &sample)
 			    &device->prior_rot_error,                          //
 			    &cv_camera_gravity_vector,                         //
 			    device->gravity_error_rad,                         //
-			    &score);                                           //
+			    &score,                                            //
+			    trusted_orientation_ptr);                          //
 			if (found_pose) {
-				this->pushPose(sample,         //
-				               *device_state,  //
-				               device,         //
-				               score,          //
-				               Tcv_cam_device, //
-				               false);         //
+				this->pushPose(sample,               //
+				               *device_state,        //
+				               device,               //
+				               score,                //
+				               Tcv_cam_device,       //
+				               false,                //
+				               trusted_orientation_ptr); //
 
 				// We found a pose for this device in this sample
 				device_state->needs_slow_processing = false;
@@ -707,6 +736,15 @@ Camera::processSampleFast(CameraSample &sample)
 		                                          ? std::optional<xrt_pose>(device_predicted_relation.pose)
 		                                          : std::nullopt;
 
+		// Trusted-orientation yaw reference (reverb-g2 T213, patch 0074 follow-up), if the device's
+		// tracking source has one available -- see getTrustedOrientation's own doc comment and
+		// processSampleSlow's identical use of it. Computed once per device per sample, independent
+		// of Tcv_world_device_predicted above (a locked fusion heading can exist well before any
+		// position prior does).
+		auto trusted_orientation = this->getTrustedOrientation(device, Tcv_world_cam, sample.timestamp_ns);
+		const pose_metrics_trusted_orientation *trusted_orientation_ptr =
+		    trusted_orientation.has_value() ? &trusted_orientation.value() : nullptr;
+
 		bool wipe_blob_associations = false;
 		if (this->tryDeviceBlobRecovery(device, sample, device_state, Tcv_cam_world,
 		                                Tcv_world_device_predicted)) {
@@ -719,7 +757,7 @@ Camera::processSampleFast(CameraSample &sample)
 		// if we have a valid prior pose, try to use it for fast matching
 		if (Tcv_world_device_predicted.has_value() &&
 		    this->tryDevicePose(device, sample, device_state, Tcv_cam_world, Tcv_world_device_predicted,
-		                        Tcv_world_device_predicted.value())) {
+		                        Tcv_world_device_predicted.value(), trusted_orientation_ptr)) {
 			CT_DEBUG(tracker, "Fast processing for device %d succeeded", device->id);
 			continue; // try the next device, we found a pose!
 		}
@@ -737,8 +775,9 @@ Camera::processSampleFast(CameraSample &sample)
 			}
 		}
 
-		if (has_last_known && this->tryDevicePose(device, sample, device_state, Tcv_cam_world,
-		                                          Tcv_world_device_predicted, Tcv_world_device_last_known)) {
+		if (has_last_known &&
+		    this->tryDevicePose(device, sample, device_state, Tcv_cam_world, Tcv_world_device_predicted,
+		                        Tcv_world_device_last_known, trusted_orientation_ptr)) {
 			CT_DEBUG(tracker, "Fast processing for device %d succeeded with last known pose", device->id);
 			continue; // try the next device, we found a pose!
 		}
@@ -783,7 +822,8 @@ Camera::pushPose(CameraSample &camera_sample,
                  std::unique_ptr<Device> &device,
                  pose_metrics &score,
                  xrt_pose &Tcv_cam_device,
-                 bool was_optimized)
+                 bool was_optimized,
+                 const pose_metrics_trusted_orientation *trusted_orientation)
 {
 	// We should never find two poses for the same device in a single frame
 	assert(device_state.found_pose.has_value() == false);
@@ -824,8 +864,11 @@ Camera::pushPose(CameraSample &camera_sample,
 		}
 
 		// We need to re-evaluate the pose after optimization, since the reprojection error may have changed.
+		// Re-checked against trusted_orientation too: RANSAC-PnP can move the pose, so a candidate that
+		// agreed with the trusted heading before refinement is not guaranteed to still agree after it.
 		pose_metrics_evaluate_pose(&score, &Tcv_cam_device, camera_sample.blobs, camera_sample.blob_count,
-		                           &device->params.led_model, device->id, &this->model, NULL);
+		                           &device->params.led_model, device->id, &this->model, NULL,
+		                           trusted_orientation);
 	}
 
 	// Move to OpenXR space
@@ -897,6 +940,13 @@ Camera::pushPose(CameraSample &camera_sample,
 	// Only the publication is suppressed: found_pose, the marked blobs and the rest of the
 	// tracker's per-frame bookkeeping are left exactly as they were, so this changes what the
 	// device is told and nothing about how the tracker searches.
+	//
+	// trusted_orientation (reverb-g2 T213, patch 0074 follow-up) rides this SAME gate for free:
+	// pose_metrics_evaluate_pose above was given trusted_orientation, so a refined pose that
+	// disagrees with it on yaw already comes back without POSE_MATCH_GOOD (see
+	// pose_metrics_evaluate_pose_with_prior's loophole-branch check) -- no separate check needed
+	// here. What trusted_orientation ALSO does, unlike an ordinary failed prior match, is gate
+	// the locked_data update just below -- see that block's own comment.
 	if (POSE_HAS_FLAGS(&score, POSE_MATCH_GOOD)) {
 		// Push the sample to the device
 		t_constellation_tracker_sample sample = {
@@ -918,20 +968,93 @@ Camera::pushPose(CameraSample &camera_sample,
 	{
 		std::unique_lock<os::Mutex> lock(device->data_lock);
 
-		// If we already found a pose in the future, then don't mark blobs, since the device has definitely
-		// moved.
-		if (!device->locked_data.last_known_pose.has_value() ||
-		    device->locked_data.last_known_pose->timestamp_ns <= camera_sample.timestamp_ns) {
-			// Call back to the blobwatch to update the blobs for this device. Done after pose optimization
-			// since the RANSAC process will unlabel any outliers.
-			auto tbo = camera_sample.toBlobObservation();
-			t_blobwatch_mark_blob_device(camera_sample.source, &tbo, device->id);
-		}
+		// last_known_pose/blob-marking below are normally updated UNCONDITIONALLY, even for a pose
+		// that didn't pass POSE_MATCH_GOOD after refinement (see the publication gate above, added
+		// 2026-08-12): only the publication to the device is suppressed, deliberately, so a
+		// so-so pose still feeds the tracker's own internal recovery prior. Do NOT relax that for
+		// the general case -- it is load-bearing for ordinary reacquisition.
+		//
+		// trusted_orientation (reverb-g2 T213) is the one narrow exception, and only when it was
+		// actually supplied for this call: a candidate that disagrees with a LOCKED, always-fresh
+		// fusion heading on yaw is not "so-so", it's the yaw-ghost this whole feature exists to
+		// keep out of the tracker's own state -- 0074's own follow-up note named this exact update
+		// as the residual way a rejected ghost still poisons future searches. When
+		// trusted_orientation is nullptr (every device/camera that hasn't opted in, i.e. almost
+		// all of them), trusted_yaw_ok is unconditionally true and this block is BYTE IDENTICAL to
+		// before.
+		bool trusted_yaw_ok = trusted_orientation == nullptr || POSE_HAS_FLAGS(&score, POSE_MATCH_TRUSTED_YAW);
 
-		device->locked_data.last_known_pose = DeviceLastPose(Txr_world_device, camera_sample.timestamp_ns);
+		if (trusted_yaw_ok) {
+			// If we already found a pose in the future, then don't mark blobs, since the device has
+			// definitely moved.
+			if (!device->locked_data.last_known_pose.has_value() ||
+			    device->locked_data.last_known_pose->timestamp_ns <= camera_sample.timestamp_ns) {
+				// Call back to the blobwatch to update the blobs for this device. Done after pose
+				// optimization since the RANSAC process will unlabel any outliers.
+				auto tbo = camera_sample.toBlobObservation();
+				t_blobwatch_mark_blob_device(camera_sample.source, &tbo, device->id);
+			}
+
+			device->locked_data.last_known_pose = DeviceLastPose(Txr_world_device, camera_sample.timestamp_ns);
+		} else {
+			CT_DEBUG(tracker,
+			         "Device %d: pose disagreed with trusted orientation on yaw (%.1f deg) -- not letting "
+			         "it poison last_known_pose/blob associations",
+			         device->id, RAD_TO_DEG(score.trusted_yaw_error_rad));
+		}
 	}
 
 	CT_DEBUG(tracker, "Found pose for device %d", device->id);
+}
+
+std::optional<pose_metrics_trusted_orientation>
+Camera::getTrustedOrientation(std::unique_ptr<Device> &device, xrt_pose &Tcv_world_cam, int64_t when_ns)
+{
+	if (device->params.tracking_source == nullptr) {
+		return std::nullopt;
+	}
+
+	// Contract (see t_constellation.h): out_orientation comes back in the SAME xrt world/
+	// tracking-origin frame and body-frame convention get_tracked_pose's own poses use --
+	// converting from whatever internal reference the tracking source has (e.g. a WMR
+	// controller's IMU fusion) into that convention is the tracking source's own job, not ours.
+	xrt_quat Txr_world_trusted_orientation;
+	float yaw_threshold_rad = 0.0f;
+	if (!t_constellation_tracker_tracking_source_get_trusted_orientation(
+	        device->params.tracking_source, when_ns, &Txr_world_trusted_orientation, &yaw_threshold_rad)) {
+		return std::nullopt;
+	}
+	if (!(yaw_threshold_rad > 0.0f)) {
+		// A non-positive threshold can't ever be satisfied meaningfully -- treat it the same as
+		// "nothing trustworthy right now" rather than rejecting every single candidate.
+		return std::nullopt;
+	}
+
+	// Convert into THIS camera's frame -- the exact same convert-then-transform-then-invert shape
+	// tryDevicePose's own Tcv_cam_device_prior conversion uses a few lines above this function's
+	// callers, just applied to an orientation-only pose (position is irrelevant to the result: pose
+	// composition's rotation output never depends on the child pose's translation).
+	xrt_pose Txr_world_trusted_pose = XRT_POSE_IDENTITY;
+	Txr_world_trusted_pose.orientation = Txr_world_trusted_orientation;
+	xrt_pose Tcv_world_trusted_pose;
+	math_pose_convert_opencv(&Txr_world_trusted_pose, &Tcv_world_trusted_pose);
+
+	xrt_pose Tcv_cam_world;
+	math_pose_invert(&Tcv_world_cam, &Tcv_cam_world);
+
+	xrt_pose Tcv_cam_trusted_pose;
+	math_pose_transform(&Tcv_cam_world, &Tcv_world_trusted_pose, &Tcv_cam_trusted_pose);
+
+	pose_metrics_trusted_orientation trusted{};
+	trusted.orientation = Tcv_cam_trusted_pose.orientation;
+	// "World up as seen from this camera" -- identical quantity to CS_FLAG_MATCH_GRAVITY's own
+	// cv_camera_gravity_vector (processSampleSlow), computed independently here since that one is
+	// only ever filled in conditionally (gated on device->gravity_error_rad and a position prior
+	// existing), neither of which trusted_orientation depends on.
+	get_pose_gravity_vector(Tcv_world_cam, trusted.up_vector);
+	trusted.yaw_threshold_rad = yaw_threshold_rad;
+
+	return trusted;
 }
 
 /*

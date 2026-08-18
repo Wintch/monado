@@ -323,7 +323,8 @@ public: // Methods (t_constellation_tracker.cpp)
 	              DeviceState &device_state,
 	              xrt_pose &Tcv_cam_world,
 	              std::optional<xrt_pose> &Tcv_world_device_prior,
-	              xrt_pose &Tcv_world_device_candidate);
+	              xrt_pose &Tcv_world_device_candidate,
+	              const pose_metrics_trusted_orientation *trusted_orientation = nullptr);
 
 	bool
 	tryDeviceBlobRecovery(std::unique_ptr<Device> &device,
@@ -345,7 +346,19 @@ public: // Methods (t_constellation_tracker.cpp)
 	         std::unique_ptr<Device> &device,
 	         pose_metrics &score,
 	         xrt_pose &Tcv_cam_device,
-	         bool was_optimized);
+	         bool was_optimized,
+	         const pose_metrics_trusted_orientation *trusted_orientation = nullptr);
+
+	//! Queries @p device's tracking_source (if any) for a trusted absolute orientation (@ref
+	//! t_constellation_tracker_tracking_source::get_trusted_orientation), and if one is
+	//! available, converts it into THIS camera's frame (Tcv_cam_device convention, matching the
+	//! candidates pose_metrics evaluates) plus a camera-frame up_vector to isolate yaw with --
+	//! the same conversion tryDevicePose's own Tcv_cam_device_prior already does, and the same
+	//! "world up as seen from this camera" get_pose_gravity_vector already computes for
+	//! CS_FLAG_MATCH_GRAVITY. Returns std::nullopt if the device has no such hook, or it has
+	//! nothing trustworthy to report right now.
+	std::optional<pose_metrics_trusted_orientation>
+	getTrustedOrientation(std::unique_ptr<Device> &device, xrt_pose &Tcv_world_cam, int64_t when_ns);
 
 public: // Methods (constellation_debug_scribble.cpp)
 	void

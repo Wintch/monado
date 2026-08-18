@@ -215,15 +215,18 @@ correspondence_search_project_pose(struct correspondence_search *cs,
 
 	struct pose_metrics score;
 
+	const struct pose_metrics_trusted_orientation *trusted_orientation =
+	    (mi->search_flags & CS_FLAG_HAVE_TRUSTED_ORIENTATION) ? &mi->trusted_orientation : NULL;
+
 	// Check how many LEDs have matching blobs in this pose, if there's enough we have a good match
 	// @todo: It would be better to be able to pass a list of undistorted blob points
 	if (mi->search_flags & CS_FLAG_HAVE_POSE_PRIOR) {
 		pose_metrics_evaluate_pose_with_prior(&score, pose, false, &mi->pose_prior, mi->pos_error_thresh,
 		                                      mi->rot_error_thresh, cs->blobs, cs->num_points, leds,
-		                                      model->device_id, cs->calib, NULL);
+		                                      model->device_id, cs->calib, NULL, trusted_orientation);
 	} else {
 		pose_metrics_evaluate_pose(&score, pose, cs->blobs, cs->num_points, leds, model->device_id, cs->calib,
-		                           NULL);
+		                           NULL, trusted_orientation);
 	}
 
 	// If this pose is any good, test it further
@@ -974,7 +977,8 @@ correspondence_search_find_one_pose(struct correspondence_search *cs,
                                     struct xrt_vec3 *rot_error_thresh,
                                     struct xrt_vec3 *gravity_vector,
                                     float gravity_tolerance_rad,
-                                    struct pose_metrics *score)
+                                    struct pose_metrics *score,
+                                    const struct pose_metrics_trusted_orientation *trusted_orientation)
 {
 	assert(pose != NULL);
 	assert(score != NULL);
@@ -1013,6 +1017,11 @@ correspondence_search_find_one_pose(struct correspondence_search *cs,
 
 		math_quat_decompose_swing_twist(&pose->orientation, gravity_vector, &mi.gravity_swing,
 		                                &pose_gravity_twist);
+	}
+
+	if (search_flags & CS_FLAG_HAVE_TRUSTED_ORIENTATION) {
+		assert(trusted_orientation != NULL);
+		mi.trusted_orientation = *trusted_orientation;
 	}
 
 	if (search_pose_for_model(cs, &mi) && (mi.match_flags & POSE_MATCH_GOOD)) {

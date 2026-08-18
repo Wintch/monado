@@ -32,6 +32,19 @@
 #define LOG_SPEW(...)
 #endif
 
+// Rate-limited diagnostic counters for the trusted-orientation yaw check (reverb-g2 T213, patch
+// 0074 follow-up) -- logged once for the first occurrence, then every 100th, so a session log
+// shows this firing without being spammy under a real search (which can test many candidates per
+// frame). Plain statics, not atomics: this file is called concurrently from more than one
+// processing thread (see t_constellation_tracker.cpp's slow/fast threads), but an occasionally
+// under/over-counted diagnostic tally is a fine trade against the complexity of proper atomics --
+// same "benign race" tolerance correspondence_search.c's own search_budget_ns init already uses.
+// Distinguishable in the log from the WMR driver's OWN device-side reject line
+// (wmr_controller_base.c's "yaw prior: rejected sample...", patch 0074): this one is the
+// generic tracker's search-level decision, not the device's post-hoc sample gate.
+static uint64_t trusted_yaw_reject_count = 0;
+static uint64_t trusted_yaw_deprioritize_count = 0;
+
 static void
 expand_rect(struct pose_rect *bounds, double x, double y, double w, double h)
 {
@@ -353,6 +366,54 @@ pose_metrics_match_pose_to_blobs(const struct xrt_pose *pose,
 	}
 }
 
+/*!
+ * Yaw-only disagreement between a candidate's orientation and a trusted reference, isolated via
+ * swing-twist about @p trusted's up_vector -- mirrors the WMR driver's own
+ * wmr_constellation_solve_yaw_error_rad (reverb-g2 patch 0074), just operating in whatever frame
+ * the caller's poses are already in (camera frame, from this file's callers) instead of world
+ * frame, and with a caller-supplied axis instead of a hardcoded world-Y, since this file has no
+ * notion of "world" at all -- see CS_FLAG_MATCH_GRAVITY's own gravity_vector in
+ * correspondence_search.c for the established pattern of doing exactly that kind of
+ * frame-agnostic swing-twist decomposition.
+ */
+static float
+trusted_orientation_yaw_error_rad(const struct xrt_quat *pose_orientation,
+                                  const struct pose_metrics_trusted_orientation *trusted)
+{
+	struct xrt_quat trusted_inv;
+	math_quat_invert(&trusted->orientation, &trusted_inv);
+
+	// Frame-local rotation taking the trusted reference to the candidate -- same
+	// "target * inverse(current)" pattern the WMR driver's own yaw-error helper uses.
+	struct xrt_quat full_delta;
+	math_quat_rotate(pose_orientation, &trusted_inv, &full_delta);
+
+	struct xrt_vec3 axis = trusted->up_vector;
+	math_vec3_normalize(&axis);
+
+	struct xrt_quat swing_discarded, yaw_only;
+	math_quat_decompose_swing_twist(&full_delta, &axis, &swing_discarded, &yaw_only);
+
+	// yaw_only's vector part is guaranteed parallel to `axis` by construction (see
+	// math_quat_decompose_swing_twist: it's built as `axis * dot(orig_axis, axis)`, then
+	// renormalized) -- its signed projection onto axis, paired with .w, gives the same
+	// atan2(sin(theta/2), cos(theta/2)) pair the WMR helper reads directly off .y/.w for its
+	// hardcoded world-Y axis, generalized here to an arbitrary one.
+	struct xrt_vec3 yaw_vec = {yaw_only.x, yaw_only.y, yaw_only.z};
+	float signed_sin_half = (float)m_vec3_dot(yaw_vec, axis);
+
+	float yaw_error_rad = 2.0f * atan2f(signed_sin_half, yaw_only.w);
+
+	// Wrap to (-pi, pi] -- 2*atan2 spans (-2pi, 2pi], and an unwrapped error beyond +-180 steps
+	// the long way around the circle (see the WMR helper's own comment, caught live there).
+	if (yaw_error_rad > (float)M_PI) {
+		yaw_error_rad -= 2.0f * (float)M_PI;
+	} else if (yaw_error_rad < -(float)M_PI) {
+		yaw_error_rad += 2.0f * (float)M_PI;
+	}
+	return yaw_error_rad;
+}
+
 void
 pose_metrics_evaluate_pose(struct pose_metrics *score,
                            const struct xrt_pose *pose,
@@ -361,10 +422,11 @@ pose_metrics_evaluate_pose(struct pose_metrics *score,
                            struct t_constellation_tracker_led_model *led_model,
                            t_constellation_device_id_t device_id,
                            struct camera_model *calib,
-                           struct pose_rect *out_bounds)
+                           struct pose_rect *out_bounds,
+                           const struct pose_metrics_trusted_orientation *trusted_orientation)
 {
 	pose_metrics_evaluate_pose_with_prior(score, pose, false, NULL, NULL, NULL, blobs, num_blobs, led_model,
-	                                      device_id, calib, out_bounds);
+	                                      device_id, calib, out_bounds, trusted_orientation);
 }
 
 void
@@ -379,7 +441,8 @@ pose_metrics_evaluate_pose_with_prior(struct pose_metrics *score,
                                       struct t_constellation_tracker_led_model *led_model,
                                       t_constellation_device_id_t device_id,
                                       struct camera_model *calib,
-                                      struct pose_rect *out_bounds)
+                                      struct pose_rect *out_bounds,
+                                      const struct pose_metrics_trusted_orientation *trusted_orientation)
 {
 	/*
 	 * 1. Project the LED points with the provided pose
@@ -416,6 +479,24 @@ pose_metrics_evaluate_pose_with_prior(struct pose_metrics *score,
 		check_pose_prior(score, pose, pose_prior, pos_error_thresh, rot_error_thresh);
 	}
 
+	// If a trusted orientation was supplied, measure yaw agreement unconditionally (regardless
+	// of pose_prior/prior_must_match, and regardless of which branch below ends up granting
+	// POSE_MATCH_GOOD) -- see pose_metrics_trusted_orientation's own comment for what this is
+	// and pose_metrics_score_is_better_pose for the other consumer of these flags. Computed
+	// before the matched_blobs<3 early exit purely so the flags are always set consistently
+	// whenever trusted_orientation != NULL, even though a <3-blob score can never become GOOD
+	// anyway.
+	bool trusted_yaw_ok = true; // vacuously true when no trusted_orientation was supplied
+	if (trusted_orientation != NULL) {
+		score->match_flags |= POSE_HAD_TRUSTED_ORIENTATION;
+		float yaw_error_rad = trusted_orientation_yaw_error_rad(&pose->orientation, trusted_orientation);
+		score->trusted_yaw_error_rad = (double)yaw_error_rad;
+		trusted_yaw_ok = fabsf(yaw_error_rad) <= trusted_orientation->yaw_threshold_rad;
+		if (trusted_yaw_ok) {
+			score->match_flags |= POSE_MATCH_TRUSTED_YAW;
+		}
+	}
+
 	// Don't add GOOD/STRONG flags if matched fewer than 3 blobs
 	if (score->matched_blobs < 3) {
 		goto done;
@@ -450,8 +531,34 @@ pose_metrics_evaluate_pose_with_prior(struct pose_metrics *score,
 		/*
 		 * If we matched all the blobs in the pose bounding box (allowing 25% noise / overlapping blobs)
 		 * or if we matched a large proportion (2/3) of the LEDs we expect to be visible, then consider this a
-		 * good pose match
+		 * good pose match.
+		 *
+		 * This branch grants POSE_MATCH_GOOD on reprojection quality and blob count ALONE -- unlike the
+		 * POSE_MATCH_POSITION|POSE_MATCH_ORIENT branch above, it never checks orientation against
+		 * anything. That is the exact loophole reverb-g2's T213 traced a yaw-flipped correspondence
+		 * ghost through (a wrong-heading pose can fit the same handful of blobs just as well as the
+		 * true one): if a trusted orientation reference is available, it MUST also agree here before
+		 * this branch is allowed to accept -- see pose_metrics_trusted_orientation's own comment.
 		 */
+		if (!trusted_yaw_ok) {
+			trusted_yaw_reject_count++;
+			if (trusted_yaw_reject_count == 1 || (trusted_yaw_reject_count % 100) == 0) {
+				U_LOG_I(
+				    "pose_metrics: trusted-yaw REJECTED a reprojection-only candidate (yaw error "
+				    "%.1f deg > %.1f deg threshold, %u matched blobs, %.2f px/LED; %llu rejected so "
+				    "far)",
+				    (double)RAD_TO_DEG(score->trusted_yaw_error_rad),
+				    (double)RAD_TO_DEG((double)trusted_orientation->yaw_threshold_rad),
+				    score->matched_blobs, error_per_led,
+				    (unsigned long long)trusted_yaw_reject_count);
+			}
+			LOG_SPEW(
+			    "Rejected reprojection-only match (%d visible LEDs, %d matched blobs) on trusted-yaw "
+			    "disagreement (%f rad)",
+			    score->visible_leds, score->matched_blobs, score->trusted_yaw_error_rad);
+			goto done;
+		}
+
 		score->match_flags |= POSE_MATCH_GOOD;
 
 		// If we had no pose prior, but a close reprojection error, allow a STRONG match
@@ -489,6 +596,41 @@ pose_metrics_score_is_better_pose(struct pose_metrics *old_score, struct pose_me
 	// If the old score wasn't any good, but the new one is - take the new one
 	if (!POSE_HAS_FLAGS(old_score, POSE_MATCH_GOOD) && POSE_HAS_FLAGS(new_score, POSE_MATCH_GOOD)) {
 		return true;
+	}
+
+	// Trusted-orientation yaw preference (reverb-g2 T213, patch 0074 follow-up): among two
+	// candidates that are BOTH already "good" matches, one that agrees with an available
+	// trusted yaw reference always beats one that doesn't -- decided before any
+	// reprojection-based tie-break below, so a lower-error yaw-ghost can never win the search
+	// purely on reprojection quality. Deliberately placed after the two rules above (which
+	// already correctly decide the "no real candidate yet" case: every caller of this function
+	// only calls it once new_score already has POSE_MATCH_GOOD, so this only ever discriminates
+	// between two already-good candidates, never blocks the first real match from replacing an
+	// empty/never-matched old_score). A score that never had a trusted orientation to check
+	// (POSE_HAD_TRUSTED_ORIENTATION clear) is treated as "agrees" -- this rule only ever
+	// narrows the field among trusted-checked candidates, it never penalises a caller that
+	// didn't supply one.
+	if (POSE_HAS_FLAGS(old_score, POSE_MATCH_GOOD) && POSE_HAS_FLAGS(new_score, POSE_MATCH_GOOD)) {
+		bool old_yaw_ok = !POSE_HAS_FLAGS(old_score, POSE_HAD_TRUSTED_ORIENTATION) ||
+		                  POSE_HAS_FLAGS(old_score, POSE_MATCH_TRUSTED_YAW);
+		bool new_yaw_ok = !POSE_HAS_FLAGS(new_score, POSE_HAD_TRUSTED_ORIENTATION) ||
+		                  POSE_HAS_FLAGS(new_score, POSE_MATCH_TRUSTED_YAW);
+
+		if (old_yaw_ok && !new_yaw_ok) {
+			trusted_yaw_deprioritize_count++;
+			if (trusted_yaw_deprioritize_count == 1 || (trusted_yaw_deprioritize_count % 100) == 0) {
+				U_LOG_I(
+				    "pose_metrics: trusted-yaw DEPRIORITIZED a candidate in favour of the current "
+				    "best (candidate yaw error %.1f deg, %u matched blobs vs best's %u; %llu "
+				    "deprioritized so far)",
+				    (double)RAD_TO_DEG(new_score->trusted_yaw_error_rad), new_score->matched_blobs,
+				    old_score->matched_blobs, (unsigned long long)trusted_yaw_deprioritize_count);
+			}
+			return false;
+		}
+		if (!old_yaw_ok && new_yaw_ok) {
+			return true;
+		}
 	}
 
 	double new_error_per_led = new_score->reprojection_error / new_score->matched_blobs;
