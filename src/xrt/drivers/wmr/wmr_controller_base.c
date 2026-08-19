@@ -66,6 +66,11 @@ DEBUG_GET_ONCE_BOOL_OPTION(wmr_controller_orient_fix, "WMR_CONTROLLER_ORIENT_FIX
 //! pose. See the use site: 200 ms was shorter than the interval samples actually arrive at.
 DEBUG_GET_ONCE_NUM_OPTION(wmr_constellation_max_age_ms, "WMR_CONSTELLATION_MAX_AGE_MS", 500)
 DEBUG_GET_ONCE_FLOAT_OPTION(wmr_constellation_gravity_gate_deg, "WMR_CONSTELLATION_GRAVITY_GATE_DEG", 14.0f)
+
+//! World-frame absurdity guard for an arriving constellation sample, in metres (reverb-g2 T223).
+//! NOT a plausibility bound: see the long comment at its use site in constellation_sample_store.
+//! 0 disables it entirely; 5 restores the pre-T223 hardcoded value.
+DEBUG_GET_ONCE_FLOAT_OPTION(wmr_constellation_max_range_m, "WMR_CONSTELLATION_MAX_RANGE_M", 1000.0f)
 //! TRACKER-side twin of the gravity gate above (T221's trigger-blindness fix): when > 0, the
 //! constellation tracker asks for our fusion's down vector and rejects wrong-lobe candidates
 //! BEFORE committing/delivering them, so its recovery ladder actually runs during a ghost flood
@@ -1616,16 +1621,59 @@ constellation_sample_store(struct t_constellation_tracker_device *device, struct
 	// 2026-08-12 in a real game session: pos=(-3432890, -7235085, -15194503), i.e. thousands of
 	// kilometres, with 7 matched blobs. Finite, so the check below never sees it, and it would
 	// enter the history and therefore the tracker's own prior exactly like a NaN would.
-	static const float WMR_CONSTELLATION_MAX_RANGE_M = 5.0f;
+	/*
+	 * WORLD-frame absurdity guard. Deliberately NOT the physical plausibility bound -- that
+	 * one is camera-relative and lives in the tracker (Camera::pushPose's
+	 * WMR_CONSTELLATION_MAX_CAM_RANGE_M), because it is the hand-to-CAMERA distance that
+	 * physics bounds, not the hand-to-ORIGIN distance.
+	 *
+	 * reverb-g2 T223 (2026-08-19), the failure that motivated splitting the two: this check
+	 * was a hardcoded 5 m against the WORLD-frame position, i.e. distance from the SLAM
+	 * tracking origin. Measured live with the headset worn and the wearer sitting still, the
+	 * SLAM head pose had walked to (-3.50, +1.07, +7.66) -- 8.4 m from origin, no divergence
+	 * reset logged. Every controller solve is published as Txr_world_device, so every
+	 * CORRECT solve was then >5 m from origin too and was dropped here. The tracker kept
+	 * producing perfectly good camera-relative poses (two hands 26 cm apart, 45 cm in front)
+	 * at ~38/s while the driver's sample_count stayed frozen for minutes: total, permanent,
+	 * silent loss of controller position for the rest of the session, cured only by a
+	 * relaunch (which re-anchors the origin near the wearer). The wearer's report -- both
+	 * hands parked at one shared point off to the side, occasionally blinking to the right
+	 * place -- is exactly the placeholder this drop path produces.
+	 *
+	 * It was silent because the drop logged at WMR_DEBUG, a per-poll firehose level nobody
+	 * runs a real session at: an hour of the session that found it went into re-deriving,
+	 * from counters that could only be inferred, what one visible log line would have said.
+	 * Hence WMR_INFO here, throttled -- a drop path with no visible counter is a trap, and
+	 * this one had been armed since the check was written.
+	 *
+	 * COUPLING, worth stating because it is not obvious: this guard is only safe at a value this
+	 * large BECAUSE the camera-relative bound upstream (t_constellation_tracker.h's
+	 * max_camera_range_m, 3 m for WMR) already filters the ordinary bad solves. The two are load-
+	 * bearing together, not independently. Disabling the upstream one while leaving this at 1000 m
+	 * would let a moderate-magnitude bad solve -- say 500 m, well short of "absurd" -- into the
+	 * relation history, where m_relation_history's velocity estimate would turn it into an implied
+	 * ~19 km/s and feed that to prediction. That is the "fling" class this project already knows.
+	 *
+	 * The remaining job of this check is the one its own comment above describes: catching
+	 * finite-but-absurd solves (observed 2026-08-12: pos=(-3432890, -7235085, -15194503),
+	 * thousands of kilometres, with 7 matched blobs) before they enter the relation history
+	 * and therefore the tracker's own prior. That needs a bound big enough to never fire on
+	 * a legitimately-drifted origin. 0 disables; WMR_CONSTELLATION_MAX_RANGE_M=5 restores
+	 * the pre-T223 behaviour exactly, for an A/B.
+	 */
+	const float max_range_m = debug_get_float_option_wmr_constellation_max_range_m();
 	const struct xrt_vec3 *sp = &sample->pose.position;
-	if (fabsf(sp->x) > WMR_CONSTELLATION_MAX_RANGE_M || fabsf(sp->y) > WMR_CONSTELLATION_MAX_RANGE_M ||
-	    fabsf(sp->z) > WMR_CONSTELLATION_MAX_RANGE_M) {
+	if (max_range_m > 0.0f && (fabsf(sp->x) > max_range_m || fabsf(sp->y) > max_range_m ||
+	                           fabsf(sp->z) > max_range_m)) {
 		wcb->constellation.out_of_range_count++;
 		if (wcb->constellation.out_of_range_count == 1 ||
 		    (wcb->constellation.out_of_range_count % 100) == 0) {
-			WMR_DEBUG(wcb, "constellation sample %.0f m away, dropping it [%llu so far]",
-			          (double)fmaxf(fmaxf(fabsf(sp->x), fabsf(sp->y)), fabsf(sp->z)),
-			          (unsigned long long)wcb->constellation.out_of_range_count);
+			WMR_INFO(wcb,
+			         "constellation sample [%s]: %.2f m from the tracking ORIGIN exceeds the %.2f m "
+			         "absurdity guard, dropping it -- if the wearer has not moved that far, the SLAM "
+			         "origin has drifted and this is dropping GOOD samples [%llu so far]",
+			         wcb->base.str, (double)fmaxf(fmaxf(fabsf(sp->x), fabsf(sp->y)), fabsf(sp->z)),
+			         (double)max_range_m, (unsigned long long)wcb->constellation.out_of_range_count);
 		}
 		return;
 	}
@@ -2030,6 +2078,11 @@ wmr_controller_base_add_to_constellation_tracker(struct wmr_controller_base *wcb
 	struct t_constellation_tracker_device_params params = {
 	    .led_model = wcb->constellation.led_model,
 	    .tracking_source = &wcb->constellation.tracking_source,
+	    // A WMR controller is handheld and the cameras are on the wearer's head: 3 m is already
+	    // generous for arm's length. Same value and same argument as the seeding clamp in
+	    // Camera::trySeededRecovery, which got there first. See T223 for what this replaces --
+	    // a world-frame bound that also counted however far the SLAM origin had drifted.
+	    .max_camera_range_m = 3.0f,
 	};
 
 	int ret = t_constellation_tracker_add_device(tracker, &params, &wcb->constellation.device,

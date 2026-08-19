@@ -56,6 +56,21 @@ DEBUG_GET_ONCE_NUM_OPTION(constellation_lost_search_div, "WMR_CONSTELLATION_LOST
 // WMR_CONSTELLATION_YAW_PRIOR_DEG's own enablement, not a replacement for it.
 DEBUG_GET_ONCE_BOOL_OPTION(constellation_seed_prior, "WMR_CONSTELLATION_SEED_PRIOR", false)
 
+// Global OVERRIDE of the per-device camera-relative plausibility bound, in metres (reverb-g2 T223).
+// Negative (the default) = no override: each device's own params.max_camera_range_m decides, which is
+// where the value belongs, since the right bound is a property of the rig topology (see that field's
+// comment in t_constellation_tracker.h). Set >= 0 to force one bound on every device for an A/B; 0
+// disables the check outright.
+// The same physical argument the seed clamp in Camera::trySeededRecovery already uses, and
+// the same 3 m value: what bounds a tracked object's position is its distance to the CAMERA
+// that saw it, not its distance to the world origin -- the latter also counts however far the
+// SLAM tracking origin has drifted, which says nothing about whether the solve is real.
+// T223 measured a whole worn session lost to that conflation (see the driver-side comment in
+// constellation_sample_store). 0 disables.
+// Revisit -- as the seed clamp's own comment says -- if an external-camera rig ever needs a
+// tracked object legitimately further than this from the camera that observes it.
+DEBUG_GET_ONCE_FLOAT_OPTION(constellation_max_cam_range_m, "WMR_CONSTELLATION_MAX_CAM_RANGE_M", -1.0f)
+
 /*
  *
  * Helper functions
@@ -103,6 +118,8 @@ static uint64_t seed_recovery_attempt_count[XRT_CONSTELLATION_MAX_DEVICES] = {};
 static uint64_t seed_recovery_skip_count[XRT_CONSTELLATION_MAX_DEVICES] = {};
 static uint64_t seed_recovery_success_count[XRT_CONSTELLATION_MAX_DEVICES] = {};
 static uint64_t tracker_gravity_reject_count[XRT_CONSTELLATION_MAX_DEVICES] = {};
+static uint64_t cam_range_reject_count[XRT_CONSTELLATION_MAX_DEVICES] = {};
+static uint64_t no_world_pose_count[XRT_CONSTELLATION_MAX_DEVICES] = {};
 
 static uint64_t *
 seed_recovery_counter_slot(uint64_t *counters, t_constellation_device_id_t device_id)
@@ -1158,6 +1175,32 @@ Camera::pushPose(CameraSample &camera_sample,
 	         Txr_cam_device.orientation.y, Txr_cam_device.orientation.z, Txr_cam_device.orientation.w,
 	         Txr_cam_device.position.x, Txr_cam_device.position.y, Txr_cam_device.position.z);
 
+	// Camera-relative plausibility (reverb-g2 T223) -- see the option's own comment above. This is
+	// deliberately measured HERE, on Txr_cam_device, which is the refined pose expressed relative
+	// to the camera that observed it, and therefore independent of where the tracking origin
+	// happens to be. A hand cannot be 8 m from the headset that is looking at it; a ghost lobe
+	// routinely is. Gates BOTH the publication below and the last_known_pose update further down:
+	// an impossible pose must not become the prior the next search starts from either.
+	const float cam_range_override_m = debug_get_float_option_constellation_max_cam_range_m();
+	const float max_cam_range_m =
+	    cam_range_override_m >= 0.0f ? cam_range_override_m : device->params.max_camera_range_m;
+	bool cam_range_ok = true;
+	if (max_cam_range_m > 0.0f) {
+		const xrt_vec3 &cp = Txr_cam_device.position;
+		float cam_dist_m = sqrtf(cp.x * cp.x + cp.y * cp.y + cp.z * cp.z);
+		if (cam_dist_m > max_cam_range_m) {
+			cam_range_ok = false;
+			uint64_t *count = seed_recovery_counter_slot(cam_range_reject_count, device->id);
+			(*count)++;
+			if (*count == 1 || (*count % 100) == 0) {
+				CT_INFO(tracker,
+				        "camera-range gate: device %d pose %.2f m from the camera exceeds the "
+				        "%.1f m plausibility bound -- not publishing it (%llu so far)",
+				        device->id, cam_dist_m, max_cam_range_m, (unsigned long long)*count);
+			}
+		}
+	}
+
 	std::shared_ptr<CameraMosaic> mosaic = this->mosaic.lock();
 	U_ASSERT_WEAK_PTR_RET(mosaic,
 	                      "Camera mosaic was destroyed while processing a sample, this should never happen since "
@@ -1188,6 +1231,22 @@ Camera::pushPose(CameraSample &camera_sample,
 	auto Txr_world_cam = camera_sample.Txr_world_cam;
 	if (!Txr_world_cam.has_value()) {
 		// Can't do anything if we can't locate the camera in the world.
+		//
+		// This used to be the single most silent drop path in the whole pipeline: no log at ANY
+		// verbosity, so a device could be solving perfectly while nothing ever reached the driver
+		// and no counter anywhere moved. Found during T223's investigation, where it had to be
+		// ruled out by elimination rather than read off a line. Throttled INFO now -- it fires
+		// whenever the tracking-origin device (the headset) has no valid pose for this frame's
+		// timestamp, i.e. SLAM relocalising or not yet converged, which is worth knowing.
+		uint64_t *count = seed_recovery_counter_slot(no_world_pose_count, device->id);
+		(*count)++;
+		if (*count == 1 || (*count % 500) == 0) {
+			CT_INFO(tracker,
+			        "device %d: camera has no world pose for this frame -- the tracking origin "
+			        "(headset) pose was unavailable, so a solved pose cannot be placed in the "
+			        "world and is dropped (%llu so far)",
+			        device->id, (unsigned long long)*count);
+		}
 		return;
 	}
 
@@ -1226,7 +1285,7 @@ Camera::pushPose(CameraSample &camera_sample,
 	// pose_metrics_evaluate_pose_with_prior's loophole-branch check) -- no separate check needed
 	// here. What trusted_orientation ALSO does, unlike an ordinary failed prior match, is gate
 	// the locked_data update just below -- see that block's own comment.
-	if (POSE_HAS_FLAGS(&score, POSE_MATCH_GOOD)) {
+	if (POSE_HAS_FLAGS(&score, POSE_MATCH_GOOD) && cam_range_ok) {
 		// Push the sample to the device
 		t_constellation_tracker_sample sample = {
 		    .timestamp_ns = camera_sample.timestamp_ns,
@@ -1263,7 +1322,7 @@ Camera::pushPose(CameraSample &camera_sample,
 		// before.
 		bool trusted_yaw_ok = trusted_orientation == nullptr || POSE_HAS_FLAGS(&score, POSE_MATCH_TRUSTED_YAW);
 
-		if (trusted_yaw_ok) {
+		if (trusted_yaw_ok && cam_range_ok) {
 			// If we already found a pose in the future, then don't mark blobs, since the device has
 			// definitely moved.
 			if (!device->locked_data.last_known_pose.has_value() ||
@@ -1275,6 +1334,13 @@ Camera::pushPose(CameraSample &camera_sample,
 			}
 
 			device->locked_data.last_known_pose = DeviceLastPose(Txr_world_device, camera_sample.timestamp_ns);
+		} else if (!cam_range_ok) {
+			// Reported separately from the yaw case: same suppression, different reason, and a
+			// log line that names the wrong one costs an investigation (T223's own lesson).
+			CT_DEBUG(tracker,
+			         "Device %d: pose implausibly far from the camera -- not letting it poison "
+			         "last_known_pose/blob associations",
+			         device->id);
 		} else {
 			CT_DEBUG(tracker,
 			         "Device %d: pose disagreed with trusted orientation on yaw (%.1f deg) -- not letting "

@@ -85,6 +85,21 @@ struct t_constellation_tracker_device_params
 	 * guesses when finding the device.
 	 */
 	struct t_constellation_tracker_tracking_source *tracking_source;
+
+	/*!
+	 * Optional plausibility bound, in metres, on how far from the OBSERVING CAMERA this device
+	 * may legitimately be. A pose solved further away than this is discarded before it is
+	 * published or allowed to become the search's own prior. 0 (the default for a zero- or
+	 * partially-initialised params struct) means unbounded -- the pre-existing behaviour.
+	 *
+	 * This is deliberately per-device and not a tracker-wide constant, because the right value
+	 * is a property of the RIG TOPOLOGY, not of the tracker: a headset-mounted-camera driver
+	 * (wmr) is looking at a handheld object at arm's length and can bound it tightly, while an
+	 * external-stationary-camera rig (rift, pssense) legitimately tracks objects several metres
+	 * across a room from the sensor that sees them. A tracker-wide default would silently
+	 * degrade the latter -- reverb-g2 T223 shipped one for a day and this field is the fix.
+	 */
+	float max_camera_range_m;
 };
 
 enum t_constellation_tracker_flags
