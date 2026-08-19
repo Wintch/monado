@@ -325,7 +325,7 @@ wmr_controller_hp_packet_parse(struct wmr_controller_hp *ctrl, const unsigned ch
 
 	uint8_t new_battery = read8(&p);
 	if (!ctrl->has_battery_sample || new_battery != last_input->battery) {
-		// Scale unverified -- see the long comment in wmr_controller_hp_get_battery_status()
+		// Scale confirmed (raw/255) -- see the long comment in wmr_controller_hp_get_battery_status()
 		// below. Logged on every CHANGE (not every packet) specifically so a real
 		// charge/discharge cycle can be correlated against this byte later.
 		WMR_INFO(ctrl, "Controller battery raw byte [%s]: %u -> %u", ctrl->base.base.str,
@@ -534,13 +534,22 @@ wmr_controller_hp_packet_parse(struct wmr_controller_hp *ctrl, const unsigned ch
 		last_input->imu.timestamp_ticks += (UINT64_C(0x1) << 32u);
 	}
 
-	/* Todo: More decoding here
-	    read16(&p); // Unknown. Seems to depend on controller orientation (probably mag)
-	    read32(&p); // Unknown.
-	    read16(&p); // Unknown. Device state, etc.
-	    read16(&p);
-	    read16(&p);
-	*/
+	// WMR_CONTROLLER_TAIL_LOG=1: raw-dump the 12 still-undecoded trailing bytes. docs/re-windows/03
+	// confirms Windows reads a Mag X/Y/Z triplet (HID usages 0x485-0x487, one shared scale factor)
+	// plus device-state fields from this same region, but the exact sub-offsets within these 12
+	// bytes were never pinned against live hardware -- dumped raw (not pre-split into the old,
+	// probably-wrong single-field guess below `p` at this point) so a real capture can be diffed
+	// against controller orientation to find the 3 fields that vary smoothly and boundedly.
+	static int tail_log = -1;
+	if (tail_log < 0) {
+		const char *opt = getenv("WMR_CONTROLLER_TAIL_LOG");
+		tail_log = (opt != NULL && opt[0] != '\0' && opt[0] != '0') ? 1 : 0;
+	}
+	if (tail_log) {
+		WMR_INFO(ctrl,
+		         "[%s] tail12 [%02x%02x %02x%02x%02x%02x %02x%02x %02x%02x %02x%02x]", wcb->base.str,
+		         p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8], p[9], p[10], p[11]);
+	}
 
 	return true;
 }
@@ -634,18 +643,13 @@ wmr_controller_hp_get_battery_status(struct xrt_device *xdev, bool *out_present,
 	// in the tree.
 	*out_charging = false;
 
-	// UNVERIFIED SCALE, said plainly so a caller does not trust this more than it has earned.
-	// `raw` is the uint8_t this driver has parsed out of the controller's 44-byte input report
-	// since the very first version of this file (wmr_controller_hp_packet_parse above) -- it
-	// has simply never been surfaced anywhere past Monado's own debug-variable system (u_var,
-	// i.e. only visible with XRT_DEBUG_GUI=1 open and a human looking at the right panel)
-	// until this function. Nothing found so far -- not this tree, not the Windows HID capture
-	// in docs/09-oasis-driver-re.md, not any WMR community writeup -- documents whether this
-	// byte is already a 0-100 percentage, a raw ADC reading, or something else again. Treating
-	// it as a plain 0-255 range (out_charge = raw / 255) is the least-committal reading, not a
-	// confirmed calibration. wmr_controller_hp_packet_parse logs every time this byte CHANGES,
-	// specifically so the real scale can be worked out later by watching it across a real
-	// charge/discharge cycle instead of guessed at again.
+	// CONFIRMED SCALE (2026-08-18, docs/re-windows/03+06): Windows' HidP scaling computes
+	// `percent = (raw * 100) / 255`, i.e. the same 0-255 ratio as below just expressed out of
+	// 100 instead of out of 1 -- mathematically identical to this driver's formula. `raw` is the
+	// uint8_t this driver has parsed out of the controller's 44-byte input report since the very
+	// first version of this file (wmr_controller_hp_packet_parse above). wmr_controller_hp_packet_parse
+	// still logs every time this byte CHANGES, which is how the Windows-side confirmation was
+	// cross-checked against a live charge/discharge trend on real hardware.
 	*out_charge = (float)raw / 255.0f;
 
 	return XRT_SUCCESS;
