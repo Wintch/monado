@@ -1096,9 +1096,9 @@ wmr_controller_base_get_tracked_pose(struct xrt_device *xdev,
 	if (wcb->constellation.sample_count > 0 && get_tracked_pose_call_count % 90 == 0) {
 		bool pos_tracked = (out_relation->relation_flags & XRT_SPACE_RELATION_POSITION_TRACKED_BIT) != 0;
 		WMR_INFO(wcb,
-		        "get_tracked_pose: pos=(%.3f, %.3f, %.3f) position_tracked=%s at_ts=%lld "
+		        "get_tracked_pose [%s]: pos=(%.3f, %.3f, %.3f) position_tracked=%s at_ts=%lld "
 		        "last_sample_ts=%lld delta_ms=%.1f sample_count=%llu",
-		        out_relation->pose.position.x, out_relation->pose.position.y,
+		        wcb->base.str, out_relation->pose.position.x, out_relation->pose.position.y,
 		        out_relation->pose.position.z, pos_tracked ? "yes" : "no (placeholder)",
 		        (long long)at_timestamp_ns, (long long)wcb->constellation.last_timestamp_ns,
 		        (double)(at_timestamp_ns - wcb->constellation.last_timestamp_ns) / 1e6,
@@ -1692,9 +1692,9 @@ constellation_sample_store(struct t_constellation_tracker_device *device, struct
 				if (wcb->constellation.gravity_gate_drop_count == 1 ||
 				    (wcb->constellation.gravity_gate_drop_count % 50) == 0) {
 					WMR_INFO(wcb,
-					         "gravity gate: dropped wrong-lobe sample, %.1f deg > %.1f "
+					         "gravity gate [%s]: dropped wrong-lobe sample, %.1f deg > %.1f "
 					         "(pos was %.3f,%.3f,%.3f; %llu dropped so far)",
-					         mismatch_deg, gravity_gate_deg, sample->pose.position.x,
+					         wcb->base.str, mismatch_deg, gravity_gate_deg, sample->pose.position.x,
 					         sample->pose.position.y, sample->pose.position.z,
 					         (unsigned long long)wcb->constellation.gravity_gate_drop_count);
 				}
@@ -1740,9 +1740,9 @@ constellation_sample_store(struct t_constellation_tracker_device *device, struct
 					if (wcb->constellation.yaw_prior_reject_count == 1 ||
 					    (wcb->constellation.yaw_prior_reject_count % 100) == 0) {
 						WMR_INFO(wcb,
-						         "yaw prior: rejected sample, %.1f deg > %.1f from locked "
+						         "yaw prior [%s]: rejected sample, %.1f deg > %.1f from locked "
 						         "heading (pos was %.3f,%.3f,%.3f; %llu rejected so far)",
-						         (double)yaw_error_deg, (double)yaw_prior_deg,
+						         wcb->base.str, (double)yaw_error_deg, (double)yaw_prior_deg,
 						         sample->pose.position.x, sample->pose.position.y,
 						         sample->pose.position.z,
 						         (unsigned long long)wcb->constellation.yaw_prior_reject_count);
