@@ -100,6 +100,7 @@ num_blobs_for_device(CameraSample &sample, t_constellation_device_id_t device_id
 // XRT_CONSTELLATION_MAX_DEVICES is already the hard cap this file uses elsewhere for
 // per-sample device arrays (see CameraSample::putDeviceState).
 static uint64_t seed_recovery_attempt_count[XRT_CONSTELLATION_MAX_DEVICES] = {};
+static uint64_t seed_recovery_skip_count[XRT_CONSTELLATION_MAX_DEVICES] = {};
 static uint64_t seed_recovery_success_count[XRT_CONSTELLATION_MAX_DEVICES] = {};
 
 static uint64_t *
@@ -558,17 +559,56 @@ Camera::trySeededRecovery(std::unique_ptr<Device> &device,
 
 	auto tracker = this->tracker;
 
-	// Position source for the seed -- see this function's own header comment for why
-	// last-known is preferred over the ordinary predicted prior.
+	// Position source for the seed. REVERSED from the original design (first hardware run,
+	// 2026-08-19, everyday-system rig): the predicted prior is preferred over last-known now.
+	// The original argument for last-known-first ("a half-turn ghost's position error is
+	// small") missed that Device::locked_data.last_known_pose is fed by pushPose's
+	// deliberately-UNCONDITIONAL update (see its load-bearing comment) -- it accepts
+	// position-garbage poses that never passed any gate, and the seeded attempts themselves
+	// then re-feed it, a positive feedback loop measured live: seed positions ran away
+	// 4m -> 12m from the camera inside one session while the real controllers sat 1m away.
+	// The predicted prior comes from the tracking source's relation history, which only
+	// ever stores driver-gate-ACCEPTED samples -- a far cleaner seed. Last-known stays as
+	// the fallback for a device that has never had an accepted sample this session.
 	const xrt_pose *position_source = nullptr;
-	if (Tcv_world_device_last_known.has_value()) {
-		position_source = &Tcv_world_device_last_known.value();
-	} else if (Tcv_world_device_prior.has_value()) {
+	bool seed_from_prior = false;
+	if (Tcv_world_device_prior.has_value()) {
 		position_source = &Tcv_world_device_prior.value();
+		seed_from_prior = true;
+	} else if (Tcv_world_device_last_known.has_value()) {
+		position_source = &Tcv_world_device_last_known.value();
 	} else {
 		// Nothing to seed a position with -- a trusted heading alone can't localize the
 		// device anywhere in the frame.
 		return false;
+	}
+
+	// Plausibility clamp (same first-hardware-run finding as above): refuse to seed from a
+	// position implausibly far from this camera, so one poisoned entry cannot keep the
+	// runaway loop alive. 3m is generous for every source that can currently reach this
+	// code -- seeding is gated on get_trusted_orientation, which only the WMR driver
+	// implements today, and a WMR controller is handheld near the head-mounted cameras.
+	// Revisit the constant if an external-camera rig (rift-style) ever opts in.
+	{
+		const float SEED_MAX_CAM_DISTANCE_M = 3.0f;
+		xrt_pose seed_in_cam;
+		math_pose_transform(&Tcv_cam_world, position_source, &seed_in_cam);
+		float d2 = seed_in_cam.position.x * seed_in_cam.position.x +
+		           seed_in_cam.position.y * seed_in_cam.position.y +
+		           seed_in_cam.position.z * seed_in_cam.position.z;
+		if (d2 > SEED_MAX_CAM_DISTANCE_M * SEED_MAX_CAM_DISTANCE_M) {
+			uint64_t *skip_count = seed_recovery_counter_slot(seed_recovery_skip_count, device->id);
+			(*skip_count)++;
+			if (*skip_count == 1 || (*skip_count % 500) == 0) {
+				CT_INFO(tracker,
+				        "constellation seed-prior: SKIPPING seed for device %d -- %s position "
+				        "%.2f m from camera exceeds the %.1f m plausibility bound (%llu skips "
+				        "so far for this device)",
+				        device->id, seed_from_prior ? "prior" : "last-known", sqrtf(d2),
+				        SEED_MAX_CAM_DISTANCE_M, (unsigned long long)*skip_count);
+			}
+			return false;
+		}
 	}
 
 	float yaw_threshold_rad = 0.0f;
@@ -592,7 +632,7 @@ Camera::trySeededRecovery(std::unique_ptr<Device> &device,
 		        "%.3f,%.3f,%.3f from %s, %llu attempts so far for this device)",
 		        device->id, Tcv_world_device_seed.position.x, Tcv_world_device_seed.position.y,
 		        Tcv_world_device_seed.position.z,
-		        Tcv_world_device_last_known.has_value() ? "last-known pose" : "predicted prior",
+		        seed_from_prior ? "predicted prior" : "last-known pose",
 		        (unsigned long long)*attempt_count);
 	}
 
