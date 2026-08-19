@@ -102,6 +102,7 @@ num_blobs_for_device(CameraSample &sample, t_constellation_device_id_t device_id
 static uint64_t seed_recovery_attempt_count[XRT_CONSTELLATION_MAX_DEVICES] = {};
 static uint64_t seed_recovery_skip_count[XRT_CONSTELLATION_MAX_DEVICES] = {};
 static uint64_t seed_recovery_success_count[XRT_CONSTELLATION_MAX_DEVICES] = {};
+static uint64_t tracker_gravity_reject_count[XRT_CONSTELLATION_MAX_DEVICES] = {};
 
 static uint64_t *
 seed_recovery_counter_slot(uint64_t *counters, t_constellation_device_id_t device_id)
@@ -355,6 +356,9 @@ Camera::tryDevicePose(std::unique_ptr<Device> &device,
 
 
 	if (POSE_HAS_FLAGS(&score, POSE_MATCH_GOOD | POSE_MATCH_LED_IDS)) {
+		if (this->deviceGravityRejected(device, Tcv_world_device_candidate, sample.timestamp_ns)) {
+			return false;
+		}
 		this->pushPose(sample,                   //
 		               device_state,             //
 		               device,                   //
@@ -474,6 +478,17 @@ Camera::tryDeviceBlobRecovery(std::unique_ptr<Device> &device,
 	}
 
 	if (POSE_HAS_FLAGS(&score, POSE_MATCH_GOOD)) {
+		{
+			// World-frame copy of the refined candidate for the pre-delivery gravity check
+			// (Tcv_cam_world maps world -> cam here, same as tryDevicePose's usage above).
+			xrt_pose Tcv_world_cam_inv;
+			math_pose_invert(&Tcv_cam_world, &Tcv_world_cam_inv);
+			xrt_pose Tcv_world_device;
+			math_pose_transform(&Tcv_world_cam_inv, &Tcv_cam_device, &Tcv_world_device);
+			if (this->deviceGravityRejected(device, Tcv_world_device, sample.timestamp_ns)) {
+				return false;
+			}
+		}
 		CT_DEBUG(tracker, "Camera %p RANSAC-PnP recovered pose for device %d from %u blobs", (void *)this,
 		         device->id, sample.blob_count);
 		this->pushPose(sample,               //
@@ -887,6 +902,16 @@ Camera::processSampleSlow(CameraSample &sample)
 			    device->gravity_error_rad,                         //
 			    &score,                                            //
 			    trusted_orientation_ptr);                          //
+			if (found_pose && Tcv_world_cam.has_value()) {
+				// Pre-delivery gravity check, same as the fast path's -- a full-search
+				// result can land on the wrong lobe just as easily (T221: gravity-blind
+				// ghost assignments were the dominant failure mode, not absent poses).
+				xrt_pose Tcv_world_device;
+				math_pose_transform(&Tcv_world_cam.value(), &Tcv_cam_device, &Tcv_world_device);
+				if (this->deviceGravityRejected(device, Tcv_world_device, sample.timestamp_ns)) {
+					found_pose = false;
+				}
+			}
 			if (found_pose) {
 				this->pushPose(sample,               //
 				               *device_state,        //
@@ -1324,6 +1349,61 @@ Camera::getTrustedOrientation(std::unique_ptr<Device> &device, xrt_pose &Tcv_wor
 	trusted.yaw_threshold_rad = yaw_threshold_rad;
 
 	return trusted;
+}
+
+bool
+Camera::deviceGravityRejected(std::unique_ptr<Device> &device,
+                              const xrt_pose &Tcv_world_device_candidate,
+                              int64_t when_ns)
+{
+	if (device->params.tracking_source == nullptr) {
+		return false;
+	}
+
+	xrt_vec3 down_device_trusted;
+	float max_angle_rad = 0.0f;
+	if (!t_constellation_tracker_tracking_source_get_trusted_gravity(device->params.tracking_source, when_ns,
+	                                                                 &down_device_trusted, &max_angle_rad)) {
+		return false;
+	}
+	if (!(max_angle_rad > 0.0f)) {
+		// Same reasoning as getTrustedWorldPose's yaw_threshold_rad check: a non-positive
+		// threshold would reject every candidate, which can't be what anyone meant.
+		return false;
+	}
+
+	// Mirror of the WMR driver's own device-side gravity gate, run on the candidate BEFORE
+	// delivery: express world-down in the candidate's body frame, in the delivered-pose (xr)
+	// convention. math_pose_convert_opencv is the same self-inverse basis change pushPose's
+	// delivery path applies, and composition commutes with it, so this orientation equals the
+	// one the driver would have gated after delivery.
+	xrt_pose Tcv_world_device = Tcv_world_device_candidate;
+	xrt_pose Txr_world_device;
+	math_pose_convert_opencv(&Tcv_world_device, &Txr_world_device);
+
+	xrt_quat solve_inv;
+	math_quat_invert(&Txr_world_device.orientation, &solve_inv);
+	xrt_vec3 down = {0.f, -1.f, 0.f};
+	xrt_vec3 down_candidate;
+	math_quat_rotate_vec3(&solve_inv, &down, &down_candidate);
+
+	float dot = down_candidate.x * down_device_trusted.x + down_candidate.y * down_device_trusted.y +
+	            down_candidate.z * down_device_trusted.z;
+	float mismatch_rad = acosf(fmaxf(-1.f, fminf(1.f, dot)));
+	if (mismatch_rad <= max_angle_rad) {
+		return false;
+	}
+
+	uint64_t *count = seed_recovery_counter_slot(tracker_gravity_reject_count, device->id);
+	(*count)++;
+	if (*count == 1 || (*count % 100) == 0) {
+		CT_INFO(this->tracker,
+		        "tracker gravity gate: rejected wrong-lobe candidate for device %d pre-delivery, "
+		        "%.1f deg > %.1f (%llu rejects so far)",
+		        device->id, mismatch_rad * 180.0f / (float)M_PI, max_angle_rad * 180.0f / (float)M_PI,
+		        (unsigned long long)*count);
+	}
+	return true;
 }
 
 /*

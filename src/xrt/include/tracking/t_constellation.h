@@ -254,6 +254,38 @@ struct t_constellation_tracker_tracking_source
 	                                int64_t when_ns,
 	                                struct xrt_quat *out_orientation,
 	                                float *out_yaw_threshold_rad);
+
+	/*!
+	 * OPTIONAL, may be NULL. If set, called by the constellation tracker to ask for a TRUSTED
+	 * world-down (gravity) direction expressed in the device's body frame, in the same
+	 * convention as the poses this tracker delivers -- so the tracker can reject a candidate
+	 * whose implied gravity disagrees BEFORE committing to it (marking blobs, updating its
+	 * last-known pose, delivering the sample). The motivating case (reverb-g2 T221) is a
+	 * ghost-flood regime: wrong-lobe candidates that pass reprojection scoring cleanly, get
+	 * delivered, and are then discarded by the tracking source's own device-side gravity gate
+	 * -- from where the tracker sits every one of those looked like a SUCCESS, so its recovery
+	 * ladder (including seeded recovery) never triggered all session. This callback moves the
+	 * same gravity information in front of the commit point.
+	 *
+	 * Deliberately weaker-gated than @ref get_trusted_orientation: gravity (pitch/roll) from
+	 * an IMU fusion is accelerometer truth whenever IMU data flows at all -- no yaw
+	 * lock/convergence requirement, which matters precisely because a ghost flood prevents yaw
+	 * from ever locking (the T221 chicken-and-egg).
+	 *
+	 * @param[in]  when_ns              Timestamp the reference is wanted for.
+	 * @param[out] out_world_down_device World-down expressed in the device body frame, in the
+	 *                                   delivered-pose convention (converting from any internal
+	 *                                   reference is this callback's job, not the tracker's).
+	 * @param[out] out_max_angle_rad     Maximum angle between a candidate's implied down vector
+	 *                                   and this reference before the candidate is rejected.
+	 *
+	 * @return true if both out params were filled in and should be trusted right now, false to
+	 * behave exactly as if this callback were NULL for this call.
+	 */
+	bool (*get_trusted_gravity)(struct t_constellation_tracker_tracking_source *,
+	                            int64_t when_ns,
+	                            struct xrt_vec3 *out_world_down_device,
+	                            float *out_max_angle_rad);
 };
 
 /*!
@@ -292,6 +324,27 @@ t_constellation_tracker_tracking_source_get_trusted_orientation(
 	}
 	return tracking_source->get_trusted_orientation(tracking_source, when_ns, out_orientation,
 	                                                out_yaw_threshold_rad);
+}
+
+/*!
+ * Helper function for @ref t_constellation_tracker_tracking_source::get_trusted_gravity.
+ * Handles NULL (the common case: most tracking sources don't implement this), returning false.
+ *
+ * @copydoc t_constellation_tracker_tracking_source::get_trusted_gravity
+ *
+ * @public @memberof t_constellation_tracker_tracking_source
+ */
+XRT_NONNULL_ALL static inline bool
+t_constellation_tracker_tracking_source_get_trusted_gravity(
+    struct t_constellation_tracker_tracking_source *tracking_source,
+    int64_t when_ns,
+    struct xrt_vec3 *out_world_down_device,
+    float *out_max_angle_rad)
+{
+	if (tracking_source->get_trusted_gravity == NULL) {
+		return false;
+	}
+	return tracking_source->get_trusted_gravity(tracking_source, when_ns, out_world_down_device, out_max_angle_rad);
 }
 
 

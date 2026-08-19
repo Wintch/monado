@@ -400,6 +400,19 @@ public: // Methods (t_constellation_tracker.cpp)
 	std::optional<xrt_pose>
 	getTrustedWorldPose(std::unique_ptr<Device> &device, int64_t when_ns, float *out_yaw_threshold_rad);
 
+	//! Pre-delivery gravity-coherence check (reverb-g2 T221's trigger-blindness fix): asks the
+	//! device's tracking_source for a trusted world-down direction (@ref
+	//! t_constellation_tracker_tracking_source::get_trusted_gravity -- deliberately NOT gated on
+	//! yaw lock, unlike @ref getTrustedOrientation) and compares it against the WORLD-frame
+	//! candidate's implied down vector -- the exact quantity the WMR driver's own device-side
+	//! gravity gate computes AFTER delivery. Returning true means "wrong-lobe ghost, reject":
+	//! callers must treat the candidate as not found, so the fast path's existing recovery
+	//! ladder keeps going instead of committing to a ghost the driver would only discard later.
+	//! False when the source has no such hook, nothing trustworthy right now, or the candidate
+	//! agrees -- i.e. exactly the pre-existing behavior for every non-implementing device.
+	bool
+	deviceGravityRejected(std::unique_ptr<Device> &device, const xrt_pose &Tcv_world_device_candidate, int64_t when_ns);
+
 public: // Methods (constellation_debug_scribble.cpp)
 	void
 	debugScribbleSample(CameraSample &sample, bool fast);

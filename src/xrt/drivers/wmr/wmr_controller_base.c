@@ -66,6 +66,15 @@ DEBUG_GET_ONCE_BOOL_OPTION(wmr_controller_orient_fix, "WMR_CONTROLLER_ORIENT_FIX
 //! pose. See the use site: 200 ms was shorter than the interval samples actually arrive at.
 DEBUG_GET_ONCE_NUM_OPTION(wmr_constellation_max_age_ms, "WMR_CONSTELLATION_MAX_AGE_MS", 500)
 DEBUG_GET_ONCE_FLOAT_OPTION(wmr_constellation_gravity_gate_deg, "WMR_CONSTELLATION_GRAVITY_GATE_DEG", 14.0f)
+//! TRACKER-side twin of the gravity gate above (T221's trigger-blindness fix): when > 0, the
+//! constellation tracker asks for our fusion's down vector and rejects wrong-lobe candidates
+//! BEFORE committing/delivering them, so its recovery ladder actually runs during a ghost flood
+//! instead of "succeeding" with ghosts this file then silently discards. Default off (new,
+//! unvalidated layer -- ships opt-in like 0074/0076/0077 did). Suggested live value: 14, same
+//! as the device-side gate, which stays on as the last line of defense (post-refinement drift).
+DEBUG_GET_ONCE_FLOAT_OPTION(wmr_constellation_tracker_gravity_gate_deg,
+                            "WMR_CONSTELLATION_TRACKER_GRAVITY_GATE_DEG",
+                            0.0f)
 //! Gain applied to the yaw-only heading discrepancy between a GATE-ACCEPTED constellation
 //! solve (see WMR_CONSTELLATION_GRAVITY_GATE_DEG just above) and the IMU fusion's own,
 //! unreferenced heading (2026-08-17, docs/pruebas.jsonl T206/T207: gyro-Y dynamics are now
@@ -1926,6 +1935,60 @@ constellation_tracking_source_get_trusted_orientation(struct t_constellation_tra
 	return true;
 }
 
+/*!
+ * @ref t_constellation_tracker_tracking_source::get_trusted_gravity implementation (reverb-g2
+ * T221): hands the tracker our fusion's world-down direction so it can reject wrong-lobe
+ * candidates BEFORE delivery. Gated ONLY on IMU data actually flowing -- the same permissive
+ * condition the device-side gravity gate in constellation_sample_store uses, and deliberately
+ * NOT on solve_yaw_locked: gravity (pitch/roll) is accelerometer truth whether or not the
+ * heading has converged. That asymmetry is the entire point -- T221 measured a whole worn
+ * session where the ghost flood kept yaw from ever locking, every yaw-locked layer stayed
+ * inert, and the gravity information that could have rejected the ghosts pre-delivery sat
+ * unused on this side of the boundary while the tracker committed to ghost after ghost.
+ *
+ * Frame: out vector = the exact down_imu (post-Rx180-bridge) the device-side gate computes,
+ * i.e. world-down expressed in the device body frame in the delivered-pose convention -- one
+ * quantity, two check sites, tracker first, device-side gate kept as the last line of defense.
+ */
+static bool
+constellation_tracking_source_get_trusted_gravity(struct t_constellation_tracker_tracking_source *tracking_source,
+                                                  int64_t when_ns,
+                                                  struct xrt_vec3 *out_world_down_device,
+                                                  float *out_max_angle_rad)
+{
+	struct wmr_controller_base *wcb =
+	    container_of(tracking_source, struct wmr_controller_base, constellation.tracking_source);
+
+	(void)when_ns; // Fusion is read live, same as get_trusted_orientation above.
+
+	float gate_deg = debug_get_float_option_wmr_constellation_tracker_gravity_gate_deg();
+	if (gate_deg <= 0.0f) {
+		return false;
+	}
+
+	os_mutex_lock(&wcb->data_lock);
+	struct xrt_quat fusion_rot = wcb->fusion.rot;
+	int64_t imu_ts = wcb->last_imu_timestamp_ns;
+	os_mutex_unlock(&wcb->data_lock);
+
+	if (imu_ts == 0) {
+		return false;
+	}
+
+	struct xrt_quat imu_inv;
+	math_quat_invert(&fusion_rot, &imu_inv);
+	struct xrt_vec3 down = {0.f, -1.f, 0.f};
+	struct xrt_vec3 down_imu;
+	math_quat_rotate_vec3(&imu_inv, &down, &down_imu);
+	// Rx180, the identified LED-model <-> IMU-fusion frame bridge (same as the device-side gate).
+	down_imu.y = -down_imu.y;
+	down_imu.z = -down_imu.z;
+
+	*out_world_down_device = down_imu;
+	*out_max_angle_rad = gate_deg * ((float)M_PI / 180.0f);
+	return true;
+}
+
 void
 wmr_controller_base_add_to_constellation_tracker(struct wmr_controller_base *wcb,
                                                  struct t_constellation_tracker *tracker,
@@ -1962,6 +2025,7 @@ wmr_controller_base_add_to_constellation_tracker(struct wmr_controller_base *wcb
 	}
 	wcb->constellation.tracking_source.get_tracked_pose = constellation_tracking_source_get_tracked_pose;
 	wcb->constellation.tracking_source.get_trusted_orientation = constellation_tracking_source_get_trusted_orientation;
+	wcb->constellation.tracking_source.get_trusted_gravity = constellation_tracking_source_get_trusted_gravity;
 
 	struct t_constellation_tracker_device_params params = {
 	    .led_model = wcb->constellation.led_model,
