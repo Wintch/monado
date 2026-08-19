@@ -83,6 +83,19 @@ wmr_camera_set_ctrl_exposure_gain(struct wmr_camera *cam, uint8_t camera_id, uin
 #define DEFAULT_CTRL_GAIN 100
 #define DEFAULT_GAIN 127
 
+/*
+ * Manual override for the controller-tracking frames' FIXED exposure/gain (they never
+ * adapt -- WMR_AUTOEXPOSURE only drives the SLAM frames). Motivation (T221, 2026-08-19):
+ * in-motion constellation acceptance collapsed to ~zero while at-rest acceptance ran at
+ * thousands of samples -- 6 ms of exposure on a fast-moving hand smears the LED points
+ * into arcs, corrupting centroids and correspondence, and fresh cells may bloom them.
+ * A/B knob for the motion-blur/bloom hypothesis; defaults preserve current behavior
+ * exactly. Hardware range observed on the G2 (see wmr_camera_gain_cmd): exposure 60-9000,
+ * gain 16-255. Untested values below ~60 read back clamped (2026-08-11 experiment above).
+ */
+DEBUG_GET_ONCE_NUM_OPTION(wmr_ctrl_exposure, "WMR_CONTROLLER_CAM_EXPOSURE_US", DEFAULT_CTRL_EXPOSURE)
+DEBUG_GET_ONCE_NUM_OPTION(wmr_ctrl_gain, "WMR_CONTROLLER_CAM_GAIN", DEFAULT_CTRL_GAIN)
+
 #define WMR_FRAMETYPE_SLAM 0x0
 #define WMR_FRAMETYPE_CONTROLLER 0x2
 
@@ -572,10 +585,19 @@ wmr_camera_open(struct wmr_camera_open_config *config)
 	 * must be unchanged. If the SLAM view degrades, the mapping is wrong: revert.
 	 */
 	if (debug_get_bool_option_wmr_constellation_controllers()) {
+		uint16_t ctrl_exposure = (uint16_t)debug_get_num_option_wmr_ctrl_exposure();
+		uint8_t ctrl_gain = (uint8_t)debug_get_num_option_wmr_ctrl_gain();
+		if (ctrl_exposure != DEFAULT_CTRL_EXPOSURE || ctrl_gain != DEFAULT_CTRL_GAIN) {
+			// Loud on purpose: an exposure A/B is only valid if the log proves which
+			// values actually ran (the 2026-08-11 experiment above showed values can
+			// read back clamped by the hardware).
+			WMR_CAM_INFO(cam, "Controller-tracking exposure/gain OVERRIDE: %u/%u (defaults %u/%u)",
+			             ctrl_exposure, ctrl_gain, DEFAULT_CTRL_EXPOSURE, DEFAULT_CTRL_GAIN);
+		}
 		for (int i = 0; i < cam->tcam_count; i++) {
 			const struct wmr_camera_config *config = &cam->tcam_confs[i];
-			bool status = wmr_camera_set_ctrl_exposure_gain(cam, config->location, DEFAULT_CTRL_EXPOSURE,
-			                                               DEFAULT_CTRL_GAIN);
+			bool status = wmr_camera_set_ctrl_exposure_gain(cam, config->location, ctrl_exposure,
+			                                               ctrl_gain);
 			if (status != 0) {
 				WMR_CAM_ERROR(cam, "Failed to set controller-tracking exposure and gain for camera %d",
 				              i);
