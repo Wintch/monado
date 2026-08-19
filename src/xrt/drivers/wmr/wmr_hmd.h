@@ -122,6 +122,36 @@ struct wmr_hmd
 	 */
 	uint64_t companion_backoff_until_ns;
 
+	/*!
+	 * Identity of the companion USB device, remembered so the read thread can find its
+	 * NEW hidraw node after the device re-enumerates. See wmr_hmd_companion_reconnect().
+	 */
+	uint16_t companion_vid;
+	uint16_t companion_pid;
+
+	/*!
+	 * Hot-reconnect state for the companion device (reverb-g2 T227, docs/61).
+	 *
+	 * The USB2 branch this device lives on re-enumerates constantly -- measured at
+	 * 3.47 drops/min with ~3 s outages, and measured at the SAME rate on Windows with
+	 * the same cable and machine (docs/60), so it is the link, not this stack. What IS
+	 * this stack's is the consequence: a re-enumeration invalidates the open hidraw fd
+	 * permanently, every later read returns -1 forever, and everything riding this
+	 * channel -- panel control, IPD, the proximity sensor behind XR_EXT_user_presence --
+	 * stays dead until the service is relaunched. Windows rides the same outages and the
+	 * wearer notices nothing but audio. So: re-open the device instead of retrying a
+	 * corpse.
+	 *
+	 * companion_dead_since_ns is when the current dead stretch began (0 = alive), and is
+	 * what makes the recovery measurable rather than merely plausible.
+	 */
+	uint64_t companion_dead_since_ns;
+	//! Do not attempt a re-open before this monotonic time (rate limit, ~1/s).
+	uint64_t companion_reconnect_next_ns;
+	//! Successful re-opens this session, and re-open attempts that failed with the node present.
+	uint32_t companion_reconnect_count;
+	uint32_t companion_reconnect_failures;
+
 	//! Current desired HMD screen state.
 	bool hmd_screen_enable;
 	//! Latest raw IPD value read from the device.
@@ -270,6 +300,7 @@ wmr_hmd_create(enum wmr_headset_type hmd_type,
                struct os_hid_device *hid_holo,
                struct os_hid_device *hid_ctrl,
                struct xrt_prober_device *dev_holo,
+               struct xrt_prober_device *dev_companion,
                enum u_logging_level log_level,
                struct xrt_device **out_hmd,
                struct xrt_device **out_handtracker,

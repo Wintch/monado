@@ -373,8 +373,8 @@ wmr_create_headset(struct xrt_prober *xp,
 	struct xrt_device *ht = NULL;
 	struct xrt_device *two_hands[2] = {NULL, NULL}; // Must initialize, always returned.
 	struct xrt_device *hmd_left_ctrl = NULL, *hmd_right_ctrl = NULL;
-	wmr_hmd_create(type, hid_holo, hid_companion, xpdev_holo, log_level, &hmd, &ht, &hmd_left_ctrl,
-	               &hmd_right_ctrl);
+	wmr_hmd_create(type, hid_holo, hid_companion, xpdev_holo, xpdev_companion, log_level, &hmd, &ht,
+	               &hmd_left_ctrl, &hmd_right_ctrl);
 
 	if (hmd == NULL) {
 		U_LOG_IFL_E(log_level, "Failed to create WMR HMD device.");
