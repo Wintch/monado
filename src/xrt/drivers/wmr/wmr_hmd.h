@@ -129,6 +129,35 @@ struct wmr_hmd
 	//! Latest proximity sensor value read from the device.
 	uint8_t proximity_sensor;
 
+	/*!
+	 * Debounce state for XR_EXT_user_presence (reverb-g2 T223/T224).
+	 *
+	 * The raw byte is NOT clean: measured live during a real donning gesture it alternated
+	 * 0,1,0,1 before settling at 1. Reported straight through, that flicker would toggle
+	 * presence, and a presence toggle is what a title turns into a pause -- i.e. the game
+	 * pausing and unpausing in a wearer's face while they are still putting the headset on.
+	 * So a candidate state must persist before it is committed.
+	 *
+	 * The two directions are deliberately NOT symmetric, and the asymmetry is the whole
+	 * point: entering "worn" is cheap to get wrong (a spurious resume is invisible), while
+	 * entering "not worn" is expensive (a spurious pause interrupts a session). The same
+	 * reasoning the T224 session recorded for the channel-death case: this feature rides the
+	 * companion device, the least reliable channel in the stack, and it must always fail
+	 * TOWARD "worn", never toward "absent".
+	 */
+	struct
+	{
+		//! State currently reported to the app.
+		bool committed;
+		//! Candidate state waiting out its debounce window, and when it first appeared.
+		bool candidate;
+		uint64_t candidate_since_ns;
+		//! When the companion last delivered a proximity value at all. 0 = never.
+		uint64_t last_update_ns;
+		//! Throttle for the stale-channel notice.
+		uint64_t stale_log_count;
+	} presence;
+
 	struct hololens_sensors_packet packet;
 
 	struct
