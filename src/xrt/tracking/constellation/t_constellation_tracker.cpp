@@ -142,6 +142,7 @@ static uint64_t seed_recovery_success_count[XRT_CONSTELLATION_MAX_DEVICES] = {};
 static uint64_t tracker_gravity_reject_count[XRT_CONSTELLATION_MAX_DEVICES] = {};
 static uint64_t cam_range_reject_count[XRT_CONSTELLATION_MAX_DEVICES] = {};
 static uint64_t no_world_pose_count[XRT_CONSTELLATION_MAX_DEVICES] = {};
+static uint64_t blob_ownership_log_count[XRT_CONSTELLATION_MAX_DEVICES] = {};
 
 static uint64_t *
 seed_recovery_counter_slot(uint64_t *counters, t_constellation_device_id_t device_id)
@@ -1018,6 +1019,37 @@ Camera::processSampleFast(CameraSample &sample)
 	bool need_slow_search = false;
 	std::shared_lock lock(tracker->device_lock);
 	for (std::unique_ptr<Device> &device : tracker->devices) {
+		/*
+		 * Blob OWNERSHIP telemetry (reverb-g2 T225).
+		 *
+		 * Every t_blob carries a single matched_device_id, tryDeviceBlobRecovery -- the path
+		 * that wins most frames -- needs at least 4 blobs already marked for THIS device, and
+		 * devices are iterated in a fixed order. So the hands are not independent: they
+		 * compete for a shared pool, and a hand that loses the pool cannot reach the
+		 * threshold to compete for it back.
+		 *
+		 * T225 measured two consecutive worn windows, identical build and config, wearer
+		 * changing nothing, inverting completely: left 3.6% / right 62.1%, then left 74.5% /
+		 * right 0.0%. All-or-nothing with no middle ground, which is the shape a single-winner
+		 * competition makes and NOT the shape an intrinsically worse hand would make. This
+		 * line is what turns that from a hypothesis into a measurement: if the losing hand
+		 * sits systematically below the 4-blob floor while the winner holds a large share,
+		 * the mechanism is closed -- and with it, the "the left hand is worse" framing this
+		 * project has carried since T215 (L 4.55% vs R 30.3%), which every historical
+		 * left-vs-right comparison here would then be contaminated by.
+		 */
+		{
+			uint32_t owned = num_blobs_for_device(sample, device->id);
+			uint64_t *count = seed_recovery_counter_slot(blob_ownership_log_count, device->id);
+			(*count)++;
+			if (*count == 1 || (*count % 300) == 0) {
+				CT_INFO(tracker,
+				        "blob ownership: device %d holds %u of %u blobs this frame (%s the "
+				        "4-blob floor tryDeviceBlobRecovery needs)",
+				        device->id, owned, sample.blob_count, owned >= 4 ? "at or above" : "BELOW");
+			}
+		}
+
 		xrt_space_relation device_predicted_relation = XRT_SPACE_RELATION_ZERO; //< AKA "the prior"
 
 		if (device->params.tracking_source != nullptr) {
