@@ -1561,9 +1561,22 @@ apply_solve_yaw_correction(struct wmr_controller_base *wcb,
 		os_mutex_unlock(&wcb->data_lock);
 		return;
 	}
+	// T223 (2026-08-19, docs/58): this is the ONLY place solve_yaw_locked is ever written, and
+	// there is no code path anywhere that clears it back to false once set -- the distrust-window
+	// return just above skips learning from a sample without touching the flag. So the lock is
+	// monotonic for the life of this device object (i.e. for the session, since wcb is allocated
+	// fresh per launch): "locked" means "has ever converged", not "is currently converged". That
+	// was itself unverifiable before this patch -- T223 found 3900 accepted corrections and ZERO
+	// WMR_CONSTELLATION_YAW_PRIOR_DEG rejections in the same worn session and could not tell
+	// whether the prior gate was silently declining to engage (lock never formed) or engaging and
+	// never finding a disagreement (lock formed and every sample agreed) -- those are opposite
+	// diagnoses. Logging the transition below answers that question directly instead of by
+	// inference from a downstream counter.
+	bool was_locked = wcb->constellation.solve_yaw_locked;
 	if (fabsf(yaw_error_rad) < yaw_lock_rad) {
 		wcb->constellation.solve_yaw_locked = true;
 	}
+	bool just_locked = wcb->constellation.solve_yaw_locked && !was_locked;
 
 	float step_rad = gain * yaw_error_rad;
 	if (step_rad > max_step_rad) {
@@ -1598,11 +1611,23 @@ apply_solve_yaw_correction(struct wmr_controller_base *wcb,
 	uint64_t count = wcb->constellation.solve_yaw_correction_count;
 	os_mutex_unlock(&wcb->data_lock);
 
+	// Unconditional, not throttled: a lock/unlock transition is rare (once per session, in
+	// practice, since the flag is monotonic -- see the comment at the write site above) and is
+	// exactly the event this patch exists to make visible, so it is never worth losing to a
+	// modulo. WMR_INFO, not DEBUG -- the whole reason this was unobservable in T223 is that the
+	// project's own diagnostics are repeatedly hidden at a level a real session doesn't run at.
+	if (just_locked) {
+		WMR_INFO(wcb,
+		         "yaw lock ACQUIRED [%s]: converged to %.1f deg after %llu accepted corrections -- "
+		         "WMR_CONSTELLATION_YAW_PRIOR_DEG can now engage for this hand",
+		         wcb->base.str, (double)(yaw_error_rad * 180.0 / M_PI), (unsigned long long)count);
+	}
+
 	if (count == 1 || (count % log_every) == 0) {
 		WMR_INFO(wcb,
-		         "solve-yaw correct [%s]: error=%.1f deg step=%.2f deg gain=%.3f (%llu corrections so far)",
+		         "solve-yaw correct [%s]: error=%.1f deg step=%.2f deg gain=%.3f locked=%s (%llu corrections so far)",
 		         wcb->base.str, (double)(yaw_error_rad * 180.0 / M_PI), (double)(step_rad * 180.0 / M_PI),
-		         (double)gain, (unsigned long long)count);
+		         (double)gain, was_locked || just_locked ? "true" : "false", (unsigned long long)count);
 	}
 }
 
@@ -1729,6 +1754,30 @@ constellation_sample_store(struct t_constellation_tracker_device *device, struct
 		imu_ts = wcb->last_imu_timestamp_ns;
 		solve_yaw_locked = wcb->constellation.solve_yaw_locked;
 		os_mutex_unlock(&wcb->data_lock);
+
+		// T223 (2026-08-19, docs/58): heartbeat, deliberately placed HERE and not only inside
+		// apply_solve_yaw_correction -- that function only runs on gate-accepted samples with
+		// WMR_CONTROLLER_SOLVE_YAW_CORRECT set, so a session where it is never called (the
+		// option is off, or every sample is a ghost the gravity gate above is about to drop)
+		// would otherwise never print a single "yaw lock" line at all: silence, not a verdict.
+		// This runs on every sample the gravity gate evaluates, so it fires unconditionally
+		// whenever WMR_CONSTELLATION_GRAVITY_GATE_DEG is on, independent of whether the
+		// correction feature is even enabled -- exactly the case T221/T223 could not tell apart
+		// ("the gate never fired" vs. "the lock never formed" vs. "no sample ever qualified").
+		// Throttled at a few hundred samples (the tracker runs at ~38-140 solves/s per
+		// controller per docs/03/T223, so this is roughly a once-every-few-seconds line, cheap
+		// enough to leave on for a whole session) so a session that never locks says so
+		// explicitly and repeatedly instead of once and possibly missed.
+		wcb->constellation.yaw_lock_status_log_count++;
+		uint64_t yaw_status_count = wcb->constellation.yaw_lock_status_log_count;
+		if (yaw_status_count == 1 || (yaw_status_count % 300) == 0) {
+			WMR_INFO(wcb,
+			         "yaw lock status [%s]: %s (%llu corrections applied so far, %llu gated samples "
+			         "checked)",
+			         wcb->base.str, solve_yaw_locked ? "LOCKED" : "not locked",
+			         (unsigned long long)wcb->constellation.solve_yaw_correction_count,
+			         (unsigned long long)yaw_status_count);
+		}
 
 		if (imu_ts != 0) {
 			struct xrt_quat solve_inv, imu_inv;

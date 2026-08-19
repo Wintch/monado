@@ -180,6 +180,13 @@ struct wmr_controller_base
 		//! Gate-accepted solves further rejected by WMR_CONSTELLATION_YAW_PRIOR_DEG for
 		//! disagreeing with the locked fusion heading (0 while off, or before lock).
 		uint64_t yaw_prior_reject_count;
+		//! T223 (2026-08-19, docs/58): reverb-g2's own instrumentation, not upstream. Counts
+		//! every gravity-gated sample seen while WMR_CONSTELLATION_GRAVITY_GATE_DEG is on, purely
+		//! to throttle the "yaw lock status" heartbeat log -- see its use site in
+		//! constellation_sample_store. MUST be per-device, same reasoning as
+		//! get_tracked_pose_call_count just above: a shared static would silently mute one hand's
+		//! heartbeat under interleaved calls.
+		uint64_t yaw_lock_status_log_count;
 
 		/*!
 		 * Every constellation sample this controller receives, keyed by the sample's own
