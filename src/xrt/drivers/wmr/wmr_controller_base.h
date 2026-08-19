@@ -168,6 +168,12 @@ struct wmr_controller_base
 		uint64_t gravity_gate_drop_count;
 		//! Gate-accepted solves that fed WMR_CONTROLLER_SOLVE_YAW_CORRECT (0 while off).
 		uint64_t solve_yaw_correction_count;
+		//! Per-device get_tracked_pose call counter for the throttled output log. MUST be
+		//! per-device: a function-local static is shared by both controllers, and with the
+		//! two hands' calls interleaving evenly, an even modulo lands on the same hand every
+		//! time -- silently muting the other (the exact bug the 2026-08-11 note below the
+		//! use site describes; it had crept back in via a shared static).
+		uint64_t get_tracked_pose_call_count;
 		//! Set once the solve-yaw error has been observed small (heading acquired);
 		//! afterwards, huge sudden errors are distrusted as 0047's yaw-ghost solves.
 		bool solve_yaw_locked;

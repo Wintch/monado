@@ -1091,9 +1091,8 @@ wmr_controller_base_get_tracked_pose(struct xrt_device *xdev,
 	// happens to be sitting on a multiple of 30 -- so it stayed completely silent whenever samples
 	// stopped arriving, i.e. exactly when the delta is worth reading. Gate on this device's own call
 	// count instead; sample_count > 0 still keeps it quiet until there is something to report.
-	static uint64_t get_tracked_pose_call_count = 0;
-	++get_tracked_pose_call_count;
-	if (wcb->constellation.sample_count > 0 && get_tracked_pose_call_count % 90 == 0) {
+	++wcb->constellation.get_tracked_pose_call_count;
+	if (wcb->constellation.sample_count > 0 && wcb->constellation.get_tracked_pose_call_count % 90 == 0) {
 		bool pos_tracked = (out_relation->relation_flags & XRT_SPACE_RELATION_POSITION_TRACKED_BIT) != 0;
 		WMR_INFO(wcb,
 		        "get_tracked_pose [%s]: pos=(%.3f, %.3f, %.3f) position_tracked=%s at_ts=%lld "
