@@ -502,10 +502,29 @@ pose_metrics_evaluate_pose_with_prior(struct pose_metrics *score,
 		goto done;
 	}
 
-	// At this point, we have at least 3 LEDs and their blobs matching
+	/*
+	 * At this point, we have at least 3 LEDs and their blobs matching.
+	 *
+	 * trusted_yaw_ok is required in BOTH branches below (reverb-g2 T224). It used to gate only
+	 * the else-if branch, which is the loophole T213 found and 0076 closed -- but that left the
+	 * prior-match branch here accepting a candidate on reprojection alone, with a trusted
+	 * heading available and disagreeing, purely because the candidate happened to fall inside
+	 * the prior's own window. That window is exactly what a slowly-drifting wrong lobe stays
+	 * inside: the prior is fed by previous accepted samples, so once a mis-assignment is
+	 * admitted it becomes the reference that admits the next one. Gating both branches on the
+	 * same boolean costs nothing (it is already computed above, unconditionally) and is
+	 * vacuously true whenever no trusted orientation was supplied -- so rift/pssense, which
+	 * never populate that callback, are byte-identical.
+	 *
+	 * Scope, honestly: this closes an admission path, it does not solve the residual ghost.
+	 * T224 measured that ghost at ~13-25 deg of yaw -- about a 1-2 LED step around a 32-LED
+	 * ring (~11 deg spacing) -- while the trusted heading's own noise floor under worn motion
+	 * is 10-30 deg. A threshold cannot separate populations that overlap; see docs/58.
+	 */
 	if (POSE_HAS_FLAGS(score, POSE_MATCH_POSITION | POSE_MATCH_ORIENT)) {
-		if (error_per_led < 2.0 && (score->unmatched_blobs * 4 <= score->matched_blobs ||
-		                            (2 * score->visible_leds <= 3 * score->matched_blobs))) {
+		if (trusted_yaw_ok && error_per_led < 2.0 &&
+		    (score->unmatched_blobs * 4 <= score->matched_blobs ||
+		     (2 * score->visible_leds <= 3 * score->matched_blobs))) {
 			LOG_SPEW("Got good prior match within pos (%f, %f, %f) rot (%f, %f, %f)", pos_error_thresh->x,
 			         pos_error_thresh->y, pos_error_thresh->z, rot_error_thresh->x, rot_error_thresh->y,
 			         rot_error_thresh->z);

@@ -56,6 +56,28 @@ DEBUG_GET_ONCE_NUM_OPTION(constellation_lost_search_div, "WMR_CONSTELLATION_LOST
 // WMR_CONSTELLATION_YAW_PRIOR_DEG's own enablement, not a replacement for it.
 DEBUG_GET_ONCE_BOOL_OPTION(constellation_seed_prior, "WMR_CONSTELLATION_SEED_PRIOR", false)
 
+// Try the trusted-heading-SEEDED hypothesis FIRST in the fast path, instead of last (reverb-g2
+// T224). The seeding layer (0077/0082) is already "generate the assignment from the heading" --
+// but it only runs after every ordinary attempt has failed, and the ordinary attempts seed PnP
+// with the PREVIOUS orientation. So when an ordinary attempt converges to a small-angle wrong
+// local minimum that still lands inside the prior's own window, it returns first and the
+// generated hypothesis never competes. Worse, that accepted sample becomes the prior that
+// admits the next one.
+//
+// Default OFF and deliberately so: reordering the per-camera-per-frame fast path is exactly the
+// kind of change this project has learned not to make on reasoning alone. It costs at most one
+// extra RANSAC-PnP refine plus one reprojection match per device per frame when it does not win
+// -- the same cost the attempts it is being moved ahead of already pay -- and it is inert
+// without a trusted orientation, so rift/pssense are unaffected by construction.
+//
+// EXPECTED CEILING, so the A/B is read honestly: T224 measured the residual ghost at ~13-25 deg
+// of yaw, about a 1-2 LED slip around a 32-LED ring (~11 deg spacing), while the trusted
+// heading's own noise floor under worn motion is 10-30 deg. Seeding can NARROW the candidate
+// pool to the few LEDs inside that cone; it cannot pick the right one within it. Expect a
+// better hit rate, not the ghost's elimination -- and if the measurement shows otherwise, that
+// is the interesting result.
+DEBUG_GET_ONCE_BOOL_OPTION(constellation_seed_first, "WMR_CONSTELLATION_SEED_FIRST", false)
+
 // Global OVERRIDE of the per-device camera-relative plausibility bound, in metres (reverb-g2 T223).
 // Negative (the default) = no override: each device's own params.max_camera_range_m decides, which is
 // where the value belongs, since the right bound is a property of the rig topology (see that field's
@@ -1026,6 +1048,34 @@ Camera::processSampleFast(CameraSample &sample)
 		const pose_metrics_trusted_orientation *trusted_orientation_ptr =
 		    trusted_orientation.has_value() ? &trusted_orientation.value() : nullptr;
 
+		// Last-known pose, hoisted above the attempts (it used to be looked up between them)
+		// so the optional seed-first attempt below can use it without a second lock round.
+		// Pure motion of existing code: the later attempts read the same two variables.
+		bool has_last_known = false;
+		xrt_pose Tcv_world_device_last_known;
+		{
+			std::unique_lock<os::Mutex> lock(device->data_lock);
+
+			if (auto last_known_pose = device->locked_data.last_known_pose) {
+				math_pose_convert_opencv(&last_known_pose->Txr_world_device,
+				                         &Tcv_world_device_last_known);
+				has_last_known = true;
+			}
+		}
+		std::optional<xrt_pose> Tcv_world_device_last_known_opt =
+		    has_last_known ? std::optional<xrt_pose>(Tcv_world_device_last_known) : std::nullopt;
+
+		// WMR_CONSTELLATION_SEED_FIRST -- see that option's comment. Same call as the
+		// last-resort attempt further down, just given the chance to win before an ordinary
+		// attempt's small-angle local minimum takes the frame.
+		if (debug_get_bool_option_constellation_seed_first() && trusted_orientation_ptr != nullptr &&
+		    this->trySeededRecovery(device, sample, device_state, Tcv_cam_world, Tcv_world_device_predicted,
+		                            Tcv_world_device_last_known_opt, trusted_orientation_ptr)) {
+			CT_DEBUG(tracker, "Fast processing for device %d succeeded with seeded recovery (seed-first)",
+			         device->id);
+			continue; // try the next device, we found a pose!
+		}
+
 		bool wipe_blob_associations = false;
 		if (this->tryDeviceBlobRecovery(device, sample, device_state, Tcv_cam_world,
 		                                Tcv_world_device_predicted)) {
@@ -1043,19 +1093,6 @@ Camera::processSampleFast(CameraSample &sample)
 			continue; // try the next device, we found a pose!
 		}
 
-		// Try to get a last known pose
-		bool has_last_known = false;
-		xrt_pose Tcv_world_device_last_known;
-		{
-			std::unique_lock<os::Mutex> lock(device->data_lock);
-
-			if (auto last_known_pose = device->locked_data.last_known_pose) {
-				math_pose_convert_opencv(&last_known_pose->Txr_world_device,
-				                         &Tcv_world_device_last_known);
-				has_last_known = true;
-			}
-		}
-
 		if (has_last_known &&
 		    this->tryDevicePose(device, sample, device_state, Tcv_cam_world, Tcv_world_device_predicted,
 		                        Tcv_world_device_last_known, trusted_orientation_ptr)) {
@@ -1070,8 +1107,6 @@ Camera::processSampleFast(CameraSample &sample)
 		// far less frequent slow search -- try one more, cheap, trusted-heading-seeded
 		// hypothesis first. Reuses has_last_known/Tcv_world_device_last_known computed just
 		// above instead of re-querying device->data_lock a second time.
-		std::optional<xrt_pose> Tcv_world_device_last_known_opt =
-		    has_last_known ? std::optional<xrt_pose>(Tcv_world_device_last_known) : std::nullopt;
 		if (this->trySeededRecovery(device, sample, device_state, Tcv_cam_world, Tcv_world_device_predicted,
 		                            Tcv_world_device_last_known_opt, trusted_orientation_ptr)) {
 			CT_DEBUG(tracker, "Fast processing for device %d succeeded with seeded recovery", device->id);
