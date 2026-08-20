@@ -125,6 +125,67 @@ num_blobs_for_device(CameraSample &sample, t_constellation_device_id_t device_id
 	return out_num_blobs;
 }
 
+/*
+ * Per-device blob PHOTOMETRY (reverb-g2 T229).
+ *
+ * THE QUESTION: the wearer reports one controller's LEDs looking visibly brighter than the
+ * other's on the same batteries, and docs/46 already correlates over-bright LEDs with ghost
+ * solves. Nothing in this stack commands LED intensity -- the WMR controller protocol has no
+ * brightness/power/PWM command -- so any difference is the controller's own hardware, firmware
+ * or supply, and the only way to settle it is to measure what the cameras actually see.
+ *
+ * THE TRAP, and it is why this is not a one-line change: t_blob::brightness is the brightest
+ * PIXEL of the blob, clamped to 1.0. An IR LED bright enough to saturate the sensor pegs it at
+ * 1.0 -- so in exactly the over-bright case we are chasing, brightness reports "both hands 1.0"
+ * and hides the difference the wearer can see with their own eyes. What keeps growing past
+ * saturation is the blob's AREA: a saturated LED blooms across more pixels. So the instrument is
+ * the pair (saturated fraction, mean area), with mean brightness only meaningful below
+ * saturation.
+ *
+ * Both hands are measured in the SAME frames, through the same sensor at the same exposure, so
+ * the comparison needs no absolute calibration -- which is the whole advantage over
+ * photographing the controllers.
+ *
+ * CAVEAT, stated in the log line itself: only blobs already matched to a device can be
+ * attributed to a hand, so this is conditioned on that hand solving at all. A hand that never
+ * solves produces no photometry, which is exactly the T225 inversion case -- absence here is
+ * not darkness.
+ */
+struct blob_photometry
+{
+	uint32_t n;
+	uint32_t saturated;
+	float brightness_sum;
+	float area_sum;
+};
+
+static struct blob_photometry
+measure_blobs(CameraSample &sample, t_constellation_device_id_t device_id, bool all_blobs)
+{
+	struct blob_photometry out = {};
+	for (uint32_t i = 0; i < sample.blob_count; i++) {
+		t_blob &b = sample.blobs[i];
+		if (!all_blobs && b.matched_device_id != device_id) {
+			continue;
+		}
+		out.n++;
+		out.brightness_sum += b.brightness;
+		// >= 0.99 rather than == 1.0: the scale is a float division of an 8-bit sample, so
+		// a saturated pixel need not land exactly on 1.0.
+		if (b.brightness >= 0.99f) {
+			out.saturated++;
+		}
+		// size may legitimately be {0,0} (the field is documented as optional); fall back to
+		// the bounding box, which every blobwatch fills in.
+		float area = b.size.x * b.size.y;
+		if (area <= 0.0f) {
+			area = (float)(b.bounding_box.extent.w * b.bounding_box.extent.h);
+		}
+		out.area_sum += area;
+	}
+	return out;
+}
+
 // Per-device, rate-limited seeded-recovery diagnostics (reverb-g2 T215, "assignment-prior
 // SEEDING", Camera::trySeededRecovery below). Plain fixed-size arrays, not atomics and not a
 // std::map: the SAME device can be visited concurrently by more than one camera's own
@@ -143,6 +204,7 @@ static uint64_t tracker_gravity_reject_count[XRT_CONSTELLATION_MAX_DEVICES] = {}
 static uint64_t cam_range_reject_count[XRT_CONSTELLATION_MAX_DEVICES] = {};
 static uint64_t no_world_pose_count[XRT_CONSTELLATION_MAX_DEVICES] = {};
 static uint64_t blob_ownership_log_count[XRT_CONSTELLATION_MAX_DEVICES] = {};
+static uint64_t blob_photometry_log_count[XRT_CONSTELLATION_MAX_DEVICES] = {};
 
 static uint64_t *
 seed_recovery_counter_slot(uint64_t *counters, t_constellation_device_id_t device_id)
@@ -1047,6 +1109,27 @@ Camera::processSampleFast(CameraSample &sample)
 				        "blob ownership: device %d holds %u of %u blobs this frame (%s the "
 				        "4-blob floor tryDeviceBlobRecovery needs)",
 				        device->id, owned, sample.blob_count, owned >= 4 ? "at or above" : "BELOW");
+			}
+		}
+
+		// See measure_blobs(): brightness saturates, area does not, so both are reported and
+		// the frame-wide figures come along as the exposure/room baseline that makes the
+		// per-device numbers comparable across sessions.
+		{
+			struct blob_photometry mine = measure_blobs(sample, device->id, false);
+			uint64_t *count = seed_recovery_counter_slot(blob_photometry_log_count, device->id);
+			(*count)++;
+			if (mine.n > 0 && (*count == 1 || (*count % 300) == 0)) {
+				struct blob_photometry all = measure_blobs(sample, device->id, true);
+				CT_INFO(tracker,
+				        "blob photometry: device %d n=%u bright_mean=%.3f saturated=%u/%u "
+				        "area_mean_px=%.1f | frame all n=%u bright_mean=%.3f saturated=%u "
+				        "area_mean_px=%.1f (brightness pegs at 1.0 when the LED saturates -- "
+				        "compare AREA between hands, not brightness)",
+				        device->id, mine.n, mine.brightness_sum / (float)mine.n, mine.saturated,
+				        mine.n, mine.area_sum / (float)mine.n, all.n,
+				        all.n ? all.brightness_sum / (float)all.n : 0.0f, all.saturated,
+				        all.n ? all.area_sum / (float)all.n : 0.0f);
 			}
 		}
 
