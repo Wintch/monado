@@ -173,6 +173,15 @@ struct pacing_app
 	} last_input;
 
 	int64_t last_returned_ns;
+	/*!
+	 * The GATE slot behind the last returned promise: last_returned_ns minus
+	 * the pipelined promise shift that was applied to it. The next prediction
+	 * must advance past this, NOT past the shifted promise -- comparing against
+	 * the promise and then adding the shift again spaced every promise two
+	 * display periods apart, which paced every pipelined app to exactly half
+	 * the panel rate (45 of 90 fps, measured live 2026-08-21).
+	 */
+	int64_t last_returned_gate_ns;
 };
 
 
@@ -259,9 +268,9 @@ last_sample_displayed(const struct pacing_app *pa)
 }
 
 static int64_t
-last_return_predicted_display(const struct pacing_app *pa)
+last_return_gate(const struct pacing_app *pa)
 {
-	return pa->last_returned_ns;
+	return pa->last_returned_gate_ns;
 }
 
 static int64_t
@@ -390,10 +399,11 @@ predict_display_time(const struct pacing_app *pa, int64_t now_ns, int64_t displa
 	// Start from the last time that the driver displayed something.
 	int64_t val = last_sample_displayed(pa);
 
-	// Return a time after the last returned display time. Add half the
+	// Return a time after the last returned GATE slot (the promise minus the
+	// pipelined shift it carried -- see last_returned_gate_ns). Add half the
 	// display period to the comparison for robustness when the last display
 	// time shifts slightly with respect to the last sample.
-	while (val <= last_return_predicted_display(pa) + (app_period_ns / 2)) {
+	while (val <= last_return_gate(pa) + (app_period_ns / 2)) {
 		val += app_period_ns;
 	}
 
@@ -591,6 +601,7 @@ pa_predict(struct u_pacing_app *upa,
 	int64_t gpu_done_time_ns = wake_up_time_ns + total_app_time_ns(pa);
 
 	pa->last_returned_ns = predict_ns;
+	pa->last_returned_gate_ns = predict_ns - pipelined_promise_shift_ns(pa, display_period_ns);
 
 	*out_wake_up_time = wake_up_time_ns;
 	*out_predicted_display_time = predict_ns;
