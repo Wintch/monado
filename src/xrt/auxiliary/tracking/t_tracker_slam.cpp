@@ -20,6 +20,7 @@
 #include "util/u_trace_marker.h"
 
 #include "os/os_threading.h"
+#include <cstdio>
 
 #include "math/m_api.h"
 #include "math/m_filter_fifo.h"

@@ -30,6 +30,7 @@
 #include <libusb.h>
 #include <stdlib.h>
 #include <assert.h>
+#include <stdio.h>
 
 //! Specifies whether the user wants to enable autoexposure from the start.
 DEBUG_GET_ONCE_BOOL_OPTION(wmr_autoexposure, "WMR_AUTOEXPOSURE", true)
@@ -732,6 +733,11 @@ wmr_camera_start(struct wmr_camera *cam)
 			goto fail;
 		}
 	}
+
+	// All transfers submitted successfully and the USB thread is running: mark the camera as
+	// running so wmr_camera_stop() actually performs teardown (join the USB thread, cancel
+	// transfers) instead of early-returning on its `!cam->running` guard.
+	cam->running = true;
 
 	WMR_CAM_INFO(cam, "WMR camera started");
 
