@@ -767,6 +767,11 @@ wmr_camera_stop(struct wmr_camera *cam)
 		}
 	}
 
+	// Join the USB thread before any other frame-node's teardown can proceed --
+	// otherwise an in-flight callback can still deliver a frame into a tracker
+	// that is concurrently being destroyed (SIGSEGV in pop_pose()).
+	os_thread_helper_stop_and_wait(&cam->usb_thread);
+
 	res = set_active(cam, false);
 	if (res < 0) {
 		goto fail;
