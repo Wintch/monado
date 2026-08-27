@@ -93,6 +93,21 @@ DEBUG_GET_ONCE_BOOL_OPTION(wmr_handtracking, "WMR_HANDTRACKING", true)
 //! just orientation. See docs/03-controllers.md.
 DEBUG_GET_ONCE_BOOL_OPTION(wmr_constellation_controllers, "WMR_CONSTELLATION_CONTROLLERS", false)
 
+//! Default off. On the SLAM head-pose path, wmr_hmd_get_slam_tracked_pose() always clears
+//! XRT_SPACE_RELATION_ANGULAR_VELOCITY_VALID_BIT before returning, so every consumer downstream
+//! of this driver -- including a SteamVR compatibility layer relaying our poses onward -- sees
+//! zero head angular velocity regardless of how fast the head is actually turning. SteamVR's own
+//! compositor uses TrackedDevicePose_t's velocity fields for its late-stage photon-time
+//! extrapolation and motion-smoothing/reprojection warp; hand it zero and that extrapolation is a
+//! no-op for rotation, i.e. it loses one full photon-time interval of rotational-latency
+//! prediction it would otherwise apply from real data instead of assuming a static head.
+//! When on, forwards the angular velocity the SLAM tracker itself already computed for this exact
+//! timestamp (see predict_pose() in t_tracker_slam.cpp), axis-corrected into the WMR frame, and
+//! sets the valid bit -- see the comment at its use site for why this is NOT simply reusing
+//! wh->fusion.last_angular_velocity, and for the prediction-double-counting risk that has NOT been
+//! ruled out.
+DEBUG_GET_ONCE_BOOL_OPTION(wmr_forward_angular_velocity, "WMR_FORWARD_ANGULAR_VELOCITY", false)
+
 #ifdef XRT_FEATURE_SLAM
 //! Whether to submit samples to the SLAM tracker from the start.
 DEBUG_GET_ONCE_OPTION(slam_submit_from_start, "SLAM_SUBMIT_FROM_START", NULL)
@@ -1597,6 +1612,23 @@ wmr_hmd_correct_pose_from_basalt(struct xrt_pose pose)
 	return pose;
 }
 
+//! Same axis correction as wmr_hmd_correct_pose_from_basalt(), for a free vector (e.g. angular
+//! velocity) instead of a pose. This is a coordinate-frame relabeling (Basalt's axes -> WMR's),
+//! not a physical rigid-body transform, so it applies to any vector quantity the same way it
+//! applies to position: rotate by the fixed 90-degree quat, then negate the swapped y/z axes.
+//! Unlike wmr_hmd_correct_pose_from_basalt() this is only reached under
+//! WMR_FORWARD_ANGULAR_VELOCITY (see wmr_hmd_get_slam_tracked_pose()), so it is not applied by
+//! default and has not been exercised against real Basalt output.
+XRT_MAYBE_UNUSED static inline struct xrt_vec3
+wmr_hmd_correct_vec3_from_basalt(struct xrt_vec3 v)
+{
+	struct xrt_quat q = {0.70710678, 0, 0, 0.70710678};
+	math_quat_rotate_vec3(&q, &v, &v);
+	v.y = -v.y;
+	v.z = -v.z;
+	return v;
+}
+
 static void
 wmr_hmd_get_slam_tracked_pose(struct xrt_device *xdev,
                               enum xrt_input_name name,
@@ -1611,16 +1643,43 @@ wmr_hmd_get_slam_tracked_pose(struct xrt_device *xdev,
 	int pose_bits = XRT_SPACE_RELATION_ORIENTATION_TRACKED_BIT | XRT_SPACE_RELATION_POSITION_TRACKED_BIT;
 	bool pose_tracked = out_relation->relation_flags & pose_bits;
 
+	// WMR_FORWARD_ANGULAR_VELOCITY (default off): capture the SLAM tracker's own angular
+	// velocity for THIS at_timestamp_ns and whether the tracker itself considered it valid,
+	// before relation_flags below is unconditionally clobbered to only ORIENTATION/POSITION.
+	// This is the tracker's already-predicted velocity (predict_pose() in t_tracker_slam.cpp
+	// with SLAM_PREDICTION_TYPE >= GYRO computes it from live gyro data, or dead-reckoning
+	// integrates it), matching the orientation already returned for this timestamp -- NOT
+	// wh->fusion.last_angular_velocity, which is the 3dof path's raw IMU fusion value as of its
+	// own last_imu_timestamp_ns, an earlier and SLAM-uncorrected instant. Gate on the tracker's
+	// own valid bit rather than assuming a populated field means real data: predict_pose() only
+	// computes this vector for SLAM_PRED_GYRO and above and never sets the valid bit itself --
+	// it inherits whatever the raw VIT-reported relation had, which for some VIT systems may not
+	// include it at all.
+	bool forward_angular_velocity =
+	    debug_get_bool_option_wmr_forward_angular_velocity() &&
+	    (out_relation->relation_flags & XRT_SPACE_RELATION_ANGULAR_VELOCITY_VALID_BIT) != 0;
+	struct xrt_vec3 angular_velocity = out_relation->angular_velocity;
+
 	if (pose_tracked) {
 #ifdef XRT_FEATURE_SLAM
 		// !todo Correct pose depending on the VIT system in use, this should be done in the system itself.
 		// For now, assume that we are using Basalt.
 		wh->pose = wmr_hmd_correct_pose_from_basalt(out_relation->pose);
+		if (forward_angular_velocity) {
+			angular_velocity = wmr_hmd_correct_vec3_from_basalt(angular_velocity);
+		}
 #else
 		wh->pose = out_relation->pose;
 #endif
+	} else {
+		// No fresh SLAM pose this call -- don't forward a velocity paired with a pose we
+		// are not updating either.
+		forward_angular_velocity = false;
 	}
 
+	// wh->tracking.imu2me only re-anchors the pose to a different point rigidly attached to the
+	// same physical head; a rigid body's angular velocity is the same at every point on it, so
+	// unlike position, angular_velocity needs no further correction for this step.
 	if (wh->tracking.imu2me) {
 		math_pose_transform(&wh->pose, &wh->config.sensors.transforms.P_imu_me, &wh->pose);
 	}
@@ -1629,6 +1688,12 @@ wmr_hmd_get_slam_tracked_pose(struct xrt_device *xdev,
 	out_relation->relation_flags = (enum xrt_space_relation_flags)(
 	    XRT_SPACE_RELATION_ORIENTATION_VALID_BIT | XRT_SPACE_RELATION_POSITION_VALID_BIT |
 	    XRT_SPACE_RELATION_ORIENTATION_TRACKED_BIT | XRT_SPACE_RELATION_POSITION_TRACKED_BIT);
+
+	if (forward_angular_velocity) {
+		out_relation->angular_velocity = angular_velocity;
+		out_relation->relation_flags = (enum xrt_space_relation_flags)(
+		    out_relation->relation_flags | XRT_SPACE_RELATION_ANGULAR_VELOCITY_VALID_BIT);
+	}
 }
 
 static xrt_result_t
