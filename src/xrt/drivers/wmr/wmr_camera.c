@@ -41,6 +41,20 @@ DEBUG_GET_ONCE_BOOL_OPTION(wmr_unify_expgain, "WMR_UNIFY_EXPGAIN", false)
 //! Mirrors the option of the same name in wmr_hmd.c -- this is unvalidated, opt-in only.
 DEBUG_GET_ONCE_BOOL_OPTION(wmr_constellation_controllers, "WMR_CONSTELLATION_CONTROLLERS", false)
 
+/*
+ * reverb-g2 patch 0101 (2026-08-27): stamp SLAM frames at mid-EXPOSURE instead of mid-SLOT.
+ * The frame footer's end_ts - start_ts is the 90 Hz slot period (~11.1 ms), not the exposure,
+ * so `start + delta/2` puts the stamp 5.55 ms after the exposure start while the real exposure
+ * (pixel header, microseconds, auto 60-9000) is centred at start + exposure/2 -- i.e. the
+ * frame reaches Basalt 1-5.5 ms late relative to the IMU, and an offline sweep of the wearer's
+ * yaw recording (docs/80) showed that lateness is the single biggest position-drift lever on
+ * fast head turns (-7 ms fixed shift: drift 0.96 -> 0.24 m on config I). This follows the
+ * exposure frame by frame instead of a fixed shift. SLAM frames only; controller frames keep
+ * the mid-slot stamp (the constellation tracker has no measurement to calibrate against yet).
+ * Default off: current behaviour unchanged unless WMR_CAM_TS_MID_EXPOSURE=1.
+ */
+DEBUG_GET_ONCE_BOOL_OPTION(wmr_cam_ts_mid_exposure, "WMR_CAM_TS_MID_EXPOSURE", false)
+
 static int
 update_expgain(struct wmr_camera *cam, struct xrt_frame **frames);
 static int
@@ -432,6 +446,14 @@ img_xfer_cb(struct libusb_transfer *xfer)
 	xf->source_sequence = cam->frame_sequence;
 	xf->timestamp = frame_start_ts + delta / 2;
 	xf->source_timestamp = frame_start_ts;
+
+	// reverb-g2 0101 (see the option's comment at the top of the file).
+	if (slam_tracking_frame && debug_get_bool_option_wmr_cam_ts_mid_exposure()) {
+		uint64_t mid_exposure_ts = frame_start_ts + ((uint64_t)exposure * 1000) / 2;
+		WMR_CAM_TRACE(cam, "mid-exposure stamp: exposure %u us, start+slot/2 %" PRIi64 " -> start+exposure/2 %" PRIu64 " (%" PRIi64 " ns earlier)",
+		              exposure, xf->timestamp, mid_exposure_ts, xf->timestamp - (int64_t)mid_exposure_ts);
+		xf->timestamp = (int64_t)mid_exposure_ts;
+	}
 
 	cam->last_frame_ts = frame_start_ts;
 	cam->last_seq = seq;
