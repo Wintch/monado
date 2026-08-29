@@ -47,6 +47,8 @@
 #include <iomanip>
 #include <map>
 #include <mutex>
+#include <atomic>
+#include <shared_mutex>
 #include <string>
 #include <vector>
 #include <algorithm>
@@ -312,6 +314,19 @@ struct TrackerSlam
 	struct xrt_hand_masks_sink hand_masks_sink = {};        //!< Register latest masks to ignore
 
 	bool submit;        //!< Whether to submit data pushed to sinks to the SLAM tracker
+
+	//! Teardown guard (reverb-g2 0104). xrt_frame_context_destroy_nodes runs break_apart on the
+	//! newest node first, and this tracker is created after the camera source it consumes, so
+	//! tracker_stop runs while the driver's USB/IMU threads can still push one more sample --
+	//! and a client can still query a pose -- into a tracker Basalt has already dismantled:
+	//! SIGSEGV in Tracker::pop_pose <- flush_poses <- receive_frame <- wmr_cam_usb_thread, with
+	//! the main thread inside wmr_source_stream_stop (cores 2026-08-21 and twice on 2026-08-29).
+	//! Every runtime call into the VIT tracker holds vit_lock shared; break_apart takes it
+	//! exclusive around tracker_stop and sets `stopped`, so in-flight calls finish before the
+	//! stop and later ones are dropped instead of dereferencing a stopped tracker.
+	std::shared_mutex vit_lock;
+	bool stopped = false;
+	std::atomic<uint32_t> dropped_after_stop{0}; //!< Calls that arrived after the stop -- each was the crash
 	uint32_t cam_count; //!< Number of cameras used for tracking
 
 	struct u_var_button reset_state_btn; //!< Reset tracker state button
@@ -773,6 +788,10 @@ timing_ui_setup(TrackerSlam &t)
 		u_var_button &btn = t->timing.enable_btn;
 		bool e = !t->timing.enabled;
 		snprintf(btn.label, sizeof(btn.label), "%s", msg[e]);
+		std::shared_lock<std::shared_mutex> vit_guard(t->vit_lock); // 0104
+		if (t->stopped) {
+			return;
+		}
 		vit_result_t vres = t->vit.tracker_enable_extension(t->tracker, VIT_TRACKER_EXTENSION_POSE_TIMING, e);
 		if (vres != VIT_SUCCESS) {
 			U_LOG_IFL_E(t->log_level, "Failed to set tracker timing extension");
@@ -877,6 +896,10 @@ features_ui_setup(TrackerSlam &t)
 		u_var_button &btn = t->features.enable_btn;
 		bool e = !t->features.enabled;
 		snprintf(btn.label, sizeof(btn.label), "%s", msg[e]);
+		std::shared_lock<std::shared_mutex> vit_guard(t->vit_lock); // 0104
+		if (t->stopped) {
+			return;
+		}
 		vit_result_t vres = t->vit.tracker_enable_extension(t->tracker, VIT_TRACKER_EXTENSION_POSE_FEATURES, e);
 		if (vres != VIT_SUCCESS) {
 			U_LOG_IFL_E(t->log_level, "Failed to set tracker features extension");
@@ -1978,6 +2001,10 @@ setup_ui(TrackerSlam &t)
 	u_var_button_cb reset_state_cb = [](void *t_ptr) {
 		TrackerSlam &t = *(TrackerSlam *)t_ptr;
 
+		std::shared_lock<std::shared_mutex> vit_guard(t.vit_lock); // 0104
+		if (t.stopped) {
+			return;
+		}
 		vit_result_t vres = t.vit.tracker_reset(t.tracker);
 		if (vres != VIT_SUCCESS) {
 			SLAM_WARN("Failed to reset VIT tracker");
@@ -2176,7 +2203,14 @@ t_slam_get_tracked_pose(struct xrt_tracked_slam *xts, timepoint_ns when_ns, stru
 		return;
 	}
 
-	flush_poses(t);
+	{
+		std::shared_lock<std::shared_mutex> vit_guard(t.vit_lock); // 0104
+		if (!t.stopped) {
+			flush_poses(t);
+		} else {
+			t.dropped_after_stop++;
+		}
+	}
 
 	// reverb-g2 0102: sample the anchor age this prediction is about to bridge. Under
 	// correction.mutex: this function is called from the compositor AND, with
@@ -2277,7 +2311,12 @@ t_slam_receive_imu(struct xrt_imu_sink *sink, struct xrt_imu_sample *s)
 	sample.wz = w.z;
 
 	if (t.submit) {
-		t.vit.tracker_push_imu_sample(t.tracker, &sample);
+		std::shared_lock<std::shared_mutex> vit_guard(t.vit_lock); // 0104
+		if (!t.stopped) {
+			t.vit.tracker_push_imu_sample(t.tracker, &sample);
+		} else {
+			t.dropped_after_stop++;
+		}
 	}
 
 	xrt_sink_push_imu(t.euroc_recorder->imu, s);
@@ -2300,6 +2339,13 @@ receive_frame(TrackerSlam &t, struct xrt_frame *frame, uint32_t cam_index)
 
 	// Return early if we don't submit
 	if (!t.submit) {
+		return;
+	}
+
+	// 0104: held for the rest of this function (flush_poses + the image push below).
+	std::shared_lock<std::shared_mutex> vit_guard(t.vit_lock);
+	if (t.stopped) {
+		t.dropped_after_stop++;
 		return;
 	}
 
@@ -2469,7 +2515,14 @@ t_slam_node_break_apart(struct xrt_frame_node *node)
 		t_openvr_tracker_stop(t.ovr_tracker);
 	}
 
-	vit_result_t vres = t.vit.tracker_stop(t.tracker);
+	vit_result_t vres;
+	{
+		// 0104: no push or pose query may be inside the tracker while it stops, and none may
+		// enter afterwards (the frame sources are broken apart AFTER this node -- see vit_lock).
+		std::unique_lock<std::shared_mutex> vit_guard(t.vit_lock);
+		t.stopped = true;
+		vres = t.vit.tracker_stop(t.tracker);
+	}
 	if (vres != VIT_SUCCESS) {
 		SLAM_ERROR("Failed to stop VIT tracker");
 		return;
@@ -2484,6 +2537,11 @@ t_slam_node_destroy(struct xrt_frame_node *node)
 	auto t_ptr = container_of(node, TrackerSlam, node);
 	auto &t = *t_ptr; // Needed by SLAM_DEBUG
 	SLAM_DEBUG("Destroying SLAM tracker");
+	if (t.dropped_after_stop > 0) {
+		SLAM_WARN("0104: %u sample pushes / pose queries arrived after tracker_stop and were dropped "
+		          "(each one was the pre-0104 pop_pose SIGSEGV)",
+		          t.dropped_after_stop.load());
+	}
 	if (t.ovr_tracker != NULL) {
 		t_openvr_tracker_destroy(t.ovr_tracker);
 	}
