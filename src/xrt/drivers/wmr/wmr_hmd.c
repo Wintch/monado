@@ -2937,10 +2937,19 @@ wmr_hmd_create(enum wmr_headset_type hmd_type,
 
 		os_mutex_lock(&wh->controller_status_lock);
 		if (wmr_hmd_request_controller_status(wh)) {
-			/* The reader thread sets one flag per processed status report (which
-			 * includes creating that controller when it is online) and signals the
-			 * cond once both are set. Wait for BOTH - exiting on the first would
-			 * routinely lose the second controller.
+			/* have_{left,right}_controller_status latch true on ANY status report for
+			 * that hand, including UNPAIRED/OFFLINE -- only an ONLINE report actually
+			 * creates the controller (hololens_ensure_controller()). A controller can
+			 * legitimately report OFFLINE/UNPAIRED once while still mid-handshake and
+			 * go ONLINE moments later; waiting for "some status" on both hands used to
+			 * declare victory (and this function returns wh->controller[] to the
+			 * caller right after) as soon as the slower hand's first, non-final report
+			 * came in, permanently losing it if its ONLINE report was still in flight.
+			 * Discovered 2026-08-31 on a cold start with both controllers already
+			 * powered on: left came online immediately, right's ONLINE report landed
+			 * ~1-2s later, arriving after this had already exited and handed back a
+			 * NULL right controller for the rest of the session. Wait for the actual
+			 * controller objects instead of the status latch.
 			 *
 			 * Bounded: a lost status reply used to hang startup forever here
 			 * (resolving the @todo that was in this spot). Polling instead of a
@@ -2950,7 +2959,7 @@ wmr_hmd_create(enum wmr_headset_type hmd_type,
 			 * two worst-case controller creations incl. fw-read retries. */
 			const int64_t deadline_ns = os_monotonic_get_ns() + (int64_t)10 * U_TIME_1S_IN_NS;
 			int64_t next_request_ns = os_monotonic_get_ns() + U_TIME_1S_IN_NS;
-			while (!(wh->have_left_controller_status && wh->have_right_controller_status) &&
+			while (!(wh->controller[0] != NULL && wh->controller[1] != NULL) &&
 			       os_monotonic_get_ns() < deadline_ns) {
 				os_mutex_unlock(&wh->controller_status_lock);
 				os_nanosleep(U_TIME_1MS_IN_NS * 20);
@@ -2962,7 +2971,7 @@ wmr_hmd_create(enum wmr_headset_type hmd_type,
 					next_request_ns = now_ns + U_TIME_1S_IN_NS;
 				}
 			}
-			have_controller_status = wh->have_left_controller_status && wh->have_right_controller_status;
+			have_controller_status = wh->controller[0] != NULL && wh->controller[1] != NULL;
 		}
 		os_mutex_unlock(&wh->controller_status_lock);
 
