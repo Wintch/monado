@@ -54,6 +54,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <assert.h>
+#include <time.h>
 #ifdef XRT_OS_LINUX
 #include <dirent.h>
 #include <errno.h>
@@ -237,6 +238,48 @@ hololens_sensors_decode_packet(struct wmr_hmd *wh,
 	if (wh->temperature_log_count == 1 || (wh->temperature_log_count % 15000) == 0) {
 		WMR_INFO(wh, "HMD IMU temperature (raw ICM-20602 register, uncalibrated): %u %u %u %u",
 		         pkt->temperature[0], pkt->temperature[1], pkt->temperature[2], pkt->temperature[3]);
+	}
+
+	// Dashboard snapshot (2026-09-04): dump the same raw registers to a small JSON file roughly
+	// once/second (same temperature_log_count, ~250 Hz packets) so the web dashboard can surface
+	// them without a monado-gui debug session. Best-effort telemetry only: write atomically
+	// (tmp file + rename) so a concurrent reader (the dashboard's Python process) never sees a
+	// half-written file, and never let a failure here (HOME unset, fopen failing) affect the
+	// driver's real job -- warn once via a static guard, not every second.
+	if ((wh->temperature_log_count % 250) == 0) {
+		static bool warned_snapshot_failure = false;
+		const char *home = getenv("HOME");
+		if (home == NULL) {
+			if (!warned_snapshot_failure) {
+				WMR_WARN(wh, "HMD temperature snapshot: HOME not set, skipping dashboard "
+				             "snapshot file");
+				warned_snapshot_failure = true;
+			}
+		} else {
+			char final_path[PATH_MAX];
+			char tmp_path[PATH_MAX];
+			snprintf(final_path, sizeof(final_path), "%s/vr/hmd-temperature.json", home);
+			snprintf(tmp_path, sizeof(tmp_path), "%s/vr/hmd-temperature.json.tmp", home);
+
+			FILE *snap = fopen(tmp_path, "w");
+			if (snap == NULL) {
+				if (!warned_snapshot_failure) {
+					WMR_WARN(wh, "HMD temperature snapshot: fopen(%s) failed: %s", tmp_path,
+					         strerror(errno));
+					warned_snapshot_failure = true;
+				}
+			} else {
+				fprintf(snap, "{\"t0\":%u,\"t1\":%u,\"t2\":%u,\"t3\":%u,\"ts\":%lld}\n",
+				        pkt->temperature[0], pkt->temperature[1], pkt->temperature[2],
+				        pkt->temperature[3], (long long)time(NULL));
+				fclose(snap);
+				if (rename(tmp_path, final_path) != 0 && !warned_snapshot_failure) {
+					WMR_WARN(wh, "HMD temperature snapshot: rename(%s -> %s) failed: %s",
+					         tmp_path, final_path, strerror(errno));
+					warned_snapshot_failure = true;
+				}
+			}
+		}
 	}
 
 	for (int i = 0; i < 4; i++) {
