@@ -1125,6 +1125,26 @@ control_read_packets(struct wmr_hmd *wh)
 		          "[?] [?] [?] [?] [?] [?]",
 		          buffer[0], buffer[1], buffer[4]);
 
+		// Raw bytes, exposed as-is (2026-09-05). This does NOT decode anything new -- the
+		// comment above only GUESSES that byte 1 / byte 4 might be "display_ready", and that
+		// guess is deliberately not hardened into a confident label here. Just stores the
+		// verbatim bytes so they're visible (debug GUI + a throttled log) without cranking
+		// log level to DEBUG for an entire session. See wmr_hmd_setup_ui().
+		memcpy(wh->device_status_raw, buffer, sizeof(wh->device_status_raw));
+		snprintf(wh->device_status_hex, sizeof(wh->device_status_hex),
+		         "%02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x", buffer[0], buffer[1], buffer[2],
+		         buffer[3], buffer[4], buffer[5], buffer[6], buffer[7], buffer[8], buffer[9], buffer[10]);
+
+		{
+			uint64_t now_ns = os_monotonic_get_ns();
+			if (wh->device_status_last_log_ns == 0 ||
+			    (now_ns - wh->device_status_last_log_ns) > U_TIME_1MS_IN_NS * 1000) {
+				wh->device_status_last_log_ns = now_ns;
+				WMR_INFO(wh, "DEVICE_STATUS raw bytes (undecoded, most fields unconfirmed): %s",
+				         wh->device_status_hex);
+			}
+		}
+
 		break;
 	default: //
 		WMR_DEBUG(wh, "Unknown message type: %02x (size %i)", buffer[0], size);
@@ -1969,11 +1989,41 @@ wmr_hmd_create_stereo_camera_calib(struct wmr_hmd *wh)
 	return calib;
 }
 
+//! Camera intrinsic/extrinsic calibration, exposed (2026-09-05): dump each tracking camera's
+//! parsed calibration once at startup, so a miscalibrated or degraded unit is visible in a
+//! normal (INFO-level) log instead of only guessable from SLAM behaving badly. Also stashes the
+//! same computed values into @ref wmr_hmd::cam_calib_snapshot so the debug GUI (wmr_hmd_setup_ui)
+//! can point live u_var fields at them, rather than recomputing. Reads exactly what
+//! wmr_hmd_get_cam_calib() already gives SLAM -- pixel-scaled intrinsics, not the raw 0..1
+//! ratios stored in config.tcams[i]->distortion6KT.
+static void
+wmr_hmd_log_cam_calib(struct wmr_hmd *wh)
+{
+	for (int i = 0; i < wh->config.tcam_count; i++) {
+		struct t_camera_calibration *cc = &wh->cam_calib_snapshot[i];
+		*cc = wmr_hmd_get_cam_calib(wh, i);
+
+		struct xrt_pose *pose = &wh->config.tcams[i]->pose;
+
+		WMR_INFO(wh,
+		         "Tracking camera %d calibration: size=%dx%d fx=%.4f fy=%.4f cx=%.4f cy=%.4f "
+		         "k1=%.6f k2=%.6f k3=%.6f k4=%.6f k5=%.6f k6=%.6f p1=%.6f p2=%.6f codx=%.6f cody=%.6f "
+		         "rpmax=%.4f pose pos=(%.4f, %.4f, %.4f) orient=(%.4f, %.4f, %.4f, %.4f)",
+		         i, cc->image_size_pixels.w, cc->image_size_pixels.h, cc->intrinsics[0][0],
+		         cc->intrinsics[1][1], cc->intrinsics[0][2], cc->intrinsics[1][2], cc->wmr.k1, cc->wmr.k2,
+		         cc->wmr.k3, cc->wmr.k4, cc->wmr.k5, cc->wmr.k6, cc->wmr.p1, cc->wmr.p2, cc->wmr.codx,
+		         cc->wmr.cody, cc->wmr.rpmax, pose->position.x, pose->position.y, pose->position.z,
+		         pose->orientation.x, pose->orientation.y, pose->orientation.z, pose->orientation.w);
+	}
+}
+
 //! Extended camera calibration info for SLAM
 XRT_MAYBE_UNUSED static void
 wmr_hmd_fill_slam_cams_calibration(struct wmr_hmd *wh)
 {
 	wh->tracking.slam_calib.cam_count = wh->config.tcam_count;
+
+	wmr_hmd_log_cam_calib(wh);
 
 	// Fill camera 0
 	struct xrt_pose P_imu_c0 = wh->config.sensors.accel.pose;
@@ -2457,6 +2507,18 @@ wmr_hmd_hand_track(struct wmr_hmd *wh,
 	return 0;
 }
 
+//! Small helper for wmr_hmd_setup_ui(): u_var_add_ro_f64 with a "Cam<i> calib: <field>" label
+//! built on the fly. Safe to use a stack buffer for the label -- u_var_add_ro_f64 copies the
+//! name into its own storage synchronously (see add_var() in u_var.cpp), so it doesn't need to
+//! outlive this call.
+static void
+wmr_hmd_ui_add_cam_ro_f64(struct wmr_hmd *wh, double *ptr, int cam_idx, const char *field_name)
+{
+	char label[64];
+	snprintf(label, sizeof(label), "Cam%d calib: %s", cam_idx, field_name);
+	u_var_add_ro_f64(wh, ptr, label);
+}
+
 static void
 wmr_hmd_setup_ui(struct wmr_hmd *wh)
 {
@@ -2480,12 +2542,44 @@ wmr_hmd_setup_ui(struct wmr_hmd *wh)
 	u_var_add_ro_text(wh, wh->gui.slam_status, "Tracker status");
 	u_var_add_bool(wh, &wh->tracking.imu2me, "Correct IMU pose to middle of eyes");
 
+	// Camera intrinsic/extrinsic calibration, exposed (2026-09-05): read-only, populated once at
+	// startup by wmr_hmd_log_cam_calib() (called from wmr_hmd_fill_slam_cams_calibration(),
+	// which itself runs from wmr_hmd_setup_trackers() before this function) -- see that
+	// function's matching startup log line for the same values in a normal (INFO) log.
+	for (int i = 0; i < wh->config.tcam_count; i++) {
+		struct t_camera_calibration *cc = &wh->cam_calib_snapshot[i];
+		struct xrt_pose *pose = &wh->config.tcams[i]->pose;
+		char label[64];
+
+		wmr_hmd_ui_add_cam_ro_f64(wh, &cc->intrinsics[0][0], i, "fx (px)");
+		wmr_hmd_ui_add_cam_ro_f64(wh, &cc->intrinsics[1][1], i, "fy (px)");
+		wmr_hmd_ui_add_cam_ro_f64(wh, &cc->intrinsics[0][2], i, "cx (px)");
+		wmr_hmd_ui_add_cam_ro_f64(wh, &cc->intrinsics[1][2], i, "cy (px)");
+		wmr_hmd_ui_add_cam_ro_f64(wh, &cc->wmr.k1, i, "k1");
+		wmr_hmd_ui_add_cam_ro_f64(wh, &cc->wmr.k2, i, "k2");
+		wmr_hmd_ui_add_cam_ro_f64(wh, &cc->wmr.k3, i, "k3");
+		wmr_hmd_ui_add_cam_ro_f64(wh, &cc->wmr.k4, i, "k4");
+		wmr_hmd_ui_add_cam_ro_f64(wh, &cc->wmr.k5, i, "k5");
+		wmr_hmd_ui_add_cam_ro_f64(wh, &cc->wmr.k6, i, "k6");
+		wmr_hmd_ui_add_cam_ro_f64(wh, &cc->wmr.p1, i, "p1");
+		wmr_hmd_ui_add_cam_ro_f64(wh, &cc->wmr.p2, i, "p2");
+
+		snprintf(label, sizeof(label), "Cam%d pose: position (m)", i);
+		u_var_add_ro_vec3_f32(wh, &pose->position, label);
+		snprintf(label, sizeof(label), "Cam%d pose: orientation", i);
+		u_var_add_ro_quat_f32(wh, &pose->orientation, label);
+	}
+
 	u_var_add_gui_header(wh, NULL, "Hand Tracking");
 	u_var_add_ro_text(wh, wh->gui.hand_status, "Tracker status");
 
 	u_var_add_gui_header(wh, NULL, "Hololens Sensors' Companion device");
 	u_var_add_u8(wh, &wh->proximity_sensor, "HMD Proximity");
 	u_var_add_u16(wh, &wh->raw_ipd, "HMD IPD");
+
+	// DEVICE_STATUS (0x05) raw bytes (2026-09-05) -- exposed as-is, NOT decoded. See the parse
+	// switch in wmr_hmd_read_control_packet(): most fields here are still unconfirmed guesses.
+	u_var_add_ro_text(wh, wh->device_status_hex, "Device status (raw bytes, undecoded)");
 
 	// Raw, uncalibrated ICM-20602 die-temperature registers, one per IMU sub-sample in the
 	// packet (2026-09-04) -- see the throttled log in hololens_sensors_decode_packet() for

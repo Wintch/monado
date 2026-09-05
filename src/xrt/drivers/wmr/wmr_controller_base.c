@@ -606,6 +606,11 @@ read_controller_config(struct wmr_controller_base *wcb)
 
 	WMR_INFO(wcb, "Reading configuration for controller serial %s. FW revision %x", serial_no, fw_revision);
 
+	// Controller real firmware serial number, exposed (2026-09-05): stash it in a NEW field so
+	// it's visible in monado-gui, without touching what base.serial reports to the rest of the
+	// system (see the TODOs and hardcoded "Left/Right Controller" in wmr_controller_base_init).
+	snprintf(wcb->fw_serial, sizeof(wcb->fw_serial), "%s", serial_no);
+
 #if 0
   /* WMR also reads block 0x14, which seems to have some FW revision info,
    * but we don't use it */
@@ -1294,6 +1299,11 @@ wmr_controller_base_init(struct wmr_controller_base *wcb,
 	}
 
 	u_var_add_root(wcb, wcb->base.str, true);
+
+	// Real firmware serial (2026-09-05), populated a bit later in this same call by
+	// read_controller_config() -- see @ref wmr_controller_base::fw_serial. u_var just holds
+	// this pointer and reads it live at GUI-render time, well after that happens.
+	u_var_add_ro_text(wcb, wcb->fw_serial, "FW Serial (real, from firmware)");
 
 	/* Send init commands */
 	struct wmr_controller_fw_cmd fw_cmd = {

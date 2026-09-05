@@ -163,6 +163,29 @@ struct wmr_hmd
 	uint32_t temperature_log_count;
 
 	/*!
+	 * Raw bytes of the last WMR_CONTROL_MSG_DEVICE_STATUS (0x05) companion message, stored
+	 * and exposed VERBATIM (2026-09-05) -- see the parse switch in
+	 * wmr_hmd_read_control_packet(). Most fields are still unconfirmed/undecoded; only kept
+	 * here for visibility (debug GUI + throttled log), never interpreted.
+	 */
+	uint8_t device_status_raw[11];
+	//! Hex-formatted copy of @ref device_status_raw for u_var_add_ro_text (which wants a string).
+	char device_status_hex[64];
+	//! Monotonic timestamp of the last DEVICE_STATUS log line, for the ~1/s throttle. 0 = never
+	//! logged yet. Time-based (not a modulo counter like @ref temperature_log_count) because
+	//! this message is rare and event-driven, not periodic.
+	uint64_t device_status_last_log_ns;
+
+	/*!
+	 * Snapshot of each tracking camera's computed calibration (pixel-scaled intrinsics +
+	 * distortion + the WMR-specific extra params), taken once at startup in
+	 * wmr_hmd_fill_slam_cams_calibration() via @ref wmr_hmd_get_cam_calib -- i.e. exactly what
+	 * SLAM uses. Kept here (rather than recomputed) purely so the debug GUI can point at live
+	 * fields (2026-09-05). Indexed like config.tcams; only [0, config.tcam_count) are valid.
+	 */
+	struct t_camera_calibration cam_calib_snapshot[WMR_MAX_CAMERAS];
+
+	/*!
 	 * Debounce state for XR_EXT_user_presence (reverb-g2 T223/T224).
 	 *
 	 * The raw byte is NOT clean: measured live during a real donning gesture it alternated

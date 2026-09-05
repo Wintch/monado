@@ -747,6 +747,10 @@ wmr_controller_hp_create(struct wmr_controller_connection *conn,
 	u_var_add_ro_vec3_f32(wcb, &ctrl->last_inputs.imu.acc, "imu.acc");
 	u_var_add_ro_vec3_f32(wcb, &ctrl->last_inputs.imu.gyro, "imu.gyro");
 	u_var_add_i32(wcb, &ctrl->last_inputs.imu.temperature, "imu.temperature");
+	// Controller idle/imu.zeroed flag, exposed (2026-09-05): makes idle (all-zero IMU, fusion
+	// paused -- see the throttled log at this field's use site) distinguishable from
+	// disconnected/stuck in the GUI, instead of both just looking like "not moving".
+	u_var_add_bool(wcb, &ctrl->last_inputs.imu.zeroed, "imu.zeroed (idle, fusion paused)");
 
 	return wcb;
 }

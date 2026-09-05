@@ -121,6 +121,15 @@ struct wmr_controller_base
 	/* firmware configuration block */
 	struct wmr_controller_config config;
 
+	/*!
+	 * Real 16-byte firmware serial number, read once at connect by read_controller_fw_info()
+	 * (2026-09-05). Kept deliberately SEPARATE from @ref base's `serial` field, which is
+	 * hardcoded to the literal "Left/Right Controller" (see the TODOs in
+	 * wmr_controller_base_init) -- that hardcoding is left alone here; this is purely an
+	 * additional debug-visible field. Empty ("") until read_controller_config() succeeds.
+	 */
+	char fw_serial[16 + 1];
+
 	//! Time of last IMU sample, in CPU time.
 	uint64_t last_imu_timestamp_ns;
 	//! Monotonic time of the last WMR_CONTROLLER_KEEPALIVE_S resend, or 0 before the first one.

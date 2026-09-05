@@ -35,6 +35,7 @@
 #include <string.h>
 #include <limits.h>
 #include <unistd.h>
+#include <time.h>
 
 //! Specifies whether the user wants to enable autoexposure from the start.
 DEBUG_GET_ONCE_BOOL_OPTION(wmr_autoexposure, "WMR_AUTOEXPOSURE", true)
@@ -201,6 +202,30 @@ struct wmr_camera
 
 	bool snapshot_enabled;          //!< Dashboard PGM snapshot feature on/off (WMR_CAMERA_SNAPSHOT)
 	uint64_t snapshot_frame_count;  //!< Throttle counter for that snapshot (reverb-g2, 2026-09-05)
+
+	/*!
+	 * Real frame drop-rate (reverb-g2, 2026-09-05). Under normal operation each mosaic frame
+	 * callback advances the hardware's 8-bit `seq` counter by exactly 1; a bigger jump means
+	 * (seq_delta - 1) earlier tick(s) never arrived as a frame at all (USB stall/backpressure,
+	 * not just a slow callback). See the seq/seq_delta computation in img_xfer_cb().
+	 */
+	uint32_t dropped_frame_count;
+	//! Guards @ref dropped_frame_count against a false hit on the very first frame this struct
+	//! ever processes, whose `last_seq` is still the zeroed default rather than a real previous
+	//! tick (so its seq_delta is meaningless, not a real gap).
+	bool have_prev_seq;
+
+	//! Throttle counter for the exposure/gain dashboard snapshot, incremented once per
+	//! update_expgain() call (reverb-g2, 2026-09-05) -- that's once per SLAM frame, ~30 Hz, same
+	//! cadence the WMR_CAMERA_SNAPSHOT feature throttles against.
+	uint64_t expgain_snapshot_count;
+
+	//! Fixed controller-tracking exposure/gain (WMR_CONSTELLATION_CONTROLLERS), set once at
+	//! open() time -- see wmr_camera_set_ctrl_exposure_gain(). Same pair for every camera, so
+	//! unlike `ceg[]` this isn't per-camera. Only valid when ctrl_expgain_set is true.
+	uint16_t ctrl_exposure;
+	uint8_t ctrl_gain;
+	bool ctrl_expgain_set;
 
 	enum u_logging_level log_level;
 };
@@ -540,6 +565,17 @@ img_xfer_cb(struct libusb_transfer *xfer)
 	uint8_t seq = xf->data[89];
 	uint8_t seq_delta = seq - cam->last_seq;
 
+	// Real frame drop-rate (reverb-g2, 2026-09-05): this callback should see seq_delta == 1
+	// every time -- one hardware tick per mosaic frame delivered. A bigger jump means
+	// (seq_delta - 1) tick(s) in between never showed up as a frame here at all. Guarded by
+	// have_prev_seq so the very first frame this struct ever processes -- whose last_seq is
+	// just the zeroed default, not a real previous tick -- can't manufacture a bogus one-time
+	// drop count on startup.
+	if (cam->have_prev_seq && seq_delta > 1) {
+		cam->dropped_frame_count += (seq_delta - 1);
+	}
+	cam->have_prev_seq = true;
+
 	/* Extend the sequence number to 64-bits */
 	cam->frame_sequence += seq_delta;
 
@@ -744,6 +780,12 @@ wmr_camera_open(struct wmr_camera_open_config *config)
 				              i);
 			}
 		}
+		// Same pair for every camera (the loop above always sends the one ctrl_exposure/ctrl_gain
+		// pair), so remember it once for the dashboard snapshot (reverb-g2, 2026-09-05) rather
+		// than per camera -- see wmr_camera_write_expgain_snapshot().
+		cam->ctrl_exposure = ctrl_exposure;
+		cam->ctrl_gain = ctrl_gain;
+		cam->ctrl_expgain_set = true;
 	}
 
 	u_sink_debug_init(&cam->debug_sinks[WMR_DEBUG_SINK_SLAM]);
@@ -755,6 +797,9 @@ wmr_camera_open(struct wmr_camera_open_config *config)
 	u_var_add_sink_debug(cam, &cam->debug_sinks[WMR_DEBUG_SINK_SLAM], "SLAM Tracking Streams");
 	u_var_add_sink_debug(cam, &cam->debug_sinks[WMR_DEBUG_SINK_CONTROLLER], "Controller Tracking Streams");
 	u_var_add_gui_header_end(cam, NULL, NULL);
+
+	// Real frame drop-rate (reverb-g2, 2026-09-05) -- see img_xfer_cb()'s seq_delta comment.
+	u_var_add_u32(cam, &cam->dropped_frame_count, "Dropped frames (hardware seq gaps)");
 
 	u_var_add_gui_header_begin(cam, NULL, "Exposure and gain control");
 	u_var_add_bool(cam, &cam->unify_expgains, "Use same values");
@@ -936,6 +981,68 @@ fail:
 	return false;
 }
 
+//! Throttle for wmr_camera_write_expgain_snapshot(), in update_expgain() calls (~30 Hz, one per
+//! SLAM frame -- see the "Tracking frames usually come at ~30fps" comment in img_xfer_cb()).
+//! 30 gives roughly 1 fps, matching WMR_CAMERA_SNAPSHOT_THROTTLE's cadence above.
+#define WMR_CAMERA_EXPGAIN_SNAPSHOT_THROTTLE 30
+
+/*!
+ * Live camera exposure/gain, promoted from TRACE to something dashboard-usable (reverb-g2,
+ * 2026-09-05): dump the current per-camera SLAM exposure/gain (cam->ceg[]), the fixed
+ * controller-tracking exposure/gain if that opt-in feature is on, and the running dropped-frame
+ * tally, to a small JSON file for the web dashboard follow-up to read. Atomic (tmp file +
+ * rename) and best-effort -- same pattern as wmr_hmd.c's HMD-temperature snapshot, and a failure
+ * here (HOME unset, fopen failing) must never affect the driver's real job, so it's warned once
+ * via a static guard rather than every call.
+ */
+static void
+wmr_camera_write_expgain_snapshot(struct wmr_camera *cam)
+{
+	static bool warned_snapshot_failure = false;
+	const char *home = getenv("HOME");
+	if (home == NULL) {
+		if (!warned_snapshot_failure) {
+			WMR_CAM_WARN(cam, "Exposure/gain snapshot: HOME not set, skipping dashboard snapshot file");
+			warned_snapshot_failure = true;
+		}
+		return;
+	}
+
+	char final_path[PATH_MAX];
+	char tmp_path[PATH_MAX];
+	snprintf(final_path, sizeof(final_path), "%s/vr/camera-expgain.json", home);
+	snprintf(tmp_path, sizeof(tmp_path), "%s/vr/camera-expgain.json.tmp", home);
+
+	FILE *snap = fopen(tmp_path, "w");
+	if (snap == NULL) {
+		if (!warned_snapshot_failure) {
+			WMR_CAM_WARN(cam, "Exposure/gain snapshot: fopen(%s) failed: %s", tmp_path, strerror(errno));
+			warned_snapshot_failure = true;
+		}
+		return;
+	}
+
+	fprintf(snap, "{\n");
+	for (int i = 0; i < cam->tcam_count; i++) {
+		fprintf(snap, "  \"cam%d\": {\"exposure_us\": %u, \"gain\": %u},\n", i, cam->ceg[i].exposure,
+		        cam->ceg[i].gain);
+	}
+	if (cam->ctrl_expgain_set) {
+		fprintf(snap, "  \"controller_tracking\": {\"exposure_us\": %u, \"gain\": %u},\n", cam->ctrl_exposure,
+		        cam->ctrl_gain);
+	}
+	fprintf(snap, "  \"dropped_frames\": %u,\n", cam->dropped_frame_count);
+	fprintf(snap, "  \"ts\": %lld\n", (long long)time(NULL));
+	fprintf(snap, "}\n");
+	fclose(snap);
+
+	if (rename(tmp_path, final_path) != 0 && !warned_snapshot_failure) {
+		WMR_CAM_WARN(cam, "Exposure/gain snapshot: rename(%s -> %s) failed: %s", tmp_path, final_path,
+		             strerror(errno));
+		warned_snapshot_failure = true;
+	}
+}
+
 static int
 update_expgain(struct wmr_camera *cam, struct xrt_frame **frames)
 {
@@ -968,6 +1075,12 @@ update_expgain(struct wmr_camera *cam, struct xrt_frame **frames)
 		}
 		res |= status;
 	}
+
+	cam->expgain_snapshot_count++;
+	if ((cam->expgain_snapshot_count % WMR_CAMERA_EXPGAIN_SNAPSHOT_THROTTLE) == 0) {
+		wmr_camera_write_expgain_snapshot(cam);
+	}
+
 	return res;
 }
 

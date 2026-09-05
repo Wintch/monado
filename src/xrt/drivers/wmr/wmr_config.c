@@ -460,6 +460,13 @@ wmr_config_parse_calibration(struct wmr_hmd_config *c, cJSON *calib_info, enum u
 	}
 	c->slam_cam_count = MIN(c->tcam_count, (int)debug_get_num_option_wmr_max_slam_cams());
 
+	// reverb-g2 (2026-09-05): these three counts were computed above but never logged anywhere,
+	// so a headset that enumerated fewer cameras than expected (missing/dead sensor, wrong
+	// firmware config block) was silently invisible short of stepping through this parser in a
+	// debugger. One line, once, at startup.
+	WMR_INFO(log_level, "Camera config parsed: %d cameras total, %d head-tracking, %d used for SLAM",
+	         c->cam_count, c->tcam_count, c->slam_cam_count);
+
 	return true;
 }
 
