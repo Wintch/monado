@@ -158,6 +158,15 @@ DEBUG_GET_ONCE_NUM_OPTION(wmr_user_presence_doff_ms, "WMR_USER_PRESENCE_DOFF_MS"
 //! doff-and-wait session confirms it actually blanks and a live don confirms it restores.
 DEBUG_GET_ONCE_NUM_OPTION(wmr_user_presence_screenoff_ms, "WMR_USER_PRESENCE_SCREENOFF_MS", 0)
 
+//! TEMPORARY diagnostic switch for docs/98 (reverb-g2, 2026-09-05): auto-standby RESTORE has
+//! never fired live after a real BLANK, and it isn't known whether (a) the companion channel
+//! stops delivering proximity/IPD packets at all once blanked, or (b) something upstream stops
+//! calling/evaluating wmr_hmd_update_inputs(). Turns on an unconditional per-packet proximity
+//! log (distinct from the existing change-gated WMR_DEBUG one) plus a periodic heartbeat from
+//! inside wmr_hmd_update_inputs() showing call counts and internal state. Default off, zero
+//! cost/behavior change when unset. Remove this whole option once RESTORE is root-caused.
+DEBUG_GET_ONCE_BOOL_OPTION(wmr_presence_diag, "WMR_PRESENCE_DIAG", false)
+
 
 #define WMR_TRACE(d, ...) U_LOG_XDEV_IFL_T(&d->base, d->log_level, __VA_ARGS__)
 #define WMR_DEBUG(d, ...) U_LOG_XDEV_IFL_D(&d->base, d->log_level, __VA_ARGS__)
@@ -812,9 +821,19 @@ control_ipd_value_decode(struct wmr_hmd *wh, const unsigned char *buffer, int si
 	// died mid-gesture and the byte simply never came, which is indistinguishable from a
 	// sensor calmly reporting the same thing.
 	wh->presence.last_update_ns = os_monotonic_get_ns();
+	wh->presence.diag_proximity_packets_seen++;
 
 	if (changed) {
 		WMR_DEBUG(wh, "Proximity sensor %d IPD: %d", proximity, ipd_value);
+	}
+
+	// TEMPORARY (docs/98, WMR_PRESENCE_DIAG): unconditional, UNGATED by `changed`, so a
+	// stalled companion channel post-blank shows up as this log simply stopping, rather than
+	// being indistinguishable from "sensor calmly reporting the same thing" like the WMR_DEBUG
+	// line above.
+	if (debug_get_bool_option_wmr_presence_diag()) {
+		WMR_INFO(wh, "PRESENCE-DIAG raw packet #%llu: proximity=%u ipd=%u",
+		         (unsigned long long)wh->presence.diag_proximity_packets_seen, proximity, ipd_value);
 	}
 }
 
@@ -2919,6 +2938,8 @@ static xrt_result_t
 wmr_hmd_update_inputs(struct xrt_device *xdev)
 {
 	struct wmr_hmd *wh = wmr_hmd(xdev);
+	uint64_t diag_now_ns = os_monotonic_get_ns();
+	wh->presence.diag_update_inputs_calls++;
 
 	for (size_t i = 0; i < wh->base.input_count; i++) {
 		struct xrt_input *input = &wh->base.inputs[i];
@@ -3017,6 +3038,30 @@ wmr_hmd_update_inputs(struct xrt_device *xdev)
 				         (unsigned long long)((now_ns - wh->presence.last_update_ns) / U_TIME_1S_IN_NS),
 				         wh->presence.committed ? "WORN" : "NOT WORN");
 			}
+		}
+
+		// TEMPORARY (docs/98, WMR_PRESENCE_DIAG): periodic heartbeat, independent of any
+		// committed transition. This is what tells apart "update_inputs stopped being called
+		// (or stopped evaluating) after BLANK" from "it's still running fine every frame, but
+		// the raw channel above (PRESENCE-DIAG raw packet #N) has gone quiet underneath it" --
+		// compare this log's call count against the raw packet count logged in
+		// control_ipd_value_decode: if calls keep climbing here while the raw packet counter
+		// stalls, the channel died, not the evaluation.
+		if (debug_get_bool_option_wmr_presence_diag() &&
+		    (wh->presence.diag_last_heartbeat_ns == 0 ||
+		     (diag_now_ns - wh->presence.diag_last_heartbeat_ns) >= 2 * U_TIME_1S_IN_NS)) {
+			wh->presence.diag_last_heartbeat_ns = diag_now_ns;
+			WMR_INFO(wh,
+			         "PRESENCE-DIAG heartbeat: update_inputs calls=%llu raw_packets=%llu "
+			         "raw_proximity=%u candidate=%d committed=%d screen_off_by_presence=%d "
+			         "last_packet_age_ms=%llu",
+			         (unsigned long long)wh->presence.diag_update_inputs_calls,
+			         (unsigned long long)wh->presence.diag_proximity_packets_seen, wh->proximity_sensor,
+			         wh->presence.candidate, wh->presence.committed, wh->presence.screen_off_by_presence,
+			         wh->presence.last_update_ns == 0
+			             ? 0ULL
+			             : (unsigned long long)((diag_now_ns - wh->presence.last_update_ns) /
+			                                     U_TIME_1MS_IN_NS));
 		}
 
 		input->value.boolean = wh->presence.committed;

@@ -219,6 +219,25 @@ struct wmr_hmd
 		//! True once this NOT-WORN stretch has already blanked the panel via
 		//! screen_enable_func, so update_inputs doesn't re-call it every frame.
 		bool screen_off_by_presence;
+
+		/*
+		 * TEMPORARY diagnostic counters for docs/98 (reverb-g2, 2026-09-05): auto-standby
+		 * BLANK fires correctly but RESTORE never has, live, twice. These exist only to tell
+		 * apart "the raw proximity/IPD channel stopped delivering packets at all" from "packets
+		 * keep arriving but wmr_hmd_update_inputs() stops being invoked (or stops evaluating
+		 * them)" without a rebuild mid-investigation. Gated behind WMR_PRESENCE_DIAG (default
+		 * off); remove once RESTORE is root-caused and fixed for real, live-validated.
+		 */
+		//! Every call to wmr_hmd_update_inputs(), regardless of what it finds. A stall here
+		//! (no growth for a long stretch) means the STATE TRACKER stopped invoking us -- not a
+		//! wmr_hmd.c bug, but a fact worth telling apart from the channel dying underneath us.
+		uint64_t diag_update_inputs_calls;
+		//! Every WMR_CONTROL_MSG_IPD_VALUE packet decoded, changed or not. A stall here while
+		//! diag_update_inputs_calls keeps climbing means the companion channel itself has gone
+		//! quiet -- the raw sensor/transport, not the driver's evaluation of it.
+		uint64_t diag_proximity_packets_seen;
+		//! Throttle for the periodic diagnostic heartbeat log in wmr_hmd_update_inputs().
+		uint64_t diag_last_heartbeat_ns;
 	} presence;
 
 	struct hololens_sensors_packet packet;
