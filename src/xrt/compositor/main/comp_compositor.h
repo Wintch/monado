@@ -142,6 +142,12 @@ struct comp_compositor
 
 	struct u_frame_times_widget compositor_frame_times;
 
+	//! Monotonic timestamp of the last perf-metrics.json dashboard snapshot (reverb-g2,
+	//! 2026-09-05), for a ~1/s throttle. 0 = never written yet. Time-based (not a per-frame
+	//! modulo counter) because the compositor's frame rate is display-dependent, not a fixed
+	//! constant this file can assume.
+	int64_t perf_metrics_snapshot_last_ns;
+
 	struct
 	{
 		struct comp_frame waited;

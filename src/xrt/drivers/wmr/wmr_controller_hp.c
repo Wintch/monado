@@ -372,6 +372,11 @@ wmr_controller_hp_packet_parse(struct wmr_controller_hp *ctrl, const unsigned ch
 	last_input->imu.zeroed = acc[0] == 0 && acc[1] == 0 && acc[2] == 0 && //
 	                         gyro[0] == 0 && gyro[1] == 0 && gyro[2] == 0;
 
+	// Mirror into the generic base field (2026-09-05) so wmr_hmd.c's hmd-status.json snapshot
+	// can read it without knowing about this HP-specific input struct -- see the field comment
+	// in wmr_controller_base.h. Purely a copy of the value just computed above, nothing new.
+	wcb->imu_zeroed = last_input->imu.zeroed;
+
 	vec3_from_wmr_controller_gyro(gyro, &last_input->imu.gyro);
 	math_matrix_3x3_transform_vec3(&wcb->config.sensors.gyro.mix_matrix, &last_input->imu.gyro,
 	                               &last_input->imu.gyro);

@@ -79,6 +79,9 @@
 #include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+#include <errno.h>
+#include <limits.h>
 
 #ifdef XRT_GRAPHICS_SYNC_HANDLE_IS_FD
 #include <unistd.h>
@@ -303,6 +306,74 @@ can_do_one_projection_layer_fast_path(struct comp_compositor *c)
 	       type == XRT_LAYER_PROJECTION_DEPTH;
 }
 
+//! Throttle for comp_compositor_write_perf_metrics_snapshot(): only actually write once this many
+//! nanoseconds have passed since the last write, regardless of how often compositor_layer_commit()
+//! itself runs (display-rate dependent, not a fixed constant this file can assume).
+#define COMP_PERF_METRICS_SNAPSHOT_INTERVAL_NS (U_TIME_1MS_IN_NS * 1000)
+
+/*!
+ * Compositor FPS + frame-time snapshot, for the web dashboard (reverb-g2, 2026-09-05): dumps
+ * @ref comp_compositor::compositor_frame_times.fps (the same running average the debug GUI's "FPS
+ * (Compositor)" field shows) plus min/avg/max computed directly from that widget's existing
+ * timings_ms ring buffer (the same samples backing the debug GUI's "Frame Times (Compositor)"
+ * graph) -- no separate accumulation, no change to what or how often anything is measured. Purely
+ * read-only telemetry: never touches frame pacing/scheduling. Same atomic (tmp file + rename)
+ * best-effort idiom as wmr_hmd.c's HMD-temperature snapshot -- a failure here (HOME unset, fopen
+ * failing) must never affect compositing, so it's warned once via a static guard rather than
+ * every call.
+ */
+static void
+comp_compositor_write_perf_metrics_snapshot(struct comp_compositor *c)
+{
+	static bool warned_snapshot_failure = false;
+	const char *home = getenv("HOME");
+	if (home == NULL) {
+		if (!warned_snapshot_failure) {
+			COMP_WARN(c, "Perf-metrics snapshot: HOME not set, skipping dashboard snapshot file");
+			warned_snapshot_failure = true;
+		}
+		return;
+	}
+
+	float min_ms = 0.f, max_ms = 0.f, sum_ms = 0.f;
+	for (int i = 0; i < FPS_WIDGET_NUM_FRAME_TIMES; i++) {
+		float t = c->compositor_frame_times.timings_ms[i];
+		if (i == 0 || t < min_ms) {
+			min_ms = t;
+		}
+		if (i == 0 || t > max_ms) {
+			max_ms = t;
+		}
+		sum_ms += t;
+	}
+	float avg_ms = sum_ms / (float)FPS_WIDGET_NUM_FRAME_TIMES;
+
+	char final_path[PATH_MAX];
+	char tmp_path[PATH_MAX];
+	snprintf(final_path, sizeof(final_path), "%s/vr/perf-metrics.json", home);
+	snprintf(tmp_path, sizeof(tmp_path), "%s/vr/perf-metrics.json.tmp", home);
+
+	FILE *snap = fopen(tmp_path, "w");
+	if (snap == NULL) {
+		if (!warned_snapshot_failure) {
+			COMP_WARN(c, "Perf-metrics snapshot: fopen(%s) failed: %s", tmp_path, strerror(errno));
+			warned_snapshot_failure = true;
+		}
+		return;
+	}
+
+	fprintf(snap,
+	        "{\"fps\": %.3f, \"frame_time_ms\": {\"min\": %.3f, \"avg\": %.3f, \"max\": %.3f}, \"ts\": %lld}\n",
+	        c->compositor_frame_times.fps, min_ms, avg_ms, max_ms, (long long)time(NULL));
+	fclose(snap);
+
+	if (rename(tmp_path, final_path) != 0 && !warned_snapshot_failure) {
+		COMP_WARN(c, "Perf-metrics snapshot: rename(%s -> %s) failed: %s", tmp_path, final_path,
+		          strerror(errno));
+		warned_snapshot_failure = true;
+	}
+}
+
 static XRT_CHECK_RESULT xrt_result_t
 compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sync_handle)
 {
@@ -333,6 +404,18 @@ compositor_layer_commit(struct xrt_compositor *xc, xrt_graphics_sync_handle_t sy
 	}
 
 	u_frame_times_widget_push_sample(&c->compositor_frame_times, os_monotonic_get_ns());
+
+	// perf-metrics.json dashboard snapshot (2026-09-05): time-based ~1/s throttle (this function
+	// runs once per composited frame, i.e. at display rate, not a fixed cadence this file can
+	// assume) -- see comp_compositor_write_perf_metrics_snapshot()'s own comment.
+	{
+		uint64_t now_ns = os_monotonic_get_ns();
+		if (c->perf_metrics_snapshot_last_ns == 0 ||
+		    (int64_t)now_ns - c->perf_metrics_snapshot_last_ns > COMP_PERF_METRICS_SNAPSHOT_INTERVAL_NS) {
+			c->perf_metrics_snapshot_last_ns = (int64_t)now_ns;
+			comp_compositor_write_perf_metrics_snapshot(c);
+		}
+	}
 
 	// Record the time of this frame.
 	c->last_frame_time_ns = os_monotonic_get_ns();

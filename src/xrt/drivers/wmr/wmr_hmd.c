@@ -282,6 +282,88 @@ hololens_sensors_decode_packet(struct wmr_hmd *wh,
 		}
 	}
 
+	// Combined HMD/controller status snapshot (2026-09-05): same ~1/s cadence (piggybacking on
+	// this function's existing temperature_log_count throttle -- the one periodic ~1s tick
+	// already established in this driver) and the same atomic tmp+rename idiom as the
+	// temperature snapshot just above. Dumps wh->device_status_raw verbatim -- the last
+	// DEVICE_STATUS (0x05) companion message seen, updated in wmr_hmd_read_control_packet();
+	// that message is rare/event-driven (see the TODO there), so this can lag between real
+	// device-status updates, but it's never fabricated or interpreted here, only relayed. Also
+	// lists each currently-connected controller's real firmware serial and idle/imu-zeroed
+	// flag, read generically off wmr_controller_base (works for either controller side without
+	// this file knowing about any variant-specific struct). A controller with no connection
+	// yet, or whose connection has no device attached yet, is omitted entirely -- not an error,
+	// not a null placeholder.
+	if ((wh->temperature_log_count % 250) == 0) {
+		static bool warned_status_snapshot_failure = false;
+		const char *home = getenv("HOME");
+		if (home == NULL) {
+			if (!warned_status_snapshot_failure) {
+				WMR_WARN(wh, "HMD status snapshot: HOME not set, skipping dashboard snapshot file");
+				warned_status_snapshot_failure = true;
+			}
+		} else {
+			char final_path[PATH_MAX];
+			char tmp_path[PATH_MAX];
+			snprintf(final_path, sizeof(final_path), "%s/vr/hmd-status.json", home);
+			snprintf(tmp_path, sizeof(tmp_path), "%s/vr/hmd-status.json.tmp", home);
+
+			FILE *snap = fopen(tmp_path, "w");
+			if (snap == NULL) {
+				if (!warned_status_snapshot_failure) {
+					WMR_WARN(wh, "HMD status snapshot: fopen(%s) failed: %s", tmp_path,
+					         strerror(errno));
+					warned_status_snapshot_failure = true;
+				}
+			} else {
+				fprintf(snap, "{\"device_status_raw\": [");
+				for (size_t i = 0; i < sizeof(wh->device_status_raw); i++) {
+					fprintf(snap, "%s%u", i == 0 ? "" : ", ", wh->device_status_raw[i]);
+				}
+				fprintf(snap, "], \"controllers\": {");
+
+				os_mutex_lock(&wh->controller_status_lock);
+				struct wmr_hmd_controller_connection *left_conn = wh->controller[0];
+				struct wmr_hmd_controller_connection *right_conn = wh->controller[1];
+				os_mutex_unlock(&wh->controller_status_lock);
+
+				struct
+				{
+					const char *key;
+					struct wmr_hmd_controller_connection *conn;
+				} sides[2] = {
+				    {"left", left_conn},
+				    {"right", right_conn},
+				};
+
+				bool wrote_one = false;
+				for (int s = 0; s < 2; s++) {
+					if (sides[s].conn == NULL) {
+						continue;
+					}
+					struct xrt_device *xdev =
+					    wmr_hmd_controller_connection_get_controller(sides[s].conn);
+					if (xdev == NULL) {
+						continue;
+					}
+					struct wmr_controller_base *wcb = (struct wmr_controller_base *)xdev;
+					fprintf(snap, "%s\"%s\": {\"fw_serial\": \"%s\", \"imu_zeroed\": %s}",
+					        wrote_one ? ", " : "", sides[s].key, wcb->fw_serial,
+					        wcb->imu_zeroed ? "true" : "false");
+					wrote_one = true;
+				}
+
+				fprintf(snap, "}, \"ts\": %lld}\n", (long long)time(NULL));
+				fclose(snap);
+				if (rename(tmp_path, final_path) != 0 && !warned_status_snapshot_failure) {
+					WMR_WARN(wh, "HMD status snapshot: rename(%s -> %s) failed: %s",
+					         tmp_path, final_path, strerror(errno));
+					warned_status_snapshot_failure = true;
+				}
+			}
+		}
+	}
+
 	for (int i = 0; i < 4; i++) {
 		pkt->gyro_timestamp[i] = read64(&buffer);
 	}
@@ -2017,6 +2099,60 @@ wmr_hmd_log_cam_calib(struct wmr_hmd *wh)
 	}
 }
 
+//! Camera intrinsic/extrinsic calibration, dumped to a one-shot JSON snapshot (2026-09-05) for
+//! the web dashboard -- same values as the WMR_INFO log line in @ref wmr_hmd_log_cam_calib and the
+//! read-only debug-GUI fields, just also written to disk so a dashboard process doesn't need a
+//! live monado-gui session to see them. This data is parsed once from the factory config block
+//! and never changes for the life of the session, so unlike the temperature/status snapshots
+//! this is written exactly once (from this function's one call site), not polled -- same atomic
+//! tmp+rename idiom as those, minus the throttle (nothing to throttle for a one-shot write).
+static void
+wmr_hmd_write_cam_calib_snapshot(struct wmr_hmd *wh)
+{
+	const char *home = getenv("HOME");
+	if (home == NULL) {
+		WMR_WARN(wh, "Camera calibration snapshot: HOME not set, skipping dashboard snapshot file");
+		return;
+	}
+
+	char final_path[PATH_MAX];
+	char tmp_path[PATH_MAX];
+	snprintf(final_path, sizeof(final_path), "%s/vr/camera-calibration.json", home);
+	snprintf(tmp_path, sizeof(tmp_path), "%s/vr/camera-calibration.json.tmp", home);
+
+	FILE *snap = fopen(tmp_path, "w");
+	if (snap == NULL) {
+		WMR_WARN(wh, "Camera calibration snapshot: fopen(%s) failed: %s", tmp_path, strerror(errno));
+		return;
+	}
+
+	fprintf(snap, "{\n");
+	for (int i = 0; i < wh->config.tcam_count; i++) {
+		struct t_camera_calibration *cc = &wh->cam_calib_snapshot[i];
+		struct xrt_pose *pose = &wh->config.tcams[i]->pose;
+
+		fprintf(snap,
+		        "  \"cam%d\": {\"image_size\": {\"w\": %d, \"h\": %d}, "
+		        "\"fx\": %.6f, \"fy\": %.6f, \"cx\": %.6f, \"cy\": %.6f, "
+		        "\"k1\": %.6f, \"k2\": %.6f, \"k3\": %.6f, \"k4\": %.6f, \"k5\": %.6f, \"k6\": %.6f, "
+		        "\"p1\": %.6f, \"p2\": %.6f, "
+		        "\"pose\": {\"position\": {\"x\": %.6f, \"y\": %.6f, \"z\": %.6f}, "
+		        "\"orientation\": {\"x\": %.6f, \"y\": %.6f, \"z\": %.6f, \"w\": %.6f}}}%s\n",
+		        i, cc->image_size_pixels.w, cc->image_size_pixels.h, cc->intrinsics[0][0],
+		        cc->intrinsics[1][1], cc->intrinsics[0][2], cc->intrinsics[1][2], cc->wmr.k1, cc->wmr.k2,
+		        cc->wmr.k3, cc->wmr.k4, cc->wmr.k5, cc->wmr.k6, cc->wmr.p1, cc->wmr.p2, pose->position.x,
+		        pose->position.y, pose->position.z, pose->orientation.x, pose->orientation.y,
+		        pose->orientation.z, pose->orientation.w, (i + 1 < wh->config.tcam_count) ? "," : "");
+	}
+	fprintf(snap, "}\n");
+	fclose(snap);
+
+	if (rename(tmp_path, final_path) != 0) {
+		WMR_WARN(wh, "Camera calibration snapshot: rename(%s -> %s) failed: %s", tmp_path, final_path,
+		         strerror(errno));
+	}
+}
+
 //! Extended camera calibration info for SLAM
 XRT_MAYBE_UNUSED static void
 wmr_hmd_fill_slam_cams_calibration(struct wmr_hmd *wh)
@@ -2024,6 +2160,7 @@ wmr_hmd_fill_slam_cams_calibration(struct wmr_hmd *wh)
 	wh->tracking.slam_calib.cam_count = wh->config.tcam_count;
 
 	wmr_hmd_log_cam_calib(wh);
+	wmr_hmd_write_cam_calib_snapshot(wh);
 
 	// Fill camera 0
 	struct xrt_pose P_imu_c0 = wh->config.sensors.accel.pose;

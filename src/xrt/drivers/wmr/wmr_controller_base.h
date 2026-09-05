@@ -130,6 +130,16 @@ struct wmr_controller_base
 	 */
 	char fw_serial[16 + 1];
 
+	/*!
+	 * Generic mirror of the idle/imu-zeroed flag (2026-09-05), so code that only knows about
+	 * this common base -- not any variant-specific input struct -- can tell "idle" apart from
+	 * "disconnected" for the dashboard hmd-status.json snapshot (see wmr_hmd.c). Currently only
+	 * ever set by the HP variant (wmr_controller_hp.c, right after computing its own
+	 * last_inputs.imu.zeroed); left false (the correct "unknown"/never-idle default) for
+	 * variants that don't compute this, such as Odyssey.
+	 */
+	bool imu_zeroed;
+
 	//! Time of last IMU sample, in CPU time.
 	uint64_t last_imu_timestamp_ns;
 	//! Monotonic time of the last WMR_CONTROLLER_KEEPALIVE_S resend, or 0 before the first one.
