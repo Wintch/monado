@@ -31,9 +31,33 @@
 #include <stdlib.h>
 #include <assert.h>
 #include <stdio.h>
+#include <errno.h>
+#include <string.h>
+#include <limits.h>
+#include <unistd.h>
 
 //! Specifies whether the user wants to enable autoexposure from the start.
 DEBUG_GET_ONCE_BOOL_OPTION(wmr_autoexposure, "WMR_AUTOEXPOSURE", true)
+
+/*
+ * reverb-g2 (2026-09-05): dump one throttled raw-grayscale PGM snapshot per SLAM-tracking camera
+ * to ~/vr/cameraN.pgm, for the web dashboard's live tracking-camera view (docs precedent:
+ * wmr_hmd.c's HMD-temperature dashboard snapshot, same "cheap raw dump here, real encoding in
+ * Python at serve time" split -- see status-dashboard.py). Default ON: this thread
+ * ("WMR: USB-Camera", see wmr_cam_usb_thread) is NOT elevated to SCHED_FIFO (only "WMR: USB-HMD"
+ * is -- grep u_linux_try_to_set_realtime_priority_on_thread), so unlike that thread it has never
+ * carried the same real-time obligations; the throttle below (WMR_CAMERA_SNAPSHOT_THROTTLE,
+ * ~1 fps) and the fact that the real tracking sinks are always pushed BEFORE this snapshot runs
+ * keep it from ever being able to delay a frame's arrival at SLAM/Basalt either way.
+ */
+DEBUG_GET_ONCE_BOOL_OPTION(wmr_camera_snapshot, "WMR_CAMERA_SNAPSHOT", true)
+
+//! Every Nth SLAM-tracking-frame callback does the real (tiny) dashboard snapshot file I/O; SLAM
+//! frames land here at roughly 30fps (see the "Tracking frames usually come at ~30fps" comment
+//! below), so 30 throttles the per-camera dump to roughly 1 fps -- nowhere near the ~30-90fps
+//! source rate, per the driver's documented sensitivity to added work in this pipeline (docs/44
+//! T199: an in-loop sleep() once let the IMU stream fall ~630ms behind).
+#define WMR_CAMERA_SNAPSHOT_THROTTLE 30
 
 //! Specifies whether the user wants to use the same exp/gain values for all cameras
 DEBUG_GET_ONCE_BOOL_OPTION(wmr_unify_expgain, "WMR_UNIFY_EXPGAIN", false)
@@ -174,6 +198,9 @@ struct wmr_camera
 
 	struct xrt_frame_sink *cam_sinks[WMR_MAX_CAMERAS]; //!< Downstream sinks to push tracking frames to
 	struct xrt_frame_sink *ctrl_cam_sinks[WMR_MAX_CAMERAS]; //!< Downstream sinks for controller-tracking frames
+
+	bool snapshot_enabled;          //!< Dashboard PGM snapshot feature on/off (WMR_CAMERA_SNAPSHOT)
+	uint64_t snapshot_frame_count;  //!< Throttle counter for that snapshot (reverb-g2, 2026-09-05)
 
 	enum u_logging_level log_level;
 };
@@ -342,6 +369,82 @@ set_active(struct wmr_camera *cam, bool active)
 	return send_buffer_to_device(cam, (uint8_t *)&cmd, sizeof(cmd));
 }
 
+/*!
+ * Dump one camera's already-demuxed frame as a raw 8-bit grayscale PGM (P5) to
+ * ~/vr/camera<index>.pgm, atomically (write to a .tmp file, then rename()), for the web
+ * dashboard's live tracking-camera view. Best-effort only: any failure just warns once (a static
+ * guard, matching wmr_hmd.c's HMD-temperature snapshot) and returns -- this must never be allowed
+ * to affect the driver's real job.
+ *
+ * `xf` is one of the per-camera ROI frames already produced by u_frame_create_roi() in
+ * img_xfer_cb() below: `xf->width`/`xf->height` are this camera's true dimensions (640x480 on the
+ * G2), but `xf->stride` is still the COMBINED multi-camera frame's stride (all tcam_count cameras
+ * side by side), not this camera's own width -- so rows are copied one at a time, respecting
+ * stride, rather than as one contiguous `width * height`-byte block (which would interleave in
+ * neighbouring cameras' columns into every row after the first).
+ */
+static void
+wmr_camera_dump_snapshot_pgm(struct wmr_camera *cam, int index, struct xrt_frame *xf)
+{
+	static bool warned_snapshot_failure = false;
+
+	const char *home = getenv("HOME");
+	if (home == NULL) {
+		if (!warned_snapshot_failure) {
+			WMR_CAM_WARN(cam, "Camera snapshot: HOME not set, skipping dashboard snapshot file");
+			warned_snapshot_failure = true;
+		}
+		return;
+	}
+
+	char final_path[PATH_MAX];
+	char tmp_path[PATH_MAX];
+	snprintf(final_path, sizeof(final_path), "%s/vr/camera%d.pgm", home, index);
+	snprintf(tmp_path, sizeof(tmp_path), "%s/vr/camera%d.pgm.tmp", home, index);
+
+	FILE *snap = fopen(tmp_path, "wb");
+	if (snap == NULL) {
+		if (!warned_snapshot_failure) {
+			WMR_CAM_WARN(cam, "Camera snapshot: fopen(%s) failed: %s", tmp_path, strerror(errno));
+			warned_snapshot_failure = true;
+		}
+		return;
+	}
+
+	fprintf(snap, "P5\n%u %u\n255\n", xf->width, xf->height);
+
+	bool write_ok = true;
+	const uint8_t *row = xf->data;
+	for (uint32_t y = 0; y < xf->height; y++) {
+		if (fwrite(row, 1, xf->width, snap) != xf->width) {
+			write_ok = false;
+			break;
+		}
+		row += xf->stride;
+	}
+
+	if (fclose(snap) != 0) {
+		write_ok = false;
+	}
+
+	if (!write_ok) {
+		if (!warned_snapshot_failure) {
+			WMR_CAM_WARN(cam, "Camera snapshot: failed writing %s: %s", tmp_path, strerror(errno));
+			warned_snapshot_failure = true;
+		}
+		unlink(tmp_path);
+		return;
+	}
+
+	if (rename(tmp_path, final_path) != 0) {
+		if (!warned_snapshot_failure) {
+			WMR_CAM_WARN(cam, "Camera snapshot: rename(%s -> %s) failed: %s", tmp_path, final_path,
+			             strerror(errno));
+			warned_snapshot_failure = true;
+		}
+	}
+}
+
 static void LIBUSB_CALL
 img_xfer_cb(struct libusb_transfer *xfer)
 {
@@ -480,6 +583,20 @@ img_xfer_cb(struct libusb_transfer *xfer)
 			xrt_sink_push_frame(cam->cam_sinks[i], frames[i]);
 		}
 
+		// Dashboard snapshot (reverb-g2, 2026-09-05): comes AFTER the real tracking sinks are
+		// already pushed above, so nothing here can ever delay a frame's arrival at
+		// SLAM/Basalt. Throttled hard (WMR_CAMERA_SNAPSHOT_THROTTLE, ~1 fps out of this
+		// thread's ~30fps SLAM-frame rate) -- see wmr_camera_dump_snapshot_pgm()'s comment.
+		if (cam->snapshot_enabled) {
+			cam->snapshot_frame_count++;
+			if ((cam->snapshot_frame_count % WMR_CAMERA_SNAPSHOT_THROTTLE) == 0) {
+				DRV_TRACE_IDENT(camera_dashboard_snapshot);
+				for (int i = 0; i < cam->slam_cam_count; i++) {
+					wmr_camera_dump_snapshot_pgm(cam, i, frames[i]);
+				}
+			}
+		}
+
 		for (int i = 0; i < cam->slam_cam_count; i++) {
 			xrt_frame_reference(&frames[i], NULL);
 		}
@@ -529,6 +646,7 @@ wmr_camera_open(struct wmr_camera_open_config *config)
 	cam->tcam_count = config->tcam_count;
 	cam->slam_cam_count = config->slam_cam_count;
 	cam->log_level = config->log_level;
+	cam->snapshot_enabled = debug_get_bool_option_wmr_camera_snapshot();
 
 	for (int i = 0; i < cam->tcam_count; i++) {
 		cam->tcam_confs[i] = *config->tcam_confs[i];
