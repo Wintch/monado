@@ -158,6 +158,9 @@ struct wmr_hmd
 	uint16_t raw_ipd;
 	//! Latest proximity sensor value read from the device.
 	uint8_t proximity_sensor;
+	//! Throttle counter for the raw HMD IMU temperature log (2026-09-04), incremented once
+	//! per decoded sensor packet (~250 Hz) in hololens_sensors_decode_packet().
+	uint32_t temperature_log_count;
 
 	/*!
 	 * Debounce state for XR_EXT_user_presence (reverb-g2 T223/T224).
@@ -186,6 +189,13 @@ struct wmr_hmd
 		uint64_t last_update_ns;
 		//! Throttle for the stale-channel notice.
 		uint64_t stale_log_count;
+		//! Monotonic time the current NOT-WORN stretch began (0 = worn, or not-worn but
+		//! not yet timed since the last screen-state change). Feeds
+		//! WMR_USER_PRESENCE_SCREENOFF_MS in wmr_hmd_update_inputs() -- see there.
+		uint64_t not_worn_since_ns;
+		//! True once this NOT-WORN stretch has already blanked the panel via
+		//! screen_enable_func, so update_inputs doesn't re-call it every frame.
+		bool screen_off_by_presence;
 	} presence;
 
 	struct hololens_sensors_packet packet;

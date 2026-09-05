@@ -141,6 +141,22 @@ DEBUG_GET_ONCE_BOOL_OPTION(wmr_user_presence, "WMR_USER_PRESENCE", false)
 DEBUG_GET_ONCE_NUM_OPTION(wmr_user_presence_don_ms, "WMR_USER_PRESENCE_DON_MS", 250)
 DEBUG_GET_ONCE_NUM_OPTION(wmr_user_presence_doff_ms, "WMR_USER_PRESENCE_DOFF_MS", 1000)
 
+//! Auto-standby (reverb-g2, 2026-09-04): blank the panel after this many ms continuously
+//! committed NOT WORN, using the same screen_enable_func this driver already calls at
+//! activation/reconnect (wmr_hmd_activate_reverb) and already exposes as a manual monado-gui
+//! debug button (hmd_screen_enable_btn) -- so the on/off mechanism itself is proven, only the
+//! automatic trigger is new. Replicates Windows Mixed Reality Portal's own burn-in-protection
+//! idle timer (HKCU\Software\Microsoft\Windows\CurrentVersion\Holographic\IdleTimerDuration,
+//! default 180000 ms/3 min on Windows) as a starting point, NOT a validated tuning for this
+//! rig's own use (a booth wants guests handing the headset back and forth, which may want a
+//! shorter window -- tune after live data, don't assume Windows' number is right here too).
+//! Re-enable on the next WORN commit is IMMEDIATE (no debounce beyond the existing
+//! WMR_USER_PRESENCE_DON_MS), deliberately NOT Windows' own manual-wake-button requirement --
+//! a guest putting the headset back on should just see it come back, not need a UI action.
+//! 0 disables (default): opt-in on top of WMR_USER_PRESENCE=1, unvalidated until a live
+//! doff-and-wait session confirms it actually blanks and a live don confirms it restores.
+DEBUG_GET_ONCE_NUM_OPTION(wmr_user_presence_screenoff_ms, "WMR_USER_PRESENCE_SCREENOFF_MS", 0)
+
 
 #define WMR_TRACE(d, ...) U_LOG_XDEV_IFL_T(&d->base, d->log_level, __VA_ARGS__)
 #define WMR_DEBUG(d, ...) U_LOG_XDEV_IFL_D(&d->base, d->log_level, __VA_ARGS__)
@@ -205,6 +221,22 @@ hololens_sensors_decode_packet(struct wmr_hmd *wh,
 	pkt->id = read8(&buffer);
 	for (int i = 0; i < 4; i++) {
 		pkt->temperature[i] = read16(&buffer);
+	}
+
+	// Throttled raw-temperature log (2026-09-04): the HMD's IMU (ICM-20602, the same chip the
+	// controllers use) reports 4 raw die-temperature register readings per packet -- decoded
+	// here but never previously read back anywhere in this driver (silently discarded until
+	// now). NOT converted to Celsius here -- no raw->degC formula has been confirmed live
+	// against this specific unit yet, so the number is logged as-is, uncalibrated, rather than
+	// print a guessed conversion that could be silently wrong. Still useful as a same-session
+	// heat TREND (rising/falling/flat) while real calibration is pending -- see docs/97.
+	// Unconditional (no WMR_USER_PRESENCE gate): this is unrelated telemetry, every session
+	// benefits, not just presence-enabled ones. Throttled to ~once/minute at the packet's
+	// ~250 Hz rate so it doesn't spam a long session's log.
+	wh->temperature_log_count++;
+	if (wh->temperature_log_count == 1 || (wh->temperature_log_count % 15000) == 0) {
+		WMR_INFO(wh, "HMD IMU temperature (raw ICM-20602 register, uncalibrated): %u %u %u %u",
+		         pkt->temperature[0], pkt->temperature[1], pkt->temperature[2], pkt->temperature[3]);
 	}
 
 	for (int i = 0; i < 4; i++) {
@@ -2412,6 +2444,15 @@ wmr_hmd_setup_ui(struct wmr_hmd *wh)
 	u_var_add_u8(wh, &wh->proximity_sensor, "HMD Proximity");
 	u_var_add_u16(wh, &wh->raw_ipd, "HMD IPD");
 
+	// Raw, uncalibrated ICM-20602 die-temperature registers, one per IMU sub-sample in the
+	// packet (2026-09-04) -- see the throttled log in hololens_sensors_decode_packet() for
+	// why these are shown raw rather than converted to a guessed Celsius value. All 4 shown
+	// (not just sample 0) so a difference between them is visible instead of assumed away.
+	u_var_add_u16(wh, &wh->packet.temperature[0], "HMD IMU Temperature[0] (raw)");
+	u_var_add_u16(wh, &wh->packet.temperature[1], "HMD IMU Temperature[1] (raw)");
+	u_var_add_u16(wh, &wh->packet.temperature[2], "HMD IMU Temperature[2] (raw)");
+	u_var_add_u16(wh, &wh->packet.temperature[3], "HMD IMU Temperature[3] (raw)");
+
 	if (wh->hmd_desc->screen_enable_func) {
 		// Enabling/disabling the HMD screen at runtime is supported. Add button to debug GUI.
 		wh->gui.hmd_screen_enable_btn.cb = wmr_hmd_screen_enable_toggle;
@@ -2645,6 +2686,40 @@ wmr_hmd_update_inputs(struct xrt_device *xdev)
 				WMR_INFO(wh, "User presence: %s (raw proximity sensor value %u, held %llu ms)",
 				         wh->presence.committed ? "WORN" : "NOT WORN", wh->proximity_sensor,
 				         (unsigned long long)(held_ns / U_TIME_1MS_IN_NS));
+			}
+		}
+
+		/*
+		 * Auto-standby (WMR_USER_PRESENCE_SCREENOFF_MS, 2026-09-04): blank the panel after
+		 * this many ms continuously committed NOT WORN, restore immediately on the next
+		 * WORN commit. Tracked off the COMMITTED state (not the raw byte or the candidate)
+		 * so it inherits the same debounced, fail-toward-worn guarantee the presence
+		 * feature already has -- a flicker never blanks the screen, only a real doff does.
+		 * Uses the same screen_enable_func already proven safe by
+		 * wmr_hmd_activate_reverb/deactivate and the manual monado-gui toggle button.
+		 */
+		if (wh->presence.committed) {
+			wh->presence.not_worn_since_ns = 0;
+			if (wh->presence.screen_off_by_presence) {
+				if (wh->hmd_desc != NULL && wh->hmd_desc->screen_enable_func != NULL) {
+					wh->hmd_desc->screen_enable_func(wh, true);
+				}
+				wh->presence.screen_off_by_presence = false;
+				WMR_INFO(wh, "User presence: panel restored from auto-standby");
+			}
+		} else {
+			if (wh->presence.not_worn_since_ns == 0) {
+				wh->presence.not_worn_since_ns = now_ns;
+			}
+			uint64_t screenoff_ms = (uint64_t)debug_get_num_option_wmr_user_presence_screenoff_ms();
+			if (screenoff_ms > 0 && !wh->presence.screen_off_by_presence &&
+			    (now_ns - wh->presence.not_worn_since_ns) >= screenoff_ms * U_TIME_1MS_IN_NS) {
+				if (wh->hmd_desc != NULL && wh->hmd_desc->screen_enable_func != NULL) {
+					wh->hmd_desc->screen_enable_func(wh, false);
+				}
+				wh->presence.screen_off_by_presence = true;
+				WMR_INFO(wh, "User presence: panel blanked by auto-standby (%llu ms NOT WORN)",
+				         (unsigned long long)screenoff_ms);
 			}
 		}
 
