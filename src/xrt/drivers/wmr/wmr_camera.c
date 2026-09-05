@@ -14,6 +14,7 @@
 #include "math/m_api.h"
 
 #include "os/os_threading.h"
+#include "os/os_time.h"
 #include "xrt/xrt_byte_order.h"
 
 #include "util/u_autoexpgain.h"
@@ -57,8 +58,16 @@ DEBUG_GET_ONCE_BOOL_OPTION(wmr_camera_snapshot, "WMR_CAMERA_SNAPSHOT", true)
 //! frames land here at roughly 30fps (see the "Tracking frames usually come at ~30fps" comment
 //! below), so 30 throttles the per-camera dump to roughly 1 fps -- nowhere near the ~30-90fps
 //! source rate, per the driver's documented sensitivity to added work in this pipeline (docs/44
-//! T199: an in-loop sleep() once let the IMU stream fall ~630ms behind).
+//! T199: an in-loop sleep() once let the IMU stream fall ~630ms behind). Runtime-overridable
+//! (docs/08 v0 passthrough, 2026-09-05): the dashboard thumbnail only ever needed ~1fps, but a
+//! live passthrough viewer wants much closer to the source rate. Default stays 30 (unchanged
+//! dashboard behaviour) unless WMR_CAMERA_SNAPSHOT_RATE_DIVISOR overrides it; the write itself is
+//! already ordered after the real tracking sinks are pushed (see the call site below) so it can
+//! never delay a pose reaching SLAM/Basalt -- lowering the divisor only spends more of this
+//! thread's own budget on file I/O, which is the thing to watch when raising it.
 #define WMR_CAMERA_SNAPSHOT_THROTTLE 30
+
+DEBUG_GET_ONCE_NUM_OPTION(wmr_camera_snapshot_rate_divisor, "WMR_CAMERA_SNAPSHOT_RATE_DIVISOR", WMR_CAMERA_SNAPSHOT_THROTTLE)
 
 //! Specifies whether the user wants to use the same exp/gain values for all cameras
 DEBUG_GET_ONCE_BOOL_OPTION(wmr_unify_expgain, "WMR_UNIFY_EXPGAIN", false)
@@ -136,6 +145,18 @@ wmr_camera_set_ctrl_exposure_gain(struct wmr_camera *cam, uint8_t camera_id, uin
 DEBUG_GET_ONCE_NUM_OPTION(wmr_ctrl_exposure, "WMR_CONTROLLER_CAM_EXPOSURE_US", DEFAULT_CTRL_EXPOSURE)
 DEBUG_GET_ONCE_NUM_OPTION(wmr_ctrl_gain, "WMR_CONTROLLER_CAM_GAIN", DEFAULT_CTRL_GAIN)
 
+//! Passthrough-viewer support (reverb-g2, 2026-09-05): the controller-tracking exposure/gain
+//! above is a fixed pair chosen for LED visibility, completely independent of the SLAM
+//! autoexposure loop in update_expgain() -- normal and harmless when the two streams are only
+//! ever consumed separately (real SLAM vs real controller tracking), but once
+//! WMR_CAMERA_SNAPSHOT_RATE_DIVISOR=1 makes both frame types land in the SAME dashboard/
+//! passthrough PGM file (docs/08 v0), alternating between two independently-exposed sources
+//! shows up as a visible brightness flicker. Default OFF: this must never silently change
+//! exposure behaviour for existing controller-tracking use (Aircar/Cyberpilot booth titles).
+//! When on, ties the controller slots' exposure/gain to camera 0's current SLAM autoexposure
+//! value instead of the fixed default -- see the call site in update_expgain().
+DEBUG_GET_ONCE_BOOL_OPTION(wmr_ctrl_exposure_follow_slam, "WMR_CTRL_EXPOSURE_FOLLOW_SLAM", false)
+
 #define WMR_FRAMETYPE_SLAM 0x0
 #define WMR_FRAMETYPE_CONTROLLER 0x2
 
@@ -202,6 +223,11 @@ struct wmr_camera
 
 	bool snapshot_enabled;          //!< Dashboard PGM snapshot feature on/off (WMR_CAMERA_SNAPSHOT)
 	uint64_t snapshot_frame_count;  //!< Throttle counter for that snapshot (reverb-g2, 2026-09-05)
+	//! Separate throttle counter for the controller-tracking-frame snapshot below (reverb-g2,
+	//! 2026-09-05): the two frame types arrive interleaved on the same USB stream (SLAM
+	//! ~30fps, controller ~60fps, ~90fps raw combined -- see the frametype comment in
+	//! img_xfer_cb()), so each needs its own independent modulo counter rather than sharing one.
+	uint64_t ctrl_snapshot_frame_count;
 
 	/*!
 	 * Real frame drop-rate (reverb-g2, 2026-09-05). Under normal operation each mosaic frame
@@ -413,6 +439,15 @@ wmr_camera_dump_snapshot_pgm(struct wmr_camera *cam, int index, struct xrt_frame
 {
 	static bool warned_snapshot_failure = false;
 
+	// Latency instrumentation (reverb-g2, 2026-09-05, docs/08 v0 passthrough redraw
+	// investigation): stamped here, at the moment this driver thread hands the frame to
+	// disk, using the same os_monotonic_get_ns() (CLOCK_MONOTONIC) clock the rest of Monado
+	// runs on -- safe to diff against a reader process's own CLOCK_MONOTONIC read on the same
+	// host, unlike the device's own HoloLens-tick timestamps (frame_start_ts et al above),
+	// which are a separate, uncalibrated clock domain. Written as a sidecar, not embedded in
+	// the PGM itself, so existing readers (the dashboard) are unaffected.
+	const int64_t snapshot_write_ts_ns = os_monotonic_get_ns();
+
 	const char *home = getenv("HOME");
 	if (home == NULL) {
 		if (!warned_snapshot_failure) {
@@ -466,6 +501,24 @@ wmr_camera_dump_snapshot_pgm(struct wmr_camera *cam, int index, struct xrt_frame
 			WMR_CAM_WARN(cam, "Camera snapshot: rename(%s -> %s) failed: %s", tmp_path, final_path,
 			             strerror(errno));
 			warned_snapshot_failure = true;
+		}
+		return;
+	}
+
+	// Best-effort sidecar with the write timestamp (see the comment at function entry).
+	// Deliberately silent on failure -- this is instrumentation only, must never warn louder
+	// than the real dump it rides alongside.
+	char ts_final_path[PATH_MAX];
+	char ts_tmp_path[PATH_MAX];
+	snprintf(ts_final_path, sizeof(ts_final_path), "%s/vr/camera%d.pgm.ts", home, index);
+	snprintf(ts_tmp_path, sizeof(ts_tmp_path), "%s/vr/camera%d.pgm.ts.tmp", home, index);
+	FILE *ts_file = fopen(ts_tmp_path, "wb");
+	if (ts_file != NULL) {
+		fprintf(ts_file, "%lld\n", (long long)snapshot_write_ts_ns);
+		if (fclose(ts_file) == 0) {
+			rename(ts_tmp_path, ts_final_path);
+		} else {
+			unlink(ts_tmp_path);
 		}
 	}
 }
@@ -621,11 +674,16 @@ img_xfer_cb(struct libusb_transfer *xfer)
 
 		// Dashboard snapshot (reverb-g2, 2026-09-05): comes AFTER the real tracking sinks are
 		// already pushed above, so nothing here can ever delay a frame's arrival at
-		// SLAM/Basalt. Throttled hard (WMR_CAMERA_SNAPSHOT_THROTTLE, ~1 fps out of this
-		// thread's ~30fps SLAM-frame rate) -- see wmr_camera_dump_snapshot_pgm()'s comment.
+		// SLAM/Basalt. Throttled (default WMR_CAMERA_SNAPSHOT_THROTTLE, ~1 fps out of this
+		// thread's ~30fps SLAM-frame rate), overridable via WMR_CAMERA_SNAPSHOT_RATE_DIVISOR
+		// for the passthrough viewer -- see wmr_camera_dump_snapshot_pgm()'s comment.
 		if (cam->snapshot_enabled) {
 			cam->snapshot_frame_count++;
-			if ((cam->snapshot_frame_count % WMR_CAMERA_SNAPSHOT_THROTTLE) == 0) {
+			long snapshot_divisor = debug_get_num_option_wmr_camera_snapshot_rate_divisor();
+			if (snapshot_divisor < 1) {
+				snapshot_divisor = 1;
+			}
+			if ((cam->snapshot_frame_count % snapshot_divisor) == 0) {
 				DRV_TRACE_IDENT(camera_dashboard_snapshot);
 				for (int i = 0; i < cam->slam_cam_count; i++) {
 					wmr_camera_dump_snapshot_pgm(cam, i, frames[i]);
@@ -648,6 +706,27 @@ img_xfer_cb(struct libusb_transfer *xfer)
 		for (int i = 0; i < cam->tcam_count; i++) {
 			if (cam->ctrl_cam_sinks[i] != NULL) {
 				xrt_sink_push_frame(cam->ctrl_cam_sinks[i], frames[i]);
+			}
+		}
+
+		// Dashboard/passthrough snapshot, controller-frametype half (reverb-g2, 2026-09-05):
+		// this is the ~60fps half of the raw ~90fps combined rate that the SLAM branch above
+		// never sees (frametype dispatch is mutually exclusive per frame). Comes AFTER the
+		// real ctrl_cam_sinks push above, same non-delaying ordering as the SLAM branch's
+		// snapshot. Shares WMR_CAMERA_SNAPSHOT_RATE_DIVISOR with the SLAM path so one knob
+		// controls the combined dump rate; own counter because the two frame types arrive at
+		// different cadences and must not share a modulo phase.
+		if (cam->snapshot_enabled) {
+			cam->ctrl_snapshot_frame_count++;
+			long ctrl_snapshot_divisor = debug_get_num_option_wmr_camera_snapshot_rate_divisor();
+			if (ctrl_snapshot_divisor < 1) {
+				ctrl_snapshot_divisor = 1;
+			}
+			if ((cam->ctrl_snapshot_frame_count % ctrl_snapshot_divisor) == 0) {
+				DRV_TRACE_IDENT(camera_dashboard_snapshot_ctrl);
+				for (int i = 0; i < cam->tcam_count; i++) {
+					wmr_camera_dump_snapshot_pgm(cam, i, frames[i]);
+				}
 			}
 		}
 
@@ -1074,6 +1153,27 @@ update_expgain(struct wmr_camera *cam, struct xrt_frame **frames)
 			WMR_CAM_ERROR(cam, "Failed to set exposure and gain for camera %d", i);
 		}
 		res |= status;
+	}
+
+	// WMR_CTRL_EXPOSURE_FOLLOW_SLAM (see the option's comment above): only fires a USB control
+	// transfer when camera 0's SLAM-autoexposed value actually moved, same change-detection
+	// pattern as the per-camera loop above -- autoexposure holds steady under stable lighting,
+	// so this is rare in practice, not a per-frame cost.
+	if (cam->ctrl_expgain_set && debug_get_bool_option_wmr_ctrl_exposure_follow_slam()) {
+		struct wmr_camera_expgain *slam0 = &cam->ceg[0];
+		if (cam->ctrl_exposure != slam0->exposure || cam->ctrl_gain != slam0->gain) {
+			for (int i = 0; i < cam->tcam_count; i++) {
+				const struct wmr_camera_config *config = &cam->tcam_confs[i];
+				bool status =
+				    wmr_camera_set_ctrl_exposure_gain(cam, config->location, slam0->exposure, slam0->gain);
+				if (status != 0) {
+					WMR_CAM_ERROR(cam, "Failed to follow SLAM exposure/gain for controller camera %d",
+					              i);
+				}
+			}
+			cam->ctrl_exposure = slam0->exposure;
+			cam->ctrl_gain = slam0->gain;
+		}
 	}
 
 	cam->expgain_snapshot_count++;
