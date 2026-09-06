@@ -3116,13 +3116,30 @@ wmr_hmd_presence_tick(struct wmr_hmd *wh)
 	 * WORN commit. Tracked off the COMMITTED state (not the raw byte or the candidate)
 	 * so it inherits the same debounced, fail-toward-worn guarantee the presence
 	 * feature already has -- a flicker never blanks the screen, only a real doff does.
-	 * Uses the same screen_enable_func already proven safe by
-	 * wmr_hmd_activate_reverb/deactivate and the manual monado-gui toggle button.
+	 *
+	 * docs/103 (2026-09-06, later same day as the presence_tick threading refactor):
+	 * restore used to call screen_enable_func(wh, true) directly here, on the shared
+	 * wh->hid_control_dev handle -- the very handle this whole investigation already
+	 * found unreliable earlier the same day (see wmr_hmd_reassert_reverb_fresh_fd's own
+	 * comment: a shared-handle send previously needed ~4-5s due to hid_lock contention,
+	 * and a fresh fd was built specifically to stop trusting that handle). It worked
+	 * across several live blank->restore cycles earlier today, then silently failed to
+	 * visually restore in a later one -- HID_SEND returned success, "restored" got
+	 * logged, but the panel never lit. Caught live while validating THIS function's own
+	 * threading refactor, not caused by it (the shared-handle call was already here
+	 * before the refactor) -- just finally reproduced with enough attempts. Switched
+	 * restore to reuse the SAME fresh-fd reassert_func already proven reliable for the
+	 * periodic keep-alive while blanked (it ends in the identical screen-on send, just
+	 * over a fd nothing else contends for), instead of trusting the shared handle for
+	 * the one call that actually matters to the wearer. Falls back to the bare
+	 * screen_enable_func only if a family has no reassert_func (e.g. Odyssey+).
 	 */
 	if (wh->presence.committed) {
 		wh->presence.not_worn_since_ns = 0;
 		if (wh->presence.screen_off_by_presence) {
-			if (wh->hmd_desc != NULL && wh->hmd_desc->screen_enable_func != NULL) {
+			if (wh->hmd_desc != NULL && wh->hmd_desc->reassert_func != NULL) {
+				wh->hmd_desc->reassert_func(wh);
+			} else if (wh->hmd_desc != NULL && wh->hmd_desc->screen_enable_func != NULL) {
 				wh->hmd_desc->screen_enable_func(wh, true);
 			}
 			wh->presence.screen_off_by_presence = false;
