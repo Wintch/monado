@@ -19,6 +19,7 @@
 
 #include "util/u_autoexpgain.h"
 #include "util/u_debug.h"
+#include "util/u_linux.h"
 #include "util/u_var.h"
 #include "util/u_sink.h"
 #include "util/u_frame.h"
@@ -366,6 +367,16 @@ wmr_cam_usb_thread(void *ptr)
 	U_TRACE_SET_THREAD_NAME("WMR: USB-Camera");
 
 	struct wmr_camera *cam = ptr;
+
+#ifdef XRT_OS_LINUX
+	// docs/08 (2026-09-05): under Basalt's CPU/scheduling pressure this thread misses its
+	// SCHED_OTHER slot often enough that real USB camera transfers get dropped before the
+	// driver's frame callback ever runs. Mirrors "WMR: USB-HMD"'s existing SCHED_FIFO
+	// elevation (wmr_hmd.c); opt out with WMR_CAMERA_THREAD_NO_RT=1.
+	if (getenv("WMR_CAMERA_THREAD_NO_RT") == NULL) {
+		u_linux_try_to_set_realtime_priority_on_thread(cam->log_level, "WMR: USB-Camera");
+	}
+#endif
 
 	os_thread_helper_lock(&cam->usb_thread);
 	while (os_thread_helper_is_running_locked(&cam->usb_thread) && !cam->usb_complete) {
