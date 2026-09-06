@@ -254,6 +254,22 @@ struct wmr_hmd
 		uint64_t diag_last_heartbeat_ns;
 	} presence;
 
+	//! docs/103 (2026-09-06, "always evaluate" fix): true iff WMR_USER_PRESENCE=1 was set
+	//! at wmr_hmd_create() time. Gates whether wmr_run_thread() calls
+	//! wmr_hmd_presence_tick() every loop iteration -- without this, a WMR headset with
+	//! the feature off would still pay a mutex lock/unlock per iteration for nothing.
+	bool presence_enabled;
+	//! Protects every field inside `presence` above. Needed now that the debounce/commit/
+	//! blank/restore/reassert decision (formerly done inline in wmr_hmd_update_inputs(),
+	//! called only when an OpenXR client is actively syncing frames) moved to
+	//! wmr_hmd_presence_tick(), called every iteration of the always-running "WMR: USB-HMD"
+	//! thread (wmr_run_thread) instead -- see that function's own comment for why. Only
+	//! `committed` is still read from wmr_hmd_update_inputs() (the OpenXR-thread side), so
+	//! the critical sections on that side are tiny; the tick function on the read thread
+	//! holds it for the whole decision, same shape as the existing controller_status_lock
+	//! a few members below.
+	struct os_mutex presence_lock;
+
 	struct hololens_sensors_packet packet;
 
 	struct

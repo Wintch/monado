@@ -185,6 +185,13 @@ static void
 wmr_hmd_reassert_reverb(struct wmr_hmd *wh);
 static void
 wmr_hmd_reassert_reverb_fresh_fd(struct wmr_hmd *wh);
+//! docs/103 (2026-09-06, "always evaluate" fix): the presence debounce/commit/blank/
+//! restore/reassert decision, called every iteration of wmr_run_thread (client-
+//! independent) instead of only from wmr_hmd_update_inputs (client-gated). Forward-
+//! declared here, defined in its original spot near wmr_hmd_update_inputs, same pattern
+//! as the two reassert declarations right above.
+static void
+wmr_hmd_presence_tick(struct wmr_hmd *wh);
 static int
 wmr_hmd_activate_odyssey_plus(struct wmr_hmd *wh);
 static void
@@ -1355,6 +1362,28 @@ wmr_run_thread(void *ptr)
 			WMR_WARN(wh, "run loop: controller keepalives blocked %.1f ms", (double)(t3 - t2) / 1e6);
 		}
 
+		// docs/103 (2026-09-06, "always evaluate" fix): client-independent, same shape as
+		// wmr_hmd_send_controller_keepalives just above. Root cause of a real gap found
+		// live: wmr_hmd_update_inputs() -- where this decision used to live entirely --
+		// is only called by the OpenXR runtime while a client has an active frame-synced
+		// session. The instant the last client (a game, or hello_xr) exits, that call
+		// stops, and with it EVERY part of presence: the debounce/commit transition, the
+		// SCREENOFF_MS countdown, the blank, the periodic reassert, all of it. A panel lit
+		// at that moment just stays lit indefinitely -- confirmed live, twice, as zero
+		// heartbeats and zero alerts once the client was already gone, with the panel
+		// still on. That defeats the whole point of auto-standby for exactly the case it
+		// matters most: casual dev checking with no game running. Moving the decision here
+		// means it runs for as long as monado-service itself is alive, regardless of any
+		// client. wmr_hmd_update_inputs() still exists (unchanged signature, still the
+		// XRT_INPUT_GENERIC_HEAD_DETECT / XR_EXT_user_presence path for a connected app)
+		// but now only reads the already-decided wh->presence.committed under
+		// presence_lock and reports it -- it doesn't decide anything anymore. See
+		// wmr_hmd_presence_tick's own comment for the full former/new split and the
+		// locking rationale.
+		if (wh->presence_enabled) {
+			wmr_hmd_presence_tick(wh);
+		}
+
 		os_thread_helper_lock(&wh->oth);
 	}
 	os_thread_helper_unlock(&wh->oth);
@@ -2052,6 +2081,7 @@ wmr_hmd_destroy(struct xrt_device *xdev)
 
 	os_mutex_destroy(&wh->fusion.mutex);
 	os_mutex_destroy(&wh->hid_lock);
+	os_mutex_destroy(&wh->presence_lock);
 
 	u_device_free(&wh->base);
 }
@@ -3010,22 +3040,236 @@ get_compositor_info_wmr(struct xrt_device *xdev,
 }
 
 /*!
- * Feeds @ref wmr_hmd::proximity_sensor (updated by @ref control_ipd_value_decode as
- * WMR_CONTROL_MSG_IPD_VALUE packets arrive) into the XRT_INPUT_GENERIC_HEAD_DETECT input
- * that Monado's state tracker reads for XR_EXT_user_presence -- see
+ * The presence debounce/commit/blank/restore/reassert decision. docs/103 (2026-09-06,
+ * "always evaluate" fix): this used to be inline in wmr_hmd_update_inputs(), which is
+ * ONLY called by the OpenXR runtime while a client has an active frame-synced session --
+ * confirmed live, twice, that the instant the last client exits, this whole decision goes
+ * fully dormant: no more debounce, no countdown, no blank, no reassert. A panel lit at
+ * that moment just stays lit indefinitely, with zero protection, until a manual
+ * `jack-in-wayland.sh down` (which DOES cleanly screen-off via Monado's own SIGTERM
+ * clean-path -- that part was never broken). That defeats auto-standby for exactly the
+ * case it exists to protect: casual dev checking where a game usually isn't running.
+ *
+ * Fixed by calling this every iteration of wmr_run_thread instead -- the same always-on,
+ * client-independent background thread that already drives wmr_hmd_send_controller_keepalives
+ * (see that call site's own comment) and, critically, is the SAME thread that already calls
+ * control_ipd_value_decode() to update wh->proximity_sensor in the first place: the raw data
+ * was NEVER gated on a client, only the decision on top of it was. Moving the decision here
+ * closes that gap with no change to the debounce windows, the screenoff delay, or the
+ * reassert mechanism themselves -- only WHEN this runs changed, not what it does.
+ *
+ * Thread-safety: this now runs on the "WMR: USB-HMD" read thread, while
+ * wmr_hmd_update_inputs() (still the XR_EXT_user_presence path for a connected app) runs on
+ * the OpenXR runtime's thread. wh->presence_lock protects every field this function touches;
+ * wmr_hmd_update_inputs() takes the same lock just long enough to read the already-decided
+ * `committed` value.
+ */
+static void
+wmr_hmd_presence_tick(struct wmr_hmd *wh)
+{
+	uint64_t diag_now_ns = os_monotonic_get_ns();
+	uint64_t now_ns = diag_now_ns;
+
+	os_mutex_lock(&wh->presence_lock);
+
+	wh->presence.diag_update_inputs_calls++;
+
+	// PROVISIONAL threshold (2026-08-18): treat any nonzero raw proximity byte as
+	// "worn". This matches the informal convention already used offline by
+	// scripts/hmd-watch.py ("PROXIMITY %d -> %d ... WORN if new else removed"),
+	// but per docs/22-cable-connector-diagnosis.md that convention itself was
+	// never confirmed against a clean live cover/uncover gesture -- treat this as
+	// a best guess, not a validated calibration, until a real donning/doffing
+	// session confirms whether the sensor is genuinely binary or an analog value
+	// that merely idles at 0. The raw value is always logged on change (below) so
+	// a real threshold can be picked from live data without a rebuild.
+	bool raw_worn = wh->proximity_sensor != 0;
+
+	/*
+	 * Debounce (T224). The raw byte alternated 0,1,0,1 through a measured donning
+	 * gesture, so a candidate state has to hold for its window before it is committed.
+	 * Windows are asymmetric: see the struct comment in wmr_hmd.h for why leaving
+	 * "worn" deliberately costs more evidence than entering it.
+	 */
+	if (raw_worn != wh->presence.candidate) {
+		wh->presence.candidate = raw_worn;
+		wh->presence.candidate_since_ns = now_ns;
+	}
+
+	if (wh->presence.candidate != wh->presence.committed) {
+		// Entering "worn" uses the don window, leaving it uses the doff window.
+		uint64_t window_ms = (uint64_t)(wh->presence.candidate
+		                                    ? debug_get_num_option_wmr_user_presence_don_ms()
+		                                    : debug_get_num_option_wmr_user_presence_doff_ms());
+		uint64_t held_ns = now_ns - wh->presence.candidate_since_ns;
+		if (held_ns >= window_ms * U_TIME_1MS_IN_NS) {
+			wh->presence.committed = wh->presence.candidate;
+			WMR_INFO(wh, "User presence: %s (raw proximity sensor value %u, held %llu ms)",
+			         wh->presence.committed ? "WORN" : "NOT WORN", wh->proximity_sensor,
+			         (unsigned long long)(held_ns / U_TIME_1MS_IN_NS));
+		}
+	}
+
+	/*
+	 * Auto-standby (WMR_USER_PRESENCE_SCREENOFF_MS, 2026-09-04): blank the panel after
+	 * this many ms continuously committed NOT WORN, restore immediately on the next
+	 * WORN commit. Tracked off the COMMITTED state (not the raw byte or the candidate)
+	 * so it inherits the same debounced, fail-toward-worn guarantee the presence
+	 * feature already has -- a flicker never blanks the screen, only a real doff does.
+	 * Uses the same screen_enable_func already proven safe by
+	 * wmr_hmd_activate_reverb/deactivate and the manual monado-gui toggle button.
+	 */
+	if (wh->presence.committed) {
+		wh->presence.not_worn_since_ns = 0;
+		if (wh->presence.screen_off_by_presence) {
+			if (wh->hmd_desc != NULL && wh->hmd_desc->screen_enable_func != NULL) {
+				wh->hmd_desc->screen_enable_func(wh, true);
+			}
+			wh->presence.screen_off_by_presence = false;
+			WMR_INFO(wh, "User presence: panel restored from auto-standby");
+		}
+	} else {
+		if (wh->presence.not_worn_since_ns == 0) {
+			wh->presence.not_worn_since_ns = now_ns;
+		}
+		uint64_t screenoff_ms = (uint64_t)debug_get_num_option_wmr_user_presence_screenoff_ms();
+		if (screenoff_ms > 0 && !wh->presence.screen_off_by_presence &&
+		    (now_ns - wh->presence.not_worn_since_ns) >= screenoff_ms * U_TIME_1MS_IN_NS) {
+			if (wh->hmd_desc != NULL && wh->hmd_desc->screen_enable_func != NULL) {
+				wh->hmd_desc->screen_enable_func(wh, false);
+			}
+			wh->presence.screen_off_by_presence = true;
+			wh->presence.last_reassert_ns = 0;
+			WMR_INFO(wh, "User presence: panel blanked by auto-standby (%llu ms NOT WORN)",
+			         (unsigned long long)screenoff_ms);
+		}
+
+		// docs/103 (2026-09-06): presence RESTORE never fired, live, until this. Two
+		// bugs had to be found and fixed in turn, each confirmed by a live test before
+		// moving to the next:
+		//  1. Reasserting only in the RESTORE branch above (gated on
+		//     wh->presence.committed) was dead code -- committed can only become true
+		//     from a fresh companion packet, and the bug IS that no fresh packet
+		//     arrives once blanked. Moved to a one-shot right here at the blank
+		//     transition instead.
+		//  2. A one-shot's "wake" measurably decays: a real don ~100s after it produced
+		//     zero new packets, same as no reassert at all. Fixed by re-arming
+		//     periodically for as long as the panel stays blanked, not just once.
+		// reassert_func for the Reverb family (wmr_hmd_reassert_reverb_fresh_fd) is a
+		// full replica of scripts/panel.py's proven-working `activate()`, over its own
+		// fresh hidraw fd -- see that function's own comment for why a THIRD bug (the
+		// shared-handle version's ~4s hid_lock contention with this thread's own IMU
+		// reads, and a missing screen-on send on the same fd) needed fixing before this
+		// worked automatically. Live-validated 2026-09-06: 2 full automatic
+		// blank -> WORN -> restore -> NOT WORN cycles, no manual intervention, each
+		// reassert call ~368ms (not ~4s -- that cost was the shared-handle bug, now
+		// gone). Opt out with WMR_PRESENCE_RESTORE_REASSERT=0 if a rig disagrees;
+		// interval defaults to 15s (WMR_PRESENCE_REASSERT_INTERVAL_MS), untuned. Only
+		// runs while genuinely NOT WORN, so no wearer ever perceives the stall, but it
+		// does briefly flash the HP logo every interval while blanked (see
+		// wmr_hmd_reassert_reverb_fresh_fd) -- a known, accepted tradeoff, not a bug.
+		// 2026-09-06 addendum: this reassert call (~368ms) now runs on the SAME thread
+		// that also does control_read_packets/hololens_sensors_read_packets every
+		// iteration -- unlike the old client-gated version, there's no game/compositor
+		// waiting on this thread's cadence during a stall, only this thread's own next
+		// iteration is delayed by ~368ms, which is far under the pre-existing 150ms/50ms
+		// WARN thresholds' intent (a one-off rare stall, not a per-frame cost) and only
+		// ever happens while genuinely NOT WORN.
+		if (wh->presence.screen_off_by_presence) {
+			static int restore_reassert = -1;
+			if (restore_reassert == -1) {
+				const char *env = getenv("WMR_PRESENCE_RESTORE_REASSERT");
+				restore_reassert = (env == NULL || env[0] != '0');
+			}
+			static int64_t reassert_interval_ms = -1;
+			if (reassert_interval_ms == -1) {
+				const char *env = getenv("WMR_PRESENCE_REASSERT_INTERVAL_MS");
+				reassert_interval_ms = (env != NULL && atoi(env) > 0) ? atoi(env) : 15000;
+			}
+			bool due = wh->presence.last_reassert_ns == 0 ||
+			           (now_ns - wh->presence.last_reassert_ns) >=
+			               (uint64_t)reassert_interval_ms * U_TIME_1MS_IN_NS;
+			if (restore_reassert && due && wh->hmd_desc != NULL && wh->hmd_desc->reassert_func != NULL) {
+				int64_t ra0 = os_monotonic_get_ns();
+				wh->hmd_desc->reassert_func(wh);
+				WMR_INFO(wh, "presence auto-standby: reassert took %.1f ms",
+				         (double)(os_monotonic_get_ns() - ra0) / 1e6);
+				wh->presence.last_reassert_ns = now_ns;
+			}
+		}
+	}
+
+	/*
+	 * Stale-channel notice. The committed state is deliberately NOT touched here: when
+	 * the companion dies the last state stands, which for a worn headset is the safe
+	 * direction (doff-to-pause quietly stops working rather than pausing a live
+	 * session). But a consumer deciding anything on presence deserves to know the
+	 * channel went quiet, because T224 measured the companion surviving only ~1-3
+	 * minutes per session on degraded hardware -- long enough to look healthy at launch
+	 * and be gone by the time anyone tests the feature.
+	 */
+	const uint64_t PRESENCE_STALE_NS = 30 * U_TIME_1S_IN_NS;
+	if (wh->presence.last_update_ns != 0 && (now_ns - wh->presence.last_update_ns) > PRESENCE_STALE_NS) {
+		wh->presence.stale_log_count++;
+		if (wh->presence.stale_log_count == 1 || (wh->presence.stale_log_count % 5000) == 0) {
+			WMR_INFO(wh,
+			         "User presence: no proximity update for %llu s -- holding '%s'. The "
+			         "companion channel is the dependency here; if it is storming, this "
+			         "feature is effectively frozen, not reporting.",
+			         (unsigned long long)((now_ns - wh->presence.last_update_ns) / U_TIME_1S_IN_NS),
+			         wh->presence.committed ? "WORN" : "NOT WORN");
+		}
+	}
+
+	// TEMPORARY (docs/98, WMR_PRESENCE_DIAG): periodic heartbeat, independent of any
+	// committed transition. Originally meant to tell apart "update_inputs stopped being
+	// called after BLANK" from "the raw channel died underneath it" -- 2026-09-06
+	// addendum: since this whole function now runs off wmr_run_thread instead of
+	// update_inputs, diag_update_inputs_calls should climb continuously for as long as
+	// monado-service is alive, PERIOD, with no client-connection dependency at all. A
+	// stall here now would mean wmr_run_thread itself died or froze, a much more serious
+	// condition than the old "no OpenXR client" case this diagnostic used to also catch.
+	if (debug_get_bool_option_wmr_presence_diag() &&
+	    (wh->presence.diag_last_heartbeat_ns == 0 ||
+	     (diag_now_ns - wh->presence.diag_last_heartbeat_ns) >= 2 * U_TIME_1S_IN_NS)) {
+		wh->presence.diag_last_heartbeat_ns = diag_now_ns;
+		WMR_INFO(wh,
+		         "PRESENCE-DIAG heartbeat: update_inputs calls=%llu raw_packets=%llu "
+		         "raw_proximity=%u candidate=%d committed=%d screen_off_by_presence=%d "
+		         "last_packet_age_ms=%llu",
+		         (unsigned long long)wh->presence.diag_update_inputs_calls,
+		         (unsigned long long)wh->presence.diag_proximity_packets_seen, wh->proximity_sensor,
+		         wh->presence.candidate, wh->presence.committed, wh->presence.screen_off_by_presence,
+		         wh->presence.last_update_ns == 0
+		             ? 0ULL
+		             : (unsigned long long)((diag_now_ns - wh->presence.last_update_ns) / U_TIME_1MS_IN_NS));
+	}
+
+	os_mutex_unlock(&wh->presence_lock);
+}
+
+/*!
+ * Reports @ref wmr_hmd::presence's already-decided `committed` value (decided by @ref
+ * wmr_hmd_presence_tick, called every iteration of the always-on wmr_run_thread -- see
+ * that function's own comment for why) into the XRT_INPUT_GENERIC_HEAD_DETECT input that
+ * Monado's state tracker reads for XR_EXT_user_presence -- see
  * GET_STATIC_XDEV_BY_ROLE()/XRT_INPUT_GENERIC_HEAD_DETECT handling in oxr_session.c,
  * which calls xrt_device_update_inputs() (this function) and pushes
  * XrEventDataUserPresenceChangedEXT whenever the returned boolean flips. Only installed
  * as @ref xrt_device::update_inputs when WMR_USER_PRESENCE=1 (see wmr_hmd_create());
  * otherwise the base u_device_noop_update_inputs stays in place, so this is a strict
  * opt-in with no cost or behavior change by default.
+ *
+ * docs/103 (2026-09-06, "always evaluate" fix): this function used to OWN the entire
+ * debounce/commit/blank/restore/reassert decision, which meant that decision only ever
+ * ran while an OpenXR client was actively calling this (via the runtime's input-sync
+ * path) -- see wmr_hmd_presence_tick's own comment for the bug that caused and the fix.
+ * This function's only job now is reading the answer and reporting it.
  */
 static xrt_result_t
 wmr_hmd_update_inputs(struct xrt_device *xdev)
 {
 	struct wmr_hmd *wh = wmr_hmd(xdev);
-	uint64_t diag_now_ns = os_monotonic_get_ns();
-	wh->presence.diag_update_inputs_calls++;
 
 	for (size_t i = 0; i < wh->base.input_count; i++) {
 		struct xrt_input *input = &wh->base.inputs[i];
@@ -3033,174 +3277,12 @@ wmr_hmd_update_inputs(struct xrt_device *xdev)
 			continue;
 		}
 
-		// PROVISIONAL threshold (2026-08-18): treat any nonzero raw proximity byte as
-		// "worn". This matches the informal convention already used offline by
-		// scripts/hmd-watch.py ("PROXIMITY %d -> %d ... WORN if new else removed"),
-		// but per docs/22-cable-connector-diagnosis.md that convention itself was
-		// never confirmed against a clean live cover/uncover gesture -- treat this as
-		// a best guess, not a validated calibration, until a real donning/doffing
-		// session confirms whether the sensor is genuinely binary or an analog value
-		// that merely idles at 0. The raw value is always logged on change (below) so
-		// a real threshold can be picked from live data without a rebuild.
-		bool raw_worn = wh->proximity_sensor != 0;
-		uint64_t now_ns = os_monotonic_get_ns();
+		os_mutex_lock(&wh->presence_lock);
+		bool committed = wh->presence.committed;
+		os_mutex_unlock(&wh->presence_lock);
 
-		/*
-		 * Debounce (T224). The raw byte alternated 0,1,0,1 through a measured donning
-		 * gesture, so a candidate state has to hold for its window before it is committed.
-		 * Windows are asymmetric: see the struct comment in wmr_hmd.h for why leaving
-		 * "worn" deliberately costs more evidence than entering it.
-		 */
-		if (raw_worn != wh->presence.candidate) {
-			wh->presence.candidate = raw_worn;
-			wh->presence.candidate_since_ns = now_ns;
-		}
-
-		if (wh->presence.candidate != wh->presence.committed) {
-			// Entering "worn" uses the don window, leaving it uses the doff window.
-			uint64_t window_ms = (uint64_t)(wh->presence.candidate
-			                                    ? debug_get_num_option_wmr_user_presence_don_ms()
-			                                    : debug_get_num_option_wmr_user_presence_doff_ms());
-			uint64_t held_ns = now_ns - wh->presence.candidate_since_ns;
-			if (held_ns >= window_ms * U_TIME_1MS_IN_NS) {
-				wh->presence.committed = wh->presence.candidate;
-				WMR_INFO(wh, "User presence: %s (raw proximity sensor value %u, held %llu ms)",
-				         wh->presence.committed ? "WORN" : "NOT WORN", wh->proximity_sensor,
-				         (unsigned long long)(held_ns / U_TIME_1MS_IN_NS));
-			}
-		}
-
-		/*
-		 * Auto-standby (WMR_USER_PRESENCE_SCREENOFF_MS, 2026-09-04): blank the panel after
-		 * this many ms continuously committed NOT WORN, restore immediately on the next
-		 * WORN commit. Tracked off the COMMITTED state (not the raw byte or the candidate)
-		 * so it inherits the same debounced, fail-toward-worn guarantee the presence
-		 * feature already has -- a flicker never blanks the screen, only a real doff does.
-		 * Uses the same screen_enable_func already proven safe by
-		 * wmr_hmd_activate_reverb/deactivate and the manual monado-gui toggle button.
-		 */
-		if (wh->presence.committed) {
-			wh->presence.not_worn_since_ns = 0;
-			if (wh->presence.screen_off_by_presence) {
-				if (wh->hmd_desc != NULL && wh->hmd_desc->screen_enable_func != NULL) {
-					wh->hmd_desc->screen_enable_func(wh, true);
-				}
-				wh->presence.screen_off_by_presence = false;
-				WMR_INFO(wh, "User presence: panel restored from auto-standby");
-			}
-		} else {
-			if (wh->presence.not_worn_since_ns == 0) {
-				wh->presence.not_worn_since_ns = now_ns;
-			}
-			uint64_t screenoff_ms = (uint64_t)debug_get_num_option_wmr_user_presence_screenoff_ms();
-			if (screenoff_ms > 0 && !wh->presence.screen_off_by_presence &&
-			    (now_ns - wh->presence.not_worn_since_ns) >= screenoff_ms * U_TIME_1MS_IN_NS) {
-				if (wh->hmd_desc != NULL && wh->hmd_desc->screen_enable_func != NULL) {
-					wh->hmd_desc->screen_enable_func(wh, false);
-				}
-				wh->presence.screen_off_by_presence = true;
-				wh->presence.last_reassert_ns = 0;
-				WMR_INFO(wh, "User presence: panel blanked by auto-standby (%llu ms NOT WORN)",
-				         (unsigned long long)screenoff_ms);
-			}
-
-			// docs/103 (2026-09-06): presence RESTORE never fired, live, until this. Two
-			// bugs had to be found and fixed in turn, each confirmed by a live test before
-			// moving to the next:
-			//  1. Reasserting only in the RESTORE branch above (gated on
-			//     wh->presence.committed) was dead code -- committed can only become true
-			//     from a fresh companion packet, and the bug IS that no fresh packet
-			//     arrives once blanked. Moved to a one-shot right here at the blank
-			//     transition instead.
-			//  2. A one-shot's "wake" measurably decays: a real don ~100s after it produced
-			//     zero new packets, same as no reassert at all. Fixed by re-arming
-			//     periodically for as long as the panel stays blanked, not just once.
-			// reassert_func for the Reverb family (wmr_hmd_reassert_reverb_fresh_fd) is a
-			// full replica of scripts/panel.py's proven-working `activate()`, over its own
-			// fresh hidraw fd -- see that function's own comment for why a THIRD bug (the
-			// shared-handle version's ~4s hid_lock contention with this thread's own IMU
-			// reads, and a missing screen-on send on the same fd) needed fixing before this
-			// worked automatically. Live-validated 2026-09-06: 2 full automatic
-			// blank -> WORN -> restore -> NOT WORN cycles, no manual intervention, each
-			// reassert call ~368ms (not ~4s -- that cost was the shared-handle bug, now
-			// gone). Opt out with WMR_PRESENCE_RESTORE_REASSERT=0 if a rig disagrees;
-			// interval defaults to 15s (WMR_PRESENCE_REASSERT_INTERVAL_MS), untuned. Only
-			// runs while genuinely NOT WORN, so no wearer ever perceives the stall, but it
-			// does briefly flash the HP logo every interval while blanked (see
-			// wmr_hmd_reassert_reverb_fresh_fd) -- a known, accepted tradeoff, not a bug.
-			if (wh->presence.screen_off_by_presence) {
-				static int restore_reassert = -1;
-				if (restore_reassert == -1) {
-					const char *env = getenv("WMR_PRESENCE_RESTORE_REASSERT");
-					restore_reassert = (env == NULL || env[0] != '0');
-				}
-				static int64_t reassert_interval_ms = -1;
-				if (reassert_interval_ms == -1) {
-					const char *env = getenv("WMR_PRESENCE_REASSERT_INTERVAL_MS");
-					reassert_interval_ms = (env != NULL && atoi(env) > 0) ? atoi(env) : 15000;
-				}
-				bool due = wh->presence.last_reassert_ns == 0 ||
-				           (now_ns - wh->presence.last_reassert_ns) >=
-				               (uint64_t)reassert_interval_ms * U_TIME_1MS_IN_NS;
-				if (restore_reassert && due && wh->hmd_desc != NULL &&
-				    wh->hmd_desc->reassert_func != NULL) {
-					int64_t ra0 = os_monotonic_get_ns();
-					wh->hmd_desc->reassert_func(wh);
-					WMR_INFO(wh, "presence auto-standby: reassert took %.1f ms",
-					         (double)(os_monotonic_get_ns() - ra0) / 1e6);
-					wh->presence.last_reassert_ns = now_ns;
-				}
-			}
-		}
-
-		/*
-		 * Stale-channel notice. The committed state is deliberately NOT touched here: when
-		 * the companion dies the last state stands, which for a worn headset is the safe
-		 * direction (doff-to-pause quietly stops working rather than pausing a live
-		 * session). But a consumer deciding anything on presence deserves to know the
-		 * channel went quiet, because T224 measured the companion surviving only ~1-3
-		 * minutes per session on degraded hardware -- long enough to look healthy at launch
-		 * and be gone by the time anyone tests the feature.
-		 */
-		const uint64_t PRESENCE_STALE_NS = 30 * U_TIME_1S_IN_NS;
-		if (wh->presence.last_update_ns != 0 && (now_ns - wh->presence.last_update_ns) > PRESENCE_STALE_NS) {
-			wh->presence.stale_log_count++;
-			if (wh->presence.stale_log_count == 1 || (wh->presence.stale_log_count % 5000) == 0) {
-				WMR_INFO(wh,
-				         "User presence: no proximity update for %llu s -- holding '%s'. The "
-				         "companion channel is the dependency here; if it is storming, this "
-				         "feature is effectively frozen, not reporting.",
-				         (unsigned long long)((now_ns - wh->presence.last_update_ns) / U_TIME_1S_IN_NS),
-				         wh->presence.committed ? "WORN" : "NOT WORN");
-			}
-		}
-
-		// TEMPORARY (docs/98, WMR_PRESENCE_DIAG): periodic heartbeat, independent of any
-		// committed transition. This is what tells apart "update_inputs stopped being called
-		// (or stopped evaluating) after BLANK" from "it's still running fine every frame, but
-		// the raw channel above (PRESENCE-DIAG raw packet #N) has gone quiet underneath it" --
-		// compare this log's call count against the raw packet count logged in
-		// control_ipd_value_decode: if calls keep climbing here while the raw packet counter
-		// stalls, the channel died, not the evaluation.
-		if (debug_get_bool_option_wmr_presence_diag() &&
-		    (wh->presence.diag_last_heartbeat_ns == 0 ||
-		     (diag_now_ns - wh->presence.diag_last_heartbeat_ns) >= 2 * U_TIME_1S_IN_NS)) {
-			wh->presence.diag_last_heartbeat_ns = diag_now_ns;
-			WMR_INFO(wh,
-			         "PRESENCE-DIAG heartbeat: update_inputs calls=%llu raw_packets=%llu "
-			         "raw_proximity=%u candidate=%d committed=%d screen_off_by_presence=%d "
-			         "last_packet_age_ms=%llu",
-			         (unsigned long long)wh->presence.diag_update_inputs_calls,
-			         (unsigned long long)wh->presence.diag_proximity_packets_seen, wh->proximity_sensor,
-			         wh->presence.candidate, wh->presence.committed, wh->presence.screen_off_by_presence,
-			         wh->presence.last_update_ns == 0
-			             ? 0ULL
-			             : (unsigned long long)((diag_now_ns - wh->presence.last_update_ns) /
-			                                     U_TIME_1MS_IN_NS));
-		}
-
-		input->value.boolean = wh->presence.committed;
-		input->timestamp = now_ns;
+		input->value.boolean = committed;
+		input->timestamp = os_monotonic_get_ns();
 		break;
 	}
 
@@ -3238,6 +3320,9 @@ wmr_hmd_create(enum wmr_headset_type hmd_type,
 
 	// Populate the base members.
 	wh->base.update_inputs = user_presence_enabled ? wmr_hmd_update_inputs : u_device_noop_update_inputs;
+	// docs/103 (2026-09-06): read by wmr_run_thread to decide whether to call
+	// wmr_hmd_presence_tick() every iteration -- see that call site's own comment.
+	wh->presence_enabled = user_presence_enabled;
 	wh->base.get_tracked_pose = wmr_hmd_get_tracked_pose;
 	wh->base.get_view_poses = u_device_get_view_poses;
 	wh->base.destroy = wmr_hmd_destroy;
@@ -3280,6 +3365,16 @@ wmr_hmd_create(enum wmr_headset_type hmd_type,
 	ret = os_mutex_init(&wh->controller_status_lock);
 	if (ret != 0) {
 		WMR_ERROR(wh, "Failed to init Controller status mutex!");
+		wmr_hmd_destroy(&wh->base);
+		wh = NULL;
+		return;
+	}
+
+	// docs/103 (2026-09-06): guards wh->presence, now decided by wmr_hmd_presence_tick()
+	// on the read thread and read by wmr_hmd_update_inputs() on the OpenXR thread.
+	ret = os_mutex_init(&wh->presence_lock);
+	if (ret != 0) {
+		WMR_ERROR(wh, "Failed to init Presence mutex!");
 		wmr_hmd_destroy(&wh->base);
 		wh = NULL;
 		return;
