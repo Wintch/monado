@@ -142,6 +142,40 @@ DEBUG_GET_ONCE_BOOL_OPTION(wmr_user_presence, "WMR_USER_PRESENCE", false)
 DEBUG_GET_ONCE_NUM_OPTION(wmr_user_presence_don_ms, "WMR_USER_PRESENCE_DON_MS", 250)
 DEBUG_GET_ONCE_NUM_OPTION(wmr_user_presence_doff_ms, "WMR_USER_PRESENCE_DOFF_MS", 1000)
 
+//! Debounce-design gap closed 2026-09-06 (reverb-g2, real auto-standby log from
+//! jack-in-wayland.log with the headset resting untouched on the desk -- see docs/103's
+//! 2026-09-06 addendum for the full trace): WMR_USER_PRESENCE_DON_MS is measured as wall-
+//! clock time since the raw candidate value last CHANGED, not as a count of how many times
+//! it has been independently REPORTED. wmr_hmd_presence_tick() runs on every iteration of
+//! the read thread -- measured at ~250 Hz from that same log's own PRESENCE-DIAG heartbeat
+//! call-counter deltas (~506 calls per ~2s heartbeat interval), consistent with this
+//! driver's 1000 Hz IMU_FREQUENCY split into IMU_SAMPLES_PER_PACKET=4-sample packets --
+//! but the companion's proximity packet itself arrives irregularly (2 s to 100+ s apart in
+//! the same log) -- every tick between two real packets just re-reads the same static
+//! wh->proximity_sensor byte. So a SINGLE stray/noisy packet that
+//! flips the byte to "worn" satisfies the whole DON_MS window in a fraction of a second of
+//! wall time with zero corroborating evidence, and gets committed WORN -- observed live 4
+//! times in one session, each one undoing a real auto-standby blank within seconds of a
+//! headset nobody had touched.
+//!
+//! This requires at least this many INDEPENDENT proximity packets (tracked by
+//! presence.candidate_confirm_count, reset whenever the raw candidate value changes,
+//! incremented only when presence.last_update_ns advances -- i.e. a genuinely new packet
+//! arrived, not just another tick of the same stale byte) to agree with the candidate
+//! value before it is allowed to commit WORN, IN ADDITION to (not instead of) the existing
+//! WMR_USER_PRESENCE_DON_MS wall-clock hold -- both must be satisfied. 1 disables this
+//! (falls back to the pre-fix, time-only behavior); the option is a floor, so anything less
+//! than 1 is treated as 1.
+//!
+//! Deliberately NOT applied to the NOT-WORN direction (WMR_USER_PRESENCE_DOFF_MS): every
+//! NOT WORN commit in the same captured log was also a single packet, but the log never
+//! contains a genuine WORN stretch (the headset was never actually touched in it), so there
+//! is no live evidence either way of a matching noise-flip-to-0-while-worn failure mode --
+//! and the existing "worn costs more evidence than not-worn" asymmetry (see the presence
+//! struct's comment in wmr_hmd.h) already argues for leaving that direction alone absent
+//! proof it needs the same treatment. Tighten it too if a live test proves otherwise.
+DEBUG_GET_ONCE_NUM_OPTION(wmr_user_presence_don_confirm_packets, "WMR_USER_PRESENCE_DON_CONFIRM_PACKETS", 2)
+
 //! Auto-standby (reverb-g2, 2026-09-04): blank the panel after this many ms continuously
 //! committed NOT WORN, using the same screen_enable_func this driver already calls at
 //! activation/reconnect (wmr_hmd_activate_reverb) and already exposes as a manual monado-gui
@@ -3135,10 +3169,25 @@ wmr_hmd_presence_tick(struct wmr_hmd *wh)
 	 * gesture, so a candidate state has to hold for its window before it is committed.
 	 * Windows are asymmetric: see the struct comment in wmr_hmd.h for why leaving
 	 * "worn" deliberately costs more evidence than entering it.
+	 *
+	 * 2026-09-06 (docs/103 addendum): also tracks candidate_confirm_count, independently
+	 * of candidate_since_ns -- see WMR_USER_PRESENCE_DON_CONFIRM_PACKETS' own comment for
+	 * the bug this closes (a single stray packet was enough to satisfy the wall-clock
+	 * window above with zero corroborating evidence). The packet that flips the candidate
+	 * is confirmation #1; a later tick only adds another confirmation if a genuinely NEW
+	 * packet arrived since the last one counted (wh->presence.last_update_ns advancing) --
+	 * otherwise this function is just re-running on the same still-unconfirmed byte at
+	 * ~250 Hz (measured, see the debug option's own comment above), which must NOT count
+	 * as repeated evidence.
 	 */
 	if (raw_worn != wh->presence.candidate) {
 		wh->presence.candidate = raw_worn;
 		wh->presence.candidate_since_ns = now_ns;
+		wh->presence.candidate_confirm_count = 1;
+		wh->presence.candidate_last_counted_update_ns = wh->presence.last_update_ns;
+	} else if (wh->presence.last_update_ns != wh->presence.candidate_last_counted_update_ns) {
+		wh->presence.candidate_confirm_count++;
+		wh->presence.candidate_last_counted_update_ns = wh->presence.last_update_ns;
 	}
 
 	if (wh->presence.candidate != wh->presence.committed) {
@@ -3147,11 +3196,28 @@ wmr_hmd_presence_tick(struct wmr_hmd *wh)
 		                                    ? debug_get_num_option_wmr_user_presence_don_ms()
 		                                    : debug_get_num_option_wmr_user_presence_doff_ms());
 		uint64_t held_ns = now_ns - wh->presence.candidate_since_ns;
-		if (held_ns >= window_ms * U_TIME_1MS_IN_NS) {
+		bool time_ok = held_ns >= window_ms * U_TIME_1MS_IN_NS;
+
+		// WMR_USER_PRESENCE_DON_CONFIRM_PACKETS (docs/103, 2026-09-06): only gates
+		// entering WORN -- see that option's own comment for why NOT WORN is left as
+		// pure wall-clock. A value below 1 is nonsensical (nothing commits without at
+		// least the one packet that created the candidate in the first place) so it is
+		// floored to 1 here rather than trusted verbatim from the env var.
+		bool confirm_ok = true;
+		if (wh->presence.candidate) {
+			long need_raw = debug_get_num_option_wmr_user_presence_don_confirm_packets();
+			uint64_t need = need_raw < 1 ? 1 : (uint64_t)need_raw;
+			confirm_ok = wh->presence.candidate_confirm_count >= need;
+		}
+
+		if (time_ok && confirm_ok) {
 			wh->presence.committed = wh->presence.candidate;
-			WMR_INFO(wh, "User presence: %s (raw proximity sensor value %u, held %llu ms)",
+			WMR_INFO(wh,
+			         "User presence: %s (raw proximity sensor value %u, held %llu ms, "
+			         "%llu confirming packet(s))",
 			         wh->presence.committed ? "WORN" : "NOT WORN", wh->proximity_sensor,
-			         (unsigned long long)(held_ns / U_TIME_1MS_IN_NS));
+			         (unsigned long long)(held_ns / U_TIME_1MS_IN_NS),
+			         (unsigned long long)wh->presence.candidate_confirm_count);
 		}
 	}
 

@@ -216,6 +216,19 @@ struct wmr_hmd
 	 * reasoning the T224 session recorded for the channel-death case: this feature rides the
 	 * companion device, the least reliable channel in the stack, and it must always fail
 	 * TOWARD "worn", never toward "absent".
+	 *
+	 * 2026-09-06 addendum (docs/103): that "cheap to get wrong" assumption turned out to
+	 * hide a real bug once auto-standby started acting on `committed`, not just an OpenXR
+	 * app's pause state -- a spurious WORN commit doesn't just look invisible, it actively
+	 * UNDOES a real auto-standby blank. A single stray packet was enough: this function
+	 * runs far faster (~250 Hz, measured -- see WMR_USER_PRESENCE_DON_CONFIRM_PACKETS' own
+	 * comment in wmr_hmd.c for the derivation) than the companion's own packets arrive
+	 * (irregularly, 2 s to 100+ s apart live-measured), so WMR_USER_PRESENCE_DON_MS's
+	 * wall-clock window was being satisfied by one unconfirmed byte, not by anything
+	 * actually re-observed. Fixed with WMR_USER_PRESENCE_DON_CONFIRM_PACKETS (see that
+	 * option's own comment and the two
+	 * candidate_confirm_count* fields below) -- entering "worn" is still cheaper than
+	 * leaving it, just no longer cheap enough to be satisfied by noise alone.
 	 */
 	struct
 	{
@@ -224,6 +237,26 @@ struct wmr_hmd
 		//! Candidate state waiting out its debounce window, and when it first appeared.
 		bool candidate;
 		uint64_t candidate_since_ns;
+		//! WMR_USER_PRESENCE_DON_CONFIRM_PACKETS (2026-09-06, docs/103 addendum): number of
+		//! independent proximity packets that have reported the CURRENT candidate value,
+		//! reset to 1 whenever the candidate flips (the packet that caused the flip is the
+		//! first confirmation) and incremented only when a genuinely NEW packet re-confirms
+		//! the same value -- see candidate_last_counted_update_ns just below for how "new"
+		//! is detected. This exists because wmr_hmd_presence_tick() runs at the read
+		//! thread's full ~750 Hz rate while the companion's own packets arrive irregularly
+		//! (2 s to 100+ s apart, live-measured): without this counter, a single stray
+		//! packet satisfies WMR_USER_PRESENCE_DON_MS's wall-clock window all by itself,
+		//! because every tick in between just re-reads the same static, unconfirmed byte.
+		//! Only consulted for the WORN direction -- see the debug option's own comment for
+		//! why NOT WORN is left alone.
+		uint64_t candidate_confirm_count;
+		//! The presence.last_update_ns value already counted into candidate_confirm_count.
+		//! A tick where wh->presence.last_update_ns still equals this is just this
+		//! function re-running on the same already-counted packet (or no packet ever
+		//! arrived yet) -- NOT a new confirmation. Only when last_update_ns has advanced
+		//! past this did a genuinely new packet arrive since the last count, which is what
+		//! actually re-confirms the candidate value independently.
+		uint64_t candidate_last_counted_update_ns;
 		//! When the companion last delivered a proximity value at all. 0 = never.
 		uint64_t last_update_ns;
 		//! Throttle for the stale-channel notice.
