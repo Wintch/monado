@@ -54,6 +54,13 @@ struct wmr_headset_descriptor
 	int (*init_func)(struct wmr_hmd *wh);
 	void (*deinit_func)(struct wmr_hmd *wh);
 	void (*screen_enable_func)(struct wmr_hmd *wh, bool enable);
+	//! Optional. Re-sends the family-specific "wake up the companion channel" handshake
+	//! (the 0x50 loop + identification reads init_func already does at cold activation)
+	//! without touching hmd_screen_enable state. docs/103 (2026-09-06): proven live that
+	//! this, not screen_enable_func alone, is what makes the companion answer with a fresh
+	//! proximity reading after auto-standby has blanked it -- screen_enable_func by itself
+	//! never did. NULL on families that don't need/have this quirk (e.g. Odyssey+).
+	void (*reassert_func)(struct wmr_hmd *wh);
 };
 
 /*!
@@ -219,6 +226,13 @@ struct wmr_hmd
 		//! True once this NOT-WORN stretch has already blanked the panel via
 		//! screen_enable_func, so update_inputs doesn't re-call it every frame.
 		bool screen_off_by_presence;
+		//! Monotonic time of the last reassert_func call made while blanked (0 = none yet
+		//! this blanked stretch). docs/103 (2026-09-06): a single reassert at blank time
+		//! measurably "wakes" the companion channel, but the effect decays -- live-tested,
+		//! a real don ~100s after a one-shot reassert produced zero new packets, same as
+		//! having no reassert at all. This drives a periodic re-arm instead of a one-shot;
+		//! see WMR_PRESENCE_REASSERT_INTERVAL_MS in wmr_hmd_update_inputs().
+		uint64_t last_reassert_ns;
 
 		/*
 		 * TEMPORARY diagnostic counters for docs/98 (reverb-g2, 2026-09-05): auto-standby

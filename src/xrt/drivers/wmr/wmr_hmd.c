@@ -181,6 +181,10 @@ static void
 wmr_hmd_deactivate_reverb(struct wmr_hmd *wh);
 static void
 wmr_hmd_screen_enable_reverb(struct wmr_hmd *wh, bool enable);
+static void
+wmr_hmd_reassert_reverb(struct wmr_hmd *wh);
+static void
+wmr_hmd_reassert_reverb_fresh_fd(struct wmr_hmd *wh);
 static int
 wmr_hmd_activate_odyssey_plus(struct wmr_hmd *wh);
 static void
@@ -189,22 +193,23 @@ static void
 wmr_hmd_screen_enable_odyssey_plus(struct wmr_hmd *wh, bool enable);
 
 const struct wmr_headset_descriptor headset_map[] = {
-    {WMR_HEADSET_GENERIC, NULL, "Unknown WMR HMD", NULL, NULL, NULL}, /* Catch-all for unknown headsets */
-    {WMR_HEADSET_HP_VR1000, "HP Reverb VR Headset VR1000-1xxx", "HP VR1000", NULL, NULL, NULL}, /*! @todo init funcs */
+    {WMR_HEADSET_GENERIC, NULL, "Unknown WMR HMD", NULL, NULL, NULL, NULL}, /* Catch-all for unknown headsets */
+    {WMR_HEADSET_HP_VR1000, "HP Reverb VR Headset VR1000-1xxx", "HP VR1000", NULL, NULL, NULL,
+     NULL}, /*! @todo init funcs */
     {WMR_HEADSET_REVERB_G1, "HP Reverb VR Headset VR1000-2xxx", "HP Reverb", wmr_hmd_activate_reverb,
-     wmr_hmd_deactivate_reverb, wmr_hmd_screen_enable_reverb},
+     wmr_hmd_deactivate_reverb, wmr_hmd_screen_enable_reverb, wmr_hmd_reassert_reverb_fresh_fd},
     {WMR_HEADSET_REVERB_G2, "HP Reverb Virtual Reality Headset G2", "HP Reverb G2", wmr_hmd_activate_reverb,
-     wmr_hmd_deactivate_reverb, wmr_hmd_screen_enable_reverb},
+     wmr_hmd_deactivate_reverb, wmr_hmd_screen_enable_reverb, wmr_hmd_reassert_reverb_fresh_fd},
     {WMR_HEADSET_SAMSUNG_XE700X3AI, "Samsung Windows Mixed Reality XE700X3AI", "Samsung Odyssey",
-     wmr_hmd_activate_odyssey_plus, wmr_hmd_deactivate_odyssey_plus, wmr_hmd_screen_enable_odyssey_plus},
+     wmr_hmd_activate_odyssey_plus, wmr_hmd_deactivate_odyssey_plus, wmr_hmd_screen_enable_odyssey_plus, NULL},
     {WMR_HEADSET_SAMSUNG_800ZAA, "Samsung Windows Mixed Reality 800ZAA", "Samsung Odyssey+",
-     wmr_hmd_activate_odyssey_plus, wmr_hmd_deactivate_odyssey_plus, wmr_hmd_screen_enable_odyssey_plus},
-    {WMR_HEADSET_LENOVO_EXPLORER, "Lenovo VR-2511N", "Lenovo Explorer", NULL, NULL, NULL},
-    {WMR_HEADSET_MEDION_ERAZER_X1000, "Medion Erazer X1000", "Medion Erazer", NULL, NULL, NULL},
-    {WMR_HEADSET_DELL_VISOR, "DELL VR118", "Dell Visor", NULL, NULL, NULL},
-    {WMR_HEADSET_ACER_AH100, "Acer", "AH100", NULL, NULL, NULL},
-    {WMR_HEADSET_ACER_AH101, "Acer", "AH101", NULL, NULL, NULL},
-    {WMR_HEADSET_FUJITSU_FMVHDS1, "Fujitsu", "Fujitsu FMVHDS1", NULL, NULL, NULL},
+     wmr_hmd_activate_odyssey_plus, wmr_hmd_deactivate_odyssey_plus, wmr_hmd_screen_enable_odyssey_plus, NULL},
+    {WMR_HEADSET_LENOVO_EXPLORER, "Lenovo VR-2511N", "Lenovo Explorer", NULL, NULL, NULL, NULL},
+    {WMR_HEADSET_MEDION_ERAZER_X1000, "Medion Erazer X1000", "Medion Erazer", NULL, NULL, NULL, NULL},
+    {WMR_HEADSET_DELL_VISOR, "DELL VR118", "Dell Visor", NULL, NULL, NULL, NULL},
+    {WMR_HEADSET_ACER_AH100, "Acer", "AH100", NULL, NULL, NULL, NULL},
+    {WMR_HEADSET_ACER_AH101, "Acer", "AH101", NULL, NULL, NULL, NULL},
+    {WMR_HEADSET_FUJITSU_FMVHDS1, "Fujitsu", "Fujitsu FMVHDS1", NULL, NULL, NULL, NULL},
 };
 const int headset_map_n = sizeof(headset_map) / sizeof(headset_map[0]);
 
@@ -1402,13 +1407,10 @@ hololens_sensors_enable_imu(struct wmr_hmd *wh)
 		}                                                                                                      \
 	} while (false);
 
-static int
-wmr_hmd_activate_reverb(struct wmr_hmd *wh)
+static void
+wmr_hmd_reassert_reverb(struct wmr_hmd *wh)
 {
 	DRV_TRACE_MARKER();
-
-
-	WMR_TRACE(wh, "Activating HP Reverb G1/G2 HMD...");
 
 	// Hack to power up the Reverb G1 display, thanks to OpenHMD contributors.
 	// Sleep before we start seems to improve reliability.
@@ -1435,6 +1437,90 @@ wmr_hmd_activate_reverb(struct wmr_hmd *wh)
 	HID_GET(wh, wh->hid_control_dev, data, "data_3");
 
 	WMR_INFO(wh, "Sent activation report.");
+}
+
+/*!
+ * Full replica of scripts/panel.py's `activate()`, byte for byte: the 0x50 handshake, the
+ * identification reads, AND the trailing screen-on command, all sent over one brand-new
+ * hidraw file descriptor that is opened just for this call and closed again at the end --
+ * never wh->hid_control_dev, and no wh->hid_lock (a separate fd needs no serialization with
+ * it, and taking the lock anyway would reintroduce the contention this avoids).
+ *
+ * docs/103 (2026-09-06): getting here took 5 failed live attempts. Neither the shared-handle
+ * version, its periodic re-arm, nor an earlier draft of THIS fresh-fd version (same handshake
+ * and reads, but closing the fd without ever sending the screen-on command -- that job was
+ * left to the driver's ordinary screen_enable_func, on a different handle, at a different
+ * time) reproduced the "wake the companion channel" effect that scripts/panel.py's `activate`
+ * got 2/2 manually. Byte-for-byte comparison against panel.py's own printed output confirmed
+ * every read up to that point was already identical, real device data -- the screen-on send
+ * on the SAME fd, before closing it, was the one remaining structural difference. Sending it
+ * here means every periodic re-arm (see wmr_hmd_update_inputs) briefly flashes the HP logo
+ * while blanked; confirmed live to be a brief flash, not a sustained lit panel, since
+ * wh->hmd_screen_enable/screen_off_by_presence are untouched by this fd and still say "off".
+ * Live-validated 2026-09-06: 2 full automatic blank -> WORN -> restore -> NOT WORN cycles, no
+ * manual intervention.
+ */
+static void
+wmr_hmd_reassert_reverb_fresh_fd(struct wmr_hmd *wh)
+{
+	DRV_TRACE_MARKER();
+
+	char path[PATH_MAX];
+	if (!companion_find_hidraw_path(wh, path, sizeof(path))) {
+		WMR_WARN(wh, "reassert (fresh fd): companion hidraw node not found");
+		return;
+	}
+
+	struct os_hid_device *fresh = NULL;
+	int ret = os_hid_open_hidraw(path, &fresh);
+	if (ret != 0 || fresh == NULL) {
+		WMR_WARN(wh, "reassert (fresh fd): open(%s) failed: %i (%s)", path, ret,
+		         strerror(ret < 0 ? -ret : ret));
+		return;
+	}
+
+	os_nanosleep(U_TIME_1MS_IN_NS * 300);
+
+	for (int i = 0; i < 4; i++) {
+		unsigned char cmd[64] = {0x50, 0x01};
+		if (os_hid_set_feature(fresh, cmd, sizeof(cmd)) < 0) {
+			WMR_ERROR(wh, "reassert (fresh fd): send (loop) failed");
+		}
+
+		unsigned char data[64] = {0x50};
+		if (os_hid_get_feature(fresh, data[0], data, sizeof(data)) < 0) {
+			WMR_ERROR(wh, "reassert (fresh fd): get (loop) failed");
+		}
+
+		os_nanosleep(U_TIME_1MS_IN_NS * 10);
+	}
+
+	unsigned char data[64] = {0x09};
+	os_hid_get_feature(fresh, data[0], data, sizeof(data));
+	data[0] = 0x08;
+	os_hid_get_feature(fresh, data[0], data, sizeof(data));
+	data[0] = 0x06;
+	os_hid_get_feature(fresh, data[0], data, sizeof(data));
+
+	unsigned char screen_on[2] = {0x04, 0x01};
+	if (os_hid_set_feature(fresh, screen_on, sizeof(screen_on)) < 0) {
+		WMR_ERROR(wh, "reassert (fresh fd): screen-on failed");
+	}
+
+	os_hid_destroy(fresh);
+
+	WMR_INFO(wh, "Sent activation report (fresh fd).");
+}
+
+static int
+wmr_hmd_activate_reverb(struct wmr_hmd *wh)
+{
+	DRV_TRACE_MARKER();
+
+
+	WMR_TRACE(wh, "Activating HP Reverb G1/G2 HMD...");
+
+	wmr_hmd_reassert_reverb(wh);
 
 	// Enable the HMD screen now, if required. Otherwise, if screen should initially be disabled, then
 	// proactively disable it now. Why? Because some cases of irregular termination of Monado will
@@ -3013,8 +3099,57 @@ wmr_hmd_update_inputs(struct xrt_device *xdev)
 					wh->hmd_desc->screen_enable_func(wh, false);
 				}
 				wh->presence.screen_off_by_presence = true;
+				wh->presence.last_reassert_ns = 0;
 				WMR_INFO(wh, "User presence: panel blanked by auto-standby (%llu ms NOT WORN)",
 				         (unsigned long long)screenoff_ms);
+			}
+
+			// docs/103 (2026-09-06): presence RESTORE never fired, live, until this. Two
+			// bugs had to be found and fixed in turn, each confirmed by a live test before
+			// moving to the next:
+			//  1. Reasserting only in the RESTORE branch above (gated on
+			//     wh->presence.committed) was dead code -- committed can only become true
+			//     from a fresh companion packet, and the bug IS that no fresh packet
+			//     arrives once blanked. Moved to a one-shot right here at the blank
+			//     transition instead.
+			//  2. A one-shot's "wake" measurably decays: a real don ~100s after it produced
+			//     zero new packets, same as no reassert at all. Fixed by re-arming
+			//     periodically for as long as the panel stays blanked, not just once.
+			// reassert_func for the Reverb family (wmr_hmd_reassert_reverb_fresh_fd) is a
+			// full replica of scripts/panel.py's proven-working `activate()`, over its own
+			// fresh hidraw fd -- see that function's own comment for why a THIRD bug (the
+			// shared-handle version's ~4s hid_lock contention with this thread's own IMU
+			// reads, and a missing screen-on send on the same fd) needed fixing before this
+			// worked automatically. Live-validated 2026-09-06: 2 full automatic
+			// blank -> WORN -> restore -> NOT WORN cycles, no manual intervention, each
+			// reassert call ~368ms (not ~4s -- that cost was the shared-handle bug, now
+			// gone). Opt out with WMR_PRESENCE_RESTORE_REASSERT=0 if a rig disagrees;
+			// interval defaults to 15s (WMR_PRESENCE_REASSERT_INTERVAL_MS), untuned. Only
+			// runs while genuinely NOT WORN, so no wearer ever perceives the stall, but it
+			// does briefly flash the HP logo every interval while blanked (see
+			// wmr_hmd_reassert_reverb_fresh_fd) -- a known, accepted tradeoff, not a bug.
+			if (wh->presence.screen_off_by_presence) {
+				static int restore_reassert = -1;
+				if (restore_reassert == -1) {
+					const char *env = getenv("WMR_PRESENCE_RESTORE_REASSERT");
+					restore_reassert = (env == NULL || env[0] != '0');
+				}
+				static int64_t reassert_interval_ms = -1;
+				if (reassert_interval_ms == -1) {
+					const char *env = getenv("WMR_PRESENCE_REASSERT_INTERVAL_MS");
+					reassert_interval_ms = (env != NULL && atoi(env) > 0) ? atoi(env) : 15000;
+				}
+				bool due = wh->presence.last_reassert_ns == 0 ||
+				           (now_ns - wh->presence.last_reassert_ns) >=
+				               (uint64_t)reassert_interval_ms * U_TIME_1MS_IN_NS;
+				if (restore_reassert && due && wh->hmd_desc != NULL &&
+				    wh->hmd_desc->reassert_func != NULL) {
+					int64_t ra0 = os_monotonic_get_ns();
+					wh->hmd_desc->reassert_func(wh);
+					WMR_INFO(wh, "presence auto-standby: reassert took %.1f ms",
+					         (double)(os_monotonic_get_ns() - ra0) / 1e6);
+					wh->presence.last_reassert_ns = now_ns;
+				}
 			}
 		}
 
