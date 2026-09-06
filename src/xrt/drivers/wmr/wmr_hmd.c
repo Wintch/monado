@@ -3295,9 +3295,25 @@ wmr_hmd_presence_tick(struct wmr_hmd *wh)
 		// reassert call ~368ms (not ~4s -- that cost was the shared-handle bug, now
 		// gone). Opt out with WMR_PRESENCE_RESTORE_REASSERT=0 if a rig disagrees;
 		// interval defaults to 15s (WMR_PRESENCE_REASSERT_INTERVAL_MS), untuned. Only
-		// runs while genuinely NOT WORN, so no wearer ever perceives the stall, but it
-		// does briefly flash the HP logo every interval while blanked (see
-		// wmr_hmd_reassert_reverb_fresh_fd) -- a known, accepted tradeoff, not a bug.
+		// runs while genuinely NOT WORN, so no wearer ever perceives the stall.
+		//
+		// 2026-09-06 (live-caught, later still): this comment used to claim the periodic
+		// poke only "briefly flashes the HP logo" while leaving the panel off, reasoning
+		// from wh->presence.screen_off_by_presence staying untouched by reassert_func's
+		// own fd. That conflated the SOFTWARE bookkeeping flag with the PHYSICAL panel
+		// state: the flag says "off" the whole time, but reassert_func's own last HID
+		// send is a real {0x04,0x01} screen-ON (its own comment: the screen-on send is
+		// structurally required to reproduce the "wake the companion channel" effect,
+		// not optional). Nothing sent screen-off again afterward, so every periodic poke
+		// left the real backlight ON for the rest of the NOT-WORN period -- not a brief
+		// flash, a sustained relight, live-confirmed with a real OpenXR client actively
+		// rendering (the exact "always on, always with video" symptom this whole
+		// investigation was chasing -- a proximity-packet-noise bug fixed earlier the
+		// same day was real but secondary; this is why the panel stayed lit even with
+		// that fix in place and zero noisy packets involved). Fix: immediately re-blank
+		// over the same fresh-fd screen-off path auto-standby's own blank transition
+		// uses, right after the wake, so the "wake the channel" side effect becomes the
+		// brief flash this comment always intended instead of a sustained relight.
 		// 2026-09-06 addendum: this reassert call (~368ms) now runs on the SAME thread
 		// that also does control_read_packets/hololens_sensors_read_packets every
 		// iteration -- unlike the old client-gated version, there's no game/compositor
@@ -3324,6 +3340,11 @@ wmr_hmd_presence_tick(struct wmr_hmd *wh)
 				wh->hmd_desc->reassert_func(wh);
 				WMR_INFO(wh, "presence auto-standby: reassert took %.1f ms",
 				         (double)(os_monotonic_get_ns() - ra0) / 1e6);
+				if (wh->hmd_desc != NULL && wh->hmd_desc->screen_off_fresh_fd_func != NULL) {
+					wh->hmd_desc->screen_off_fresh_fd_func(wh);
+				} else if (wh->hmd_desc != NULL && wh->hmd_desc->screen_enable_func != NULL) {
+					wh->hmd_desc->screen_enable_func(wh, false);
+				}
 				wh->presence.last_reassert_ns = now_ns;
 			}
 		}
