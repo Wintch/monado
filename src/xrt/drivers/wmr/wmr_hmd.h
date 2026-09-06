@@ -61,6 +61,15 @@ struct wmr_headset_descriptor
 	//! proximity reading after auto-standby has blanked it -- screen_enable_func by itself
 	//! never did. NULL on families that don't need/have this quirk (e.g. Odyssey+).
 	void (*reassert_func)(struct wmr_hmd *wh);
+	//! Optional. Same motivation as reassert_func, opposite direction: sends the
+	//! family-specific screen-OFF command over a brand-new hidraw fd instead of
+	//! wh->hid_control_dev. docs/103 (2026-09-06): auto-standby's blank call was still
+	//! using the shared-handle screen_enable_func(wh, false) -- the exact handle already
+	//! proven unreliable for restore -- and live-caught leaving the panel lit, with real
+	//! video still showing, after "panel blanked by auto-standby" had already logged.
+	//! NULL on families that don't need/have this quirk (e.g. Odyssey+), same as
+	//! reassert_func.
+	void (*screen_off_fresh_fd_func)(struct wmr_hmd *wh);
 };
 
 /*!

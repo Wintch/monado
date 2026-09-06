@@ -185,6 +185,8 @@ static void
 wmr_hmd_reassert_reverb(struct wmr_hmd *wh);
 static void
 wmr_hmd_reassert_reverb_fresh_fd(struct wmr_hmd *wh);
+static void
+wmr_hmd_screen_off_reverb_fresh_fd(struct wmr_hmd *wh);
 //! docs/103 (2026-09-06, "always evaluate" fix): the presence debounce/commit/blank/
 //! restore/reassert decision, called every iteration of wmr_run_thread (client-
 //! independent) instead of only from wmr_hmd_update_inputs (client-gated). Forward-
@@ -200,23 +202,25 @@ static void
 wmr_hmd_screen_enable_odyssey_plus(struct wmr_hmd *wh, bool enable);
 
 const struct wmr_headset_descriptor headset_map[] = {
-    {WMR_HEADSET_GENERIC, NULL, "Unknown WMR HMD", NULL, NULL, NULL, NULL}, /* Catch-all for unknown headsets */
-    {WMR_HEADSET_HP_VR1000, "HP Reverb VR Headset VR1000-1xxx", "HP VR1000", NULL, NULL, NULL,
+    {WMR_HEADSET_GENERIC, NULL, "Unknown WMR HMD", NULL, NULL, NULL, NULL, NULL}, /* Catch-all for unknown headsets */
+    {WMR_HEADSET_HP_VR1000, "HP Reverb VR Headset VR1000-1xxx", "HP VR1000", NULL, NULL, NULL, NULL,
      NULL}, /*! @todo init funcs */
     {WMR_HEADSET_REVERB_G1, "HP Reverb VR Headset VR1000-2xxx", "HP Reverb", wmr_hmd_activate_reverb,
-     wmr_hmd_deactivate_reverb, wmr_hmd_screen_enable_reverb, wmr_hmd_reassert_reverb_fresh_fd},
+     wmr_hmd_deactivate_reverb, wmr_hmd_screen_enable_reverb, wmr_hmd_reassert_reverb_fresh_fd,
+     wmr_hmd_screen_off_reverb_fresh_fd},
     {WMR_HEADSET_REVERB_G2, "HP Reverb Virtual Reality Headset G2", "HP Reverb G2", wmr_hmd_activate_reverb,
-     wmr_hmd_deactivate_reverb, wmr_hmd_screen_enable_reverb, wmr_hmd_reassert_reverb_fresh_fd},
+     wmr_hmd_deactivate_reverb, wmr_hmd_screen_enable_reverb, wmr_hmd_reassert_reverb_fresh_fd,
+     wmr_hmd_screen_off_reverb_fresh_fd},
     {WMR_HEADSET_SAMSUNG_XE700X3AI, "Samsung Windows Mixed Reality XE700X3AI", "Samsung Odyssey",
-     wmr_hmd_activate_odyssey_plus, wmr_hmd_deactivate_odyssey_plus, wmr_hmd_screen_enable_odyssey_plus, NULL},
+     wmr_hmd_activate_odyssey_plus, wmr_hmd_deactivate_odyssey_plus, wmr_hmd_screen_enable_odyssey_plus, NULL, NULL},
     {WMR_HEADSET_SAMSUNG_800ZAA, "Samsung Windows Mixed Reality 800ZAA", "Samsung Odyssey+",
-     wmr_hmd_activate_odyssey_plus, wmr_hmd_deactivate_odyssey_plus, wmr_hmd_screen_enable_odyssey_plus, NULL},
-    {WMR_HEADSET_LENOVO_EXPLORER, "Lenovo VR-2511N", "Lenovo Explorer", NULL, NULL, NULL, NULL},
-    {WMR_HEADSET_MEDION_ERAZER_X1000, "Medion Erazer X1000", "Medion Erazer", NULL, NULL, NULL, NULL},
-    {WMR_HEADSET_DELL_VISOR, "DELL VR118", "Dell Visor", NULL, NULL, NULL, NULL},
-    {WMR_HEADSET_ACER_AH100, "Acer", "AH100", NULL, NULL, NULL, NULL},
-    {WMR_HEADSET_ACER_AH101, "Acer", "AH101", NULL, NULL, NULL, NULL},
-    {WMR_HEADSET_FUJITSU_FMVHDS1, "Fujitsu", "Fujitsu FMVHDS1", NULL, NULL, NULL, NULL},
+     wmr_hmd_activate_odyssey_plus, wmr_hmd_deactivate_odyssey_plus, wmr_hmd_screen_enable_odyssey_plus, NULL, NULL},
+    {WMR_HEADSET_LENOVO_EXPLORER, "Lenovo VR-2511N", "Lenovo Explorer", NULL, NULL, NULL, NULL, NULL},
+    {WMR_HEADSET_MEDION_ERAZER_X1000, "Medion Erazer X1000", "Medion Erazer", NULL, NULL, NULL, NULL, NULL},
+    {WMR_HEADSET_DELL_VISOR, "DELL VR118", "Dell Visor", NULL, NULL, NULL, NULL, NULL},
+    {WMR_HEADSET_ACER_AH100, "Acer", "AH100", NULL, NULL, NULL, NULL, NULL},
+    {WMR_HEADSET_ACER_AH101, "Acer", "AH101", NULL, NULL, NULL, NULL, NULL},
+    {WMR_HEADSET_FUJITSU_FMVHDS1, "Fujitsu", "Fujitsu FMVHDS1", NULL, NULL, NULL, NULL, NULL},
 };
 const int headset_map_n = sizeof(headset_map) / sizeof(headset_map[0]);
 
@@ -1539,6 +1543,47 @@ wmr_hmd_reassert_reverb_fresh_fd(struct wmr_hmd *wh)
 	os_hid_destroy(fresh);
 
 	WMR_INFO(wh, "Sent activation report (fresh fd).");
+}
+
+/*!
+ * Mirror image of wmr_hmd_reassert_reverb_fresh_fd, opposite direction: sends only the
+ * screen-OFF command ({0x04, 0x00}), over its own brand-new hidraw fd, never
+ * wh->hid_control_dev. docs/103 (2026-09-06): auto-standby's blank call was still using
+ * wh->hmd_desc->screen_enable_func(wh, false) on the shared handle when this was added --
+ * the exact handle already proven unreliable for restore earlier the same day. Live-caught:
+ * "panel blanked by auto-standby" logged, HID_SEND reported success, but with a real OpenXR
+ * client actively rendering, the panel stayed fully lit with real video still visible. No
+ * wake handshake is needed here (unlike reassert) -- going to sleep doesn't need to prove
+ * the channel is responsive first, it just needs the one send to land reliably, which is
+ * exactly what the shared handle wasn't doing.
+ */
+static void
+wmr_hmd_screen_off_reverb_fresh_fd(struct wmr_hmd *wh)
+{
+	DRV_TRACE_MARKER();
+
+	char path[PATH_MAX];
+	if (!companion_find_hidraw_path(wh, path, sizeof(path))) {
+		WMR_WARN(wh, "screen-off (fresh fd): companion hidraw node not found");
+		return;
+	}
+
+	struct os_hid_device *fresh = NULL;
+	int ret = os_hid_open_hidraw(path, &fresh);
+	if (ret != 0 || fresh == NULL) {
+		WMR_WARN(wh, "screen-off (fresh fd): open(%s) failed: %i (%s)", path, ret,
+		         strerror(ret < 0 ? -ret : ret));
+		return;
+	}
+
+	unsigned char screen_off[2] = {0x04, 0x00};
+	if (os_hid_set_feature(fresh, screen_off, sizeof(screen_off)) < 0) {
+		WMR_ERROR(wh, "screen-off (fresh fd): send failed");
+	}
+
+	os_hid_destroy(fresh);
+
+	WMR_INFO(wh, "Sent screen-off (fresh fd).");
 }
 
 static int
@@ -3152,7 +3197,9 @@ wmr_hmd_presence_tick(struct wmr_hmd *wh)
 		uint64_t screenoff_ms = (uint64_t)debug_get_num_option_wmr_user_presence_screenoff_ms();
 		if (screenoff_ms > 0 && !wh->presence.screen_off_by_presence &&
 		    (now_ns - wh->presence.not_worn_since_ns) >= screenoff_ms * U_TIME_1MS_IN_NS) {
-			if (wh->hmd_desc != NULL && wh->hmd_desc->screen_enable_func != NULL) {
+			if (wh->hmd_desc != NULL && wh->hmd_desc->screen_off_fresh_fd_func != NULL) {
+				wh->hmd_desc->screen_off_fresh_fd_func(wh);
+			} else if (wh->hmd_desc != NULL && wh->hmd_desc->screen_enable_func != NULL) {
 				wh->hmd_desc->screen_enable_func(wh, false);
 			}
 			wh->presence.screen_off_by_presence = true;
