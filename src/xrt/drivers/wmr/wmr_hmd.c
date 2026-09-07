@@ -357,6 +357,26 @@ DEBUG_GET_ONCE_NUM_OPTION(wmr_user_presence_screenoff_ms, "WMR_USER_PRESENCE_SCR
 //! cost/behavior change when unset. Remove this whole option once RESTORE is root-caused.
 DEBUG_GET_ONCE_BOOL_OPTION(wmr_presence_diag, "WMR_PRESENCE_DIAG", false)
 
+//! docs/103 (2026-09-06, VK_ERROR_UNKNOWN/lease-death bug): master kill switch for the
+//! auto-standby BLANK action's actual hardware effect. Default OFF -- see this option's
+//! full writeup in wmr_hmd_presence_tick()'s auto-standby block for the live evidence,
+//! but the short version: a real, effective panel screen-off, sent ANY time the
+//! compositor has an active DRM lease a client is using to present real content --
+//! confirmed in isolation, a single fresh-fd screen-off with no other action anywhere
+//! near it -- reliably and irrecoverably kills that lease (vk_swapchain_present:
+//! VK_ERROR_UNKNOWN, "Lease has been closed", never recovers for the rest of the
+//! session). This is NOT gated behind WMR_USER_PRESENCE_SCREENOFF_MS itself: that option
+//! (and everything upstream of it -- the WORN/NOT-WORN debounce, motion corroboration,
+//! not_worn_since_ns timing, diagnostics) stays fully live and correct with this option
+//! left at its default, so XR_EXT_user_presence and anything consuming presence.committed
+//! keep working; only the destructive screen_off_fresh_fd_func/screen_enable_func(false)
+//! call -- and, as a direct consequence, the RESTORE/periodic-reassert-while-blanked
+//! paths that only ever run once something has actually blanked -- are skipped. Opt in
+//! only on a rig where the DRM-lease-recovery gap this bug exposes (which lives in the
+//! compositor's lease/swapchain handling, not in this driver) has actually been fixed or
+//! is known not to apply.
+DEBUG_GET_ONCE_BOOL_OPTION(wmr_user_presence_blank_panel, "WMR_USER_PRESENCE_BLANK_PANEL", false)
+
 
 #define WMR_TRACE(d, ...) U_LOG_XDEV_IFL_T(&d->base, d->log_level, __VA_ARGS__)
 #define WMR_DEBUG(d, ...) U_LOG_XDEV_IFL_D(&d->base, d->log_level, __VA_ARGS__)
@@ -2275,8 +2295,20 @@ wmr_hmd_destroy(struct xrt_device *xdev)
 
 	struct wmr_hmd *wh = wmr_hmd(xdev);
 
-	// Destroy the thread object.
+	// Destroy the thread object. os_thread_helper_destroy() stops and joins
+	// wmr_run_thread, so by the time this returns, the only dispatcher of a presence
+	// action thread (wmr_hmd_presence_dispatch_action(), called from
+	// wmr_hmd_presence_tick() on that thread) can no longer fire a NEW one.
 	os_thread_helper_destroy(&wh->oth);
+
+	// docs/103 (2026-09-06, VK_ERROR_UNKNOWN/lease-death bug): with no new dispatch
+	// possible (see just above), this lock/unlock pair is a barrier against the one LAST
+	// already-dispatched presence action thread, if any was still in flight -- see
+	// presence_action_lock's own comment in wmr_hmd.h. Blocks here until that thread has
+	// released the lock (meaning it is done touching wh), only then is it safe to free wh
+	// below.
+	os_mutex_lock(&wh->presence_action_lock);
+	os_mutex_unlock(&wh->presence_action_lock);
 
 	// Disconnect tunnelled controllers
 	os_mutex_lock(&wh->controller_status_lock);
@@ -2317,6 +2349,7 @@ wmr_hmd_destroy(struct xrt_device *xdev)
 	os_mutex_destroy(&wh->fusion.mutex);
 	os_mutex_destroy(&wh->hid_lock);
 	os_mutex_destroy(&wh->presence_lock);
+	os_mutex_destroy(&wh->presence_action_lock);
 
 	u_device_free(&wh->base);
 }
@@ -3275,6 +3308,129 @@ get_compositor_info_wmr(struct xrt_device *xdev,
 }
 
 /*!
+ * docs/103 (2026-09-06, VK_ERROR_UNKNOWN/lease-death bug): arguments for a single
+ * dispatch of wmr_hmd_presence_action_thread() -- see that function and
+ * wh->presence_action_lock's own comment in wmr_hmd.h for the full story. Heap-allocated
+ * by wmr_hmd_presence_tick() and freed by the action thread itself once it is done with
+ * it.
+ */
+struct wmr_hmd_presence_action_args
+{
+	struct wmr_hmd *wh;
+	bool need_restore;
+	bool need_blank;
+	uint64_t blank_screenoff_ms;
+	bool need_periodic_poke;
+};
+
+/*!
+ * Runs on its own short-lived, detached thread -- see wh->presence_action_lock's own
+ * comment in wmr_hmd.h for why this can no longer run on wmr_run_thread. Performs
+ * whichever of restore/blank/periodic-reassert-while-blanked wmr_hmd_presence_tick()
+ * decided were due (the fast, lock-protected part of that decision, including the
+ * corresponding wh->presence.* flag updates, already happened before this thread was
+ * spawned), does the actual blocking HID I/O, logs the same messages the inline version
+ * used to log, then releases presence_action_lock and frees its own argument struct.
+ *
+ * Order matches the original inline code exactly: restore XOR (blank, then an
+ * immediately-due periodic poke can follow in the same tick -- see the blank transition
+ * resetting last_reassert_ns to 0 in wmr_hmd_presence_tick()).
+ */
+static void *
+wmr_hmd_presence_action_thread(void *ptr)
+{
+	struct wmr_hmd_presence_action_args *args = (struct wmr_hmd_presence_action_args *)ptr;
+	struct wmr_hmd *wh = args->wh;
+
+	if (args->need_restore) {
+		if (wh->hmd_desc != NULL && wh->hmd_desc->reassert_func != NULL) {
+			wh->hmd_desc->reassert_func(wh);
+		} else if (wh->hmd_desc != NULL && wh->hmd_desc->screen_enable_func != NULL) {
+			wh->hmd_desc->screen_enable_func(wh, true);
+		}
+		WMR_INFO(wh, "User presence: panel restored from auto-standby");
+	}
+	if (args->need_blank) {
+		if (wh->hmd_desc != NULL && wh->hmd_desc->screen_off_fresh_fd_func != NULL) {
+			wh->hmd_desc->screen_off_fresh_fd_func(wh);
+		} else if (wh->hmd_desc != NULL && wh->hmd_desc->screen_enable_func != NULL) {
+			wh->hmd_desc->screen_enable_func(wh, false);
+		}
+		WMR_INFO(wh, "User presence: panel blanked by auto-standby (%llu ms NOT WORN)",
+		         (unsigned long long)args->blank_screenoff_ms);
+	}
+	if (args->need_periodic_poke) {
+		if (wh->hmd_desc != NULL && wh->hmd_desc->reassert_func != NULL) {
+			int64_t ra0 = os_monotonic_get_ns();
+			wh->hmd_desc->reassert_func(wh);
+			WMR_INFO(wh, "presence auto-standby: reassert took %.1f ms",
+			         (double)(os_monotonic_get_ns() - ra0) / 1e6);
+		}
+		if (wh->hmd_desc != NULL && wh->hmd_desc->screen_off_fresh_fd_func != NULL) {
+			wh->hmd_desc->screen_off_fresh_fd_func(wh);
+		} else if (wh->hmd_desc != NULL && wh->hmd_desc->screen_enable_func != NULL) {
+			wh->hmd_desc->screen_enable_func(wh, false);
+		}
+	}
+
+	free(args);
+	os_mutex_unlock(&wh->presence_action_lock);
+	return NULL;
+}
+
+/*!
+ * docs/103 (2026-09-06, VK_ERROR_UNKNOWN/lease-death bug): dispatches a
+ * wmr_hmd_presence_action_thread() for the action(s) wmr_hmd_presence_tick() just
+ * decided (any combination of need_restore/need_blank/need_periodic_poke; a no-op if all
+ * three are false). See presence_action_lock's own comment in wmr_hmd.h for the full
+ * reasoning and the trylock contract. Called from wmr_run_thread with presence_lock
+ * already released -- this function itself must never block wmr_run_thread either, which
+ * is exactly why it hands off to a new thread instead of just calling the HID functions
+ * here.
+ */
+static void
+wmr_hmd_presence_dispatch_action(struct wmr_hmd *wh,
+                                  bool need_restore,
+                                  bool need_blank,
+                                  uint64_t blank_screenoff_ms,
+                                  bool need_periodic_poke)
+{
+	if (!need_restore && !need_blank && !need_periodic_poke) {
+		return;
+	}
+
+	if (os_mutex_trylock(&wh->presence_action_lock) != 0) {
+		// Extremely rare -- see presence_action_lock's own comment for why. Skipped
+		// cleanly: wh->presence.* was already updated by the caller, so the next tick
+		// or the next periodic interval will simply try again.
+		WMR_WARN(wh, "presence action skipped: a previous one is still in flight");
+		return;
+	}
+
+	struct wmr_hmd_presence_action_args *args = U_TYPED_CALLOC(struct wmr_hmd_presence_action_args);
+	if (args == NULL) {
+		WMR_ERROR(wh, "presence action skipped: allocation failed");
+		os_mutex_unlock(&wh->presence_action_lock);
+		return;
+	}
+	args->wh = wh;
+	args->need_restore = need_restore;
+	args->need_blank = need_blank;
+	args->blank_screenoff_ms = blank_screenoff_ms;
+	args->need_periodic_poke = need_periodic_poke;
+
+	pthread_t thread;
+	int ret = pthread_create(&thread, NULL, wmr_hmd_presence_action_thread, args);
+	if (ret != 0) {
+		WMR_ERROR(wh, "presence action skipped: pthread_create failed: %i", ret);
+		free(args);
+		os_mutex_unlock(&wh->presence_action_lock);
+		return;
+	}
+	pthread_detach(thread);
+}
+
+/*!
  * The presence debounce/commit/blank/restore/reassert decision. docs/103 (2026-09-06,
  * "always evaluate" fix): this used to be inline in wmr_hmd_update_inputs(), which is
  * ONLY called by the OpenXR runtime while a client has an active frame-synced session --
@@ -3524,6 +3680,21 @@ wmr_hmd_presence_tick(struct wmr_hmd *wh)
 	 * so it inherits the same debounced, fail-toward-worn guarantee the presence
 	 * feature already has -- a flicker never blanks the screen, only a real doff does.
 	 *
+	 * docs/103 (2026-09-06, VK_ERROR_UNKNOWN/lease-death bug): the ACTUAL blank action
+	 * below (need_blank) additionally requires WMR_USER_PRESENCE_BLANK_PANEL, default
+	 * off -- see that option's own comment a bit further up. Root-caused live: a real,
+	 * effective panel screen-off, any time the compositor has an active DRM lease a
+	 * client is using to present real content, reliably and irrecoverably kills that
+	 * lease. Proven in isolation (WMR_PRESENCE_RESTORE_REASSERT=0, so nothing else fired
+	 * anywhere near it): a single fresh-fd screen-off, alone, was enough --
+	 * vk_swapchain_present: VK_ERROR_UNKNOWN + "Lease has been closed" the moment the
+	 * next real session began, exactly the reported symptom, exactly reproduced this way
+	 * whether the blank landed before, immediately after, or 55+ seconds into an already
+	 * fully established session. Everything ABOVE this comment -- WORN/NOT-WORN
+	 * debounce, motion corroboration, not_worn_since_ns timing, XR_EXT_user_presence's
+	 * committed value -- is unaffected by the kill switch and stays exactly as tonight's
+	 * work left it; only the destructive hardware action is now opt-in.
+	 *
 	 * docs/103 (2026-09-06, later same day as the presence_tick threading refactor):
 	 * restore used to call screen_enable_func(wh, true) directly here, on the shared
 	 * wh->hid_control_dev handle -- the very handle this whole investigation already
@@ -3541,33 +3712,79 @@ wmr_hmd_presence_tick(struct wmr_hmd *wh)
 	 * the one call that actually matters to the wearer. Falls back to the bare
 	 * screen_enable_func only if a family has no reassert_func (e.g. Odyssey+).
 	 */
+	// docs/103 (2026-09-06, VK_ERROR_UNKNOWN/lease-death bug): the three actions below
+	// (restore, blank, periodic re-arm-while-blanked) each end in a ~370ms *blocking* HID
+	// transaction (open a fresh hidraw fd, handshake, several feature reports -- see
+	// wmr_hmd_reassert_reverb_fresh_fd/wmr_hmd_screen_off_reverb_fresh_fd's own comments).
+	// Until now, ALL of them ran while presence_lock was still held (the lock is taken at
+	// the top of this function and released at the very end). That was harmless before
+	// 754beed30, when this whole decision only ran from inside wmr_hmd_update_inputs()
+	// itself -- a single thread doing its own slow work, nothing else waiting on it. Once
+	// the decision moved to this always-on read thread, presence_lock became a genuine
+	// cross-thread handoff: wmr_hmd_update_inputs() takes the SAME lock, and -- confirmed
+	// by reading oxr_session.c -- one of its two call sites runs synchronously inside
+	// xrBeginSession() handling, on the IPC server's real-time "Multi Client Module"
+	// thread, exactly once per session, at the exact moment compositor_begin_session()
+	// fires. Bisected + root-caused live 2026-09-06: if this thread's blank/reassert
+	// happens to be in flight (holding presence_lock for its ~370ms of HID I/O) at that
+	// one moment, wmr_hmd_update_inputs() -- and with it, the real-time thread driving the
+	// compositor's first-ever frame pacing/present for this session -- blocks for up to
+	// ~370ms. That single stall was enough to desync the "Fake pacer" frame-time predictor
+	// badly enough to produce vk_swapchain_present: VK_ERROR_UNKNOWN followed immediately
+	// by "Lease has been closed", with the DRM lease never recovering for the rest of the
+	// session -- reproduced on demand, every time, at 754beed30 and every commit after it;
+	// confirmed absent at 754beed30's parent c44ba4a23, where the same ~370ms reassert ran
+	// synchronously INSIDE wmr_hmd_update_inputs() itself (no cross-thread lock to
+	// contend for). A same-thread-only gate (tried first, live 2026-09-06: defer the
+	// first-ever blank until wmr_hmd_update_inputs() had been called at least once) did
+	// NOT fix it -- that first update_inputs() call is itself the xrBeginSession() call,
+	// so the race is against the very call being used to gate it, not against whether a
+	// client exists yet.
+	//
+	// Fixed here at the actual point of contention: presence_lock now only ever protects
+	// the FAST bookkeeping (candidate/committed debounce above, and the flag updates below
+	// -- screen_off_by_presence, not_worn_since_ns, last_reassert_ns -- all single-writer,
+	// this thread being the only writer). The slow HID calls themselves, and their
+	// WMR_INFO logging, are deferred to run AFTER presence_lock is released further down,
+	// using the need_restore/need_blank/need_periodic_poke locals decided here. No
+	// existing debounce window, screenoff delay, or reassert interval/cadence changes --
+	// only WHEN the blocking I/O itself runs relative to the lock, not what it does or how
+	// often.
+	bool need_restore = false;
+	bool need_blank = false;
+	uint64_t blank_screenoff_ms = 0;
+	bool need_periodic_poke = false;
+
 	if (wh->presence.committed) {
 		wh->presence.not_worn_since_ns = 0;
 		if (wh->presence.screen_off_by_presence) {
-			if (wh->hmd_desc != NULL && wh->hmd_desc->reassert_func != NULL) {
-				wh->hmd_desc->reassert_func(wh);
-			} else if (wh->hmd_desc != NULL && wh->hmd_desc->screen_enable_func != NULL) {
-				wh->hmd_desc->screen_enable_func(wh, true);
-			}
+			need_restore = true;
 			wh->presence.screen_off_by_presence = false;
-			WMR_INFO(wh, "User presence: panel restored from auto-standby");
 		}
 	} else {
 		if (wh->presence.not_worn_since_ns == 0) {
 			wh->presence.not_worn_since_ns = now_ns;
 		}
 		uint64_t screenoff_ms = (uint64_t)debug_get_num_option_wmr_user_presence_screenoff_ms();
+		// docs/103 (2026-09-06, VK_ERROR_UNKNOWN/lease-death bug): also requires
+		// WMR_USER_PRESENCE_BLANK_PANEL -- see that option's own comment for the full
+		// live evidence (an isolated, single screen-off with nothing else happening
+		// anywhere near it still killed the DRM lease the moment the next real content
+		// session began). Left at its default (off), NOT-WORN duration is still tracked
+		// (not_worn_since_ns above, unconditionally) and everything upstream of this
+		// point -- debounce, motion corroboration, XR_EXT_user_presence's committed
+		// value -- stays fully correct; only the actual, physical screen-off action is
+		// skipped, which as a direct consequence also means screen_off_by_presence never
+		// becomes true, so RESTORE and the periodic reassert-while-blanked poke below
+		// never have anything to do either (both only ever run once something has
+		// actually been blanked).
 		if (screenoff_ms > 0 && !wh->presence.screen_off_by_presence &&
+		    debug_get_bool_option_wmr_user_presence_blank_panel() &&
 		    (now_ns - wh->presence.not_worn_since_ns) >= screenoff_ms * U_TIME_1MS_IN_NS) {
-			if (wh->hmd_desc != NULL && wh->hmd_desc->screen_off_fresh_fd_func != NULL) {
-				wh->hmd_desc->screen_off_fresh_fd_func(wh);
-			} else if (wh->hmd_desc != NULL && wh->hmd_desc->screen_enable_func != NULL) {
-				wh->hmd_desc->screen_enable_func(wh, false);
-			}
+			need_blank = true;
+			blank_screenoff_ms = screenoff_ms;
 			wh->presence.screen_off_by_presence = true;
 			wh->presence.last_reassert_ns = 0;
-			WMR_INFO(wh, "User presence: panel blanked by auto-standby (%llu ms NOT WORN)",
-			         (unsigned long long)screenoff_ms);
 		}
 
 		// docs/103 (2026-09-06): presence RESTORE never fired, live, until this. Two
@@ -3617,6 +3834,13 @@ wmr_hmd_presence_tick(struct wmr_hmd *wh)
 		// iteration is delayed by ~368ms, which is far under the pre-existing 150ms/50ms
 		// WARN thresholds' intent (a one-off rare stall, not a per-frame cost) and only
 		// ever happens while genuinely NOT WORN.
+		// 2026-09-06 addendum #2 (VK_ERROR_UNKNOWN/lease-death bug): "no game/compositor
+		// waiting on this thread's cadence during a stall" turned out to be wrong -- see
+		// this function's own comment above the need_restore/need_blank locals for the
+		// real dependency found live (wmr_hmd_update_inputs() via presence_lock, not this
+		// thread's own cadence). The stall duration and interval are unchanged; only
+		// where the blocking call itself runs (after presence_lock is released, see
+		// below) changed.
 		if (wh->presence.screen_off_by_presence) {
 			static int restore_reassert = -1;
 			if (restore_reassert == -1) {
@@ -3632,15 +3856,7 @@ wmr_hmd_presence_tick(struct wmr_hmd *wh)
 			           (now_ns - wh->presence.last_reassert_ns) >=
 			               (uint64_t)reassert_interval_ms * U_TIME_1MS_IN_NS;
 			if (restore_reassert && due && wh->hmd_desc != NULL && wh->hmd_desc->reassert_func != NULL) {
-				int64_t ra0 = os_monotonic_get_ns();
-				wh->hmd_desc->reassert_func(wh);
-				WMR_INFO(wh, "presence auto-standby: reassert took %.1f ms",
-				         (double)(os_monotonic_get_ns() - ra0) / 1e6);
-				if (wh->hmd_desc != NULL && wh->hmd_desc->screen_off_fresh_fd_func != NULL) {
-					wh->hmd_desc->screen_off_fresh_fd_func(wh);
-				} else if (wh->hmd_desc != NULL && wh->hmd_desc->screen_enable_func != NULL) {
-					wh->hmd_desc->screen_enable_func(wh, false);
-				}
+				need_periodic_poke = true;
 				wh->presence.last_reassert_ns = now_ns;
 			}
 		}
@@ -3693,6 +3909,17 @@ wmr_hmd_presence_tick(struct wmr_hmd *wh)
 	}
 
 	os_mutex_unlock(&wh->presence_lock);
+
+	// docs/103 (2026-09-06, VK_ERROR_UNKNOWN/lease-death bug, addendum): narrowing
+	// presence_lock's own critical section (above) was NOT enough -- the actual blocking
+	// HID I/O still ran directly on wmr_run_thread, which is what starved the compositor's
+	// IMU supply and caused the crash, lock or no lock. See presence_action_lock's own
+	// comment in wmr_hmd.h, and wmr_hmd_presence_dispatch_action()'s just above, for the
+	// real fix: hand the actual I/O off to its own short-lived thread so wmr_run_thread's
+	// own loop (control_read_packets/hololens_sensors_read_packets, feeding the
+	// compositor's pose prediction) is never blocked by it, regardless of when in a
+	// session's lifetime an action fires.
+	wmr_hmd_presence_dispatch_action(wh, need_restore, need_blank, blank_screenoff_ms, need_periodic_poke);
 }
 
 /*!
@@ -3822,6 +4049,17 @@ wmr_hmd_create(enum wmr_headset_type hmd_type,
 	ret = os_mutex_init(&wh->presence_lock);
 	if (ret != 0) {
 		WMR_ERROR(wh, "Failed to init Presence mutex!");
+		wmr_hmd_destroy(&wh->base);
+		wh = NULL;
+		return;
+	}
+
+	// docs/103 (2026-09-06, VK_ERROR_UNKNOWN/lease-death bug): guards dispatch of the
+	// detached thread that does presence's actual blocking HID I/O -- see this field's
+	// own comment in wmr_hmd.h for the full story.
+	ret = os_mutex_init(&wh->presence_action_lock);
+	if (ret != 0) {
+		WMR_ERROR(wh, "Failed to init Presence action mutex!");
 		wmr_hmd_destroy(&wh->base);
 		wh = NULL;
 		return;

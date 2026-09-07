@@ -357,6 +357,32 @@ struct wmr_hmd
 		//! having no reassert at all. This drives a periodic re-arm instead of a one-shot;
 		//! see WMR_PRESENCE_REASSERT_INTERVAL_MS in wmr_hmd_update_inputs().
 		uint64_t last_reassert_ns;
+		//! docs/103 (2026-09-06, VK_ERROR_UNKNOWN/lease-death bug): true once
+		//! wmr_hmd_update_inputs() has been called at least once, i.e. an OpenXR client has
+		//! actually reached the state tracker's input-sync path (oxr_session.c) at least
+		//! once this run. Before 754beed30 moved the auto-standby decision onto the
+		//! always-on read thread, blanking the panel could ONLY happen from inside
+		//! wmr_hmd_update_inputs() itself -- so by construction, auto-standby could never
+		//! fire before a client existed. Once the decision runs unconditionally on the read
+		//! thread, the 15s NOT-WORN timer starts counting at driver init, before any client
+		//! has connected -- and a headless/slow-launching client (confirmed: hello_xr
+		//! loading an 8K video, ~15-20s to first real frame) can lose the race, blanking the
+		//! panel before the compositor's FIRST-EVER real present. Bisected live 2026-09-06:
+		//! that specific ordering -- panel already blanked (screen_off_by_presence=1) at the
+		//! moment a client's BEGIN_SESSION/first swapchain present lands -- reproduces
+		//! VK_ERROR_UNKNOWN + "Lease has been closed" within ~5s, every time, and the DRM
+		//! lease never recovers for the rest of the session. Mid-session blanking (panel
+		//! already lit through the client's first real present, blanked only afterward) was
+		//! confirmed clean across many cycles at c44ba4a23 with no crash -- so the failure is
+		//! specific to the FIRST present landing on an already-blanked panel, not to blanking
+		//! itself. Gating just the blank transition on this flag (see wmr_hmd_presence_tick's
+		//! auto-standby block) restores the same implicit ordering the pre-754beed30 code had
+		//! by construction, while keeping everything else about the read-thread move (no more
+		//! dormant decision once a client exits, continuous tracking, restore, periodic
+		//! re-arm) intact. Deliberately a one-way latch -- never reset back to false -- since
+		//! the goal is only "don't blank before the pipeline has ever been driven for real,"
+		//! not "only track presence while a client is connected."
+		bool client_update_inputs_seen;
 
 		/*
 		 * TEMPORARY diagnostic counters for docs/98 (reverb-g2, 2026-09-05): auto-standby
@@ -389,10 +415,45 @@ struct wmr_hmd
 	//! wmr_hmd_presence_tick(), called every iteration of the always-running "WMR: USB-HMD"
 	//! thread (wmr_run_thread) instead -- see that function's own comment for why. Only
 	//! `committed` is still read from wmr_hmd_update_inputs() (the OpenXR-thread side), so
-	//! the critical sections on that side are tiny; the tick function on the read thread
-	//! holds it for the whole decision, same shape as the existing controller_status_lock
-	//! a few members below.
+	//! the critical sections on that side are tiny.
+	//!
+	//! docs/103 (2026-09-06, VK_ERROR_UNKNOWN/lease-death bug addendum): this lock now
+	//! ONLY ever guards the fast bookkeeping in wmr_hmd_presence_tick() (debounce/commit,
+	//! and the screen_off_by_presence/not_worn_since_ns/last_reassert_ns flag updates) --
+	//! it is taken and released well before any blocking HID I/O runs. See
+	//! presence_action_lock just below for where that I/O actually happens and why.
 	struct os_mutex presence_lock;
+	//! docs/103 (2026-09-06, VK_ERROR_UNKNOWN/lease-death bug): guards dispatch of the
+	//! detached, one-shot thread that performs the ACTUAL blocking HID I/O for a presence
+	//! restore/blank/periodic-reassert-while-blanked action (each ~370-750ms -- see
+	//! wmr_hmd_reassert_reverb_fresh_fd/wmr_hmd_screen_off_reverb_fresh_fd's own comments).
+	//! Root cause, bisected + confirmed live 2026-09-06: this I/O used to run directly on
+	//! wmr_run_thread, the SAME always-on thread that also does
+	//! control_read_packets/hololens_sensors_read_packets every iteration -- i.e. the
+	//! sole source of the fresh IMU samples the compositor's pose prediction/frame pacing
+	//! depends on every frame. Stalling THAT thread for ~370ms+ while a real client has an
+	//! active, frame-presenting session starves it of fresh IMU data for the same
+	//! duration, which was enough (live-confirmed, reproduced on demand at every commit
+	//! from 754beed30 onward, at ANY point in a session's lifetime -- not just early on)
+	//! to desync the compositor's frame-time predictor badly enough to produce
+	//! vk_swapchain_present: VK_ERROR_UNKNOWN immediately followed by "Lease has been
+	//! closed", with the DRM lease never recovering for the rest of the session. Narrowing
+	//! presence_lock's own critical section (see that field's own updated comment) did NOT
+	//! fix this -- the read thread was still the one blocking, lock or no lock. Confirmed
+	//! absent at 754beed30's parent c44ba4a23, where this same I/O ran inside
+	//! wmr_hmd_update_inputs() itself (a client-facing call, never the IMU read thread).
+	//! Fixed by moving the I/O off wmr_run_thread entirely, onto a short-lived detached
+	//! thread (see wmr_hmd_presence_dispatch_action()) -- this mutex is trylock()'d before
+	//! spawning one, so at most one such action thread ever runs at a time (actions are
+	//! naturally seconds apart -- WMR_USER_PRESENCE_DON_MS/_DOFF_MS/_REASSERT_INTERVAL_MS
+	//! -- so contention here would mean something else is already wrong); a busy trylock
+	//! just skips that one dispatch and logs it, since the next tick or the next periodic
+	//! interval will retry. wmr_hmd_destroy() takes this lock (a plain lock, not a
+	//! trylock) right after joining wmr_run_thread, as a barrier: by then no NEW action
+	//! can be dispatched (the only dispatcher, wmr_run_thread, has already exited), so
+	//! acquiring this lock blocks until any LAST already-dispatched action thread has
+	//! finished touching `wh` and released it, making it safe to free `wh` right after.
+	struct os_mutex presence_action_lock;
 
 	struct hololens_sensors_packet packet;
 
