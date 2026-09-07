@@ -131,6 +131,12 @@ struct fake_timing
 	//! Whole periods the free-running anchor has jumped forward this session.
 	int64_t phase_jump_count;
 
+	//! now_ns of the last "Fake pacer fell behind" WARN, for rate-limiting it.
+	int64_t last_phase_jump_log_ns;
+
+	//! phase_jump_count as of the last time we actually printed that WARN.
+	int64_t phase_jump_count_at_last_log;
+
 	//! Present-wait ground-truth re-anchors accepted this session (see pc_info).
 	int64_t present_feedback_count;
 
@@ -206,9 +212,21 @@ predict_next_frame_present_time(struct fake_timing *ft, int64_t now_ns)
 		// warn with a running count to make each shift observable against the
 		// app-side "Frame late by" lines.
 		ft->phase_jump_count += steps;
-		UPC_LOG_W("Fake pacer fell behind: jumped %" PRIi64 " period(s) forward (%" PRIi64
-		          " total this session), new anchor %" PRIi64,
-		          steps, ft->phase_jump_count, predicted_present_time_ns);
+
+		// A single stall (a client's swapchain recreating at connect, a USB hiccup)
+		// can trip this on many consecutive predictions, which used to print one WARN
+		// per frame -- thousands of near-identical lines in a short session, drowning
+		// out everything else worth diagnosing. Rate-limit the line itself to once a
+		// second; phase_jump_count keeps the exact per-session tally regardless, so
+		// throttling the log loses nothing but the noise.
+		if (now_ns - ft->last_phase_jump_log_ns >= U_TIME_1S_IN_NS) {
+			UPC_LOG_W("Fake pacer fell behind: jumped %" PRIi64 " period(s) forward (%" PRIi64
+			          " total this session, %" PRIi64 " since last log), new anchor %" PRIi64,
+			          steps, ft->phase_jump_count,
+			          ft->phase_jump_count - ft->phase_jump_count_at_last_log, predicted_present_time_ns);
+			ft->last_phase_jump_log_ns = now_ns;
+			ft->phase_jump_count_at_last_log = ft->phase_jump_count;
+		}
 	}
 
 	return predicted_present_time_ns;
@@ -455,8 +473,13 @@ pc_update_vblank_from_display_control(struct u_pacing_compositor *upc, int64_t l
 {
 	struct fake_timing *ft = fake_timing(upc);
 
-	// Use the last vblank time to sync to the output.
-	ft->last_present_time_ns = last_vblank_ns;
+	// Same monotonic guard as pc_info() above: this and the present-wait path both
+	// write last_present_time_ns, and an out-of-order or stale vblank event must never
+	// walk the anchor backwards -- predict_next_frame_present_time() would then think
+	// it has more headroom on the very next call than it actually does.
+	if (last_vblank_ns > ft->last_present_time_ns) {
+		ft->last_present_time_ns = last_vblank_ns;
+	}
 }
 
 static void
