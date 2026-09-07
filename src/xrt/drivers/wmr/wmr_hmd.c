@@ -247,6 +247,91 @@ DEBUG_GET_ONCE_NUM_OPTION(wmr_user_presence_don_confirm_packets, "WMR_USER_PRESE
 DEBUG_GET_ONCE_FLOAT_OPTION(wmr_user_presence_don_motion_rad_s, "WMR_USER_PRESENCE_DON_MOTION_RAD_S", 0.10f)
 DEBUG_GET_ONCE_NUM_OPTION(wmr_user_presence_don_confirm_timeout_ms, "WMR_USER_PRESENCE_DON_CONFIRM_TIMEOUT_MS", 4000)
 
+//! Follow-up bug, same night (2026-09-06, docs/103 addendum #3): the motion corroboration
+//! just above is worthless when the candidate never comes into existence at all. Live-
+//! observed the same night: a wearer donned the headset for 5+ minutes with the panel
+//! auto-standby-blanked, and PRESENCE-DIAG heartbeat's raw_proximity/candidate never moved
+//! off their NOT-WORN value for the WHOLE stretch -- zero WMR_CONTROL_MSG_IPD_VALUE packets
+//! arrived, worn or not, confirmed directly against jack-in-wayland.log (not assumed). Since
+//! WMR_USER_PRESENCE_DON_MOTION_RAD_S/_DON_CONFIRM_TIMEOUT_MS only run inside
+//! `if (wh->presence.candidate != wh->presence.committed)` -- which requires the raw
+//! proximity byte to have flipped at least once -- a channel that never flips runs NONE of
+//! that logic, including the supposedly-unconditional timeout. Even the periodic reassert
+//! poke (WMR_PRESENCE_REASSERT_INTERVAL_MS, already firing every 15s throughout the
+//! observed stretch) did not restore packet delivery -- new evidence that "reassert wakes
+//! the channel" (docs/103, ~12:30 entry) cannot be relied on either.
+//!
+//! Fixed by promoting motion to an INDEPENDENT PRIMARY signal that can establish presence
+//! on its own once the proximity channel is stale/silent enough to no longer be trusted,
+//! rather than only ever corroborating a candidate the channel itself already created. See
+//! wmr_hmd_presence_tick()'s own comment (the worn_signal computation, just before the
+//! debounce block) for exactly how this combines with the raw byte, and this struct's
+//! addendum #3 comment in wmr_hmd.h for the fuller narrative.
+//!
+//! Deliberately requires SUSTAINED motion, not an instantaneous peak like the
+//! corroboration option above -- reasoned explicitly, not copied: the corroboration path
+//! already has a real proximity=1 packet as independent evidence, so a single peak on top
+//! of that is plenty. This path has NO other evidence at all, so it needs a stronger,
+//! standalone bar. A single peak also cannot tell a genuine multi-hundred-ms donning
+//! gesture apart from a single knock on the desk (both can produce one large instantaneous
+//! sample); requiring the magnitude to stay at or above threshold for a minimum continuous
+//! stretch (tolerating brief single-tick dips, see _MOTION_GAP_MS below) is a much better
+//! proxy for "something is actively being handled" than "one high sample was ever seen."
+//! Ambient vibration (HVAC, a nearby door, someone bumping the table the headset rests on)
+//! is expected to fail this on magnitude alone long before duration matters: this unit's
+//! own live gyro_bias_auto "-> STILL" log output (see the corroboration option above) shows
+//! genuine resting/ambient noise at 0.011-0.016 rad/s, 6-9x below the 0.10 rad/s default
+//! reused here. NOT measured against this rig's real ambient vibration under stress (e.g. a
+//! door slam transmitted through the desk) or against a real donning gesture's actual
+//! sustained profile (only two real "via motion" peak samples exist from tonight, 0.104 and
+//! 0.977 rad/s -- peaks, not sustain profiles) -- flagged honestly for the next live test.
+DEBUG_GET_ONCE_FLOAT_OPTION(wmr_user_presence_motion_primary_rad_s, "WMR_USER_PRESENCE_MOTION_PRIMARY_RAD_S", 0.10f)
+
+//! Minimum continuous duration (tolerating gaps up to WMR_USER_PRESENCE_MOTION_GAP_MS)
+//! that |angular velocity| must stay at or above WMR_USER_PRESENCE_MOTION_PRIMARY_RAD_S
+//! before wmr_hmd_presence_tick() treats it as a real, sustained motion run rather than a
+//! transient blip. Default 500 ms: comfortably longer than a single knock/bump (expected
+//! sub-100-200 ms), comfortably shorter than how long picking up and donning a headset
+//! actually takes (a multi-hundred-ms-to-few-second gesture, not instantaneous) -- but this
+//! is reasoning from the shape of the gesture, not a live-measured donning-motion duration
+//! profile on this unit; retune from real data if a live test shows genuine dons taking
+//! noticeably longer or shorter than 500 ms to accumulate a continuous run. 0 or negative
+//! disables the entire motion-primary path (nothing can ever satisfy "sustained for >0 ms
+//! continuously", matching this file's existing convention that a non-positive duration
+//! option turns its feature off rather than trivially always-passing).
+DEBUG_GET_ONCE_NUM_OPTION(wmr_user_presence_motion_sustain_ms, "WMR_USER_PRESENCE_MOTION_SUSTAIN_MS", 500)
+
+//! Maximum gap, in ms, tolerated between two consecutive above-threshold ticks within one
+//! motion run before WMR_USER_PRESENCE_MOTION_SUSTAIN_MS's clock is reset to 0. Exists
+//! because a real donning gesture is not guaranteed to keep |angular velocity| pinned above
+//! threshold on literally every single ~4 ms tick (the read thread runs at ~250 Hz, see the
+//! measurement in WMR_USER_PRESENCE_DON_CONFIRM_PACKETS' own comment) -- a momentary dip
+//! mid-gesture should not have to restart the whole sustain window from zero. Default
+//! 250 ms is a guess at "generous enough to bridge a natural pause mid-gesture, short
+//! enough that two genuinely separate events (a bump, quiet, then an unrelated later bump)
+//! don't get fused into one continuous run" -- not validated against a real gesture's
+//! actual sample-to-sample gap pattern. 0 or negative means zero tolerance (any dip below
+//! threshold ends the run on the very next tick).
+DEBUG_GET_ONCE_NUM_OPTION(wmr_user_presence_motion_gap_ms, "WMR_USER_PRESENCE_MOTION_GAP_MS", 250)
+
+//! How long (ms) the proximity channel must have gone without delivering ANY packet --
+//! or never have delivered one at all, matching this option's own "0 = never" convention
+//! for presence.last_update_ns -- before wmr_hmd_presence_tick() allows a sustained motion
+//! run to independently assert WORN on its own (see worn_signal in that function). Default
+//! 30000 ms (30 s) is deliberately the same order of magnitude as this file's existing,
+//! separate PRESENCE_STALE_NS log-notice threshold (30 s, unconditional local constant
+//! further down in wmr_hmd_presence_tick(), left untouched and NOT reused here on purpose
+//! -- coupling a log-cadence constant to a behavior-changing gate would mean retuning one
+//! silently retunes the other) -- both pick 30 s for the same reason: comfortably above how
+//! quickly this channel delivers a packet under NORMAL operation (sub-second to a few
+//! seconds, per every successful commit logged tonight) so a merely-quiet-but-healthy
+//! channel is never mistaken for a dead one, while comfortably below the multi-minute
+//! failure duration actually observed tonight, so a genuinely dead channel does not leave a
+//! real wearer waiting anywhere near that long. 0 or negative disables the entire
+//! motion-primary path (the channel is never considered stale enough to hand it sole
+//! authority), reproducing this file's pre-this-fix behavior exactly.
+DEBUG_GET_ONCE_NUM_OPTION(wmr_user_presence_motion_rescue_stale_ms, "WMR_USER_PRESENCE_MOTION_RESCUE_STALE_MS", 30000)
+
 //! Auto-standby (reverb-g2, 2026-09-04): blank the panel after this many ms continuously
 //! committed NOT WORN, using the same screen_enable_func this driver already calls at
 //! activation/reconnect (wmr_hmd_activate_reverb) and already exposes as a manual monado-gui
@@ -3252,6 +3337,87 @@ wmr_hmd_presence_tick(struct wmr_hmd *wh)
 	}
 
 	/*
+	 * docs/103 (2026-09-06, addendum #3): independent motion-run tracker, updated
+	 * unconditionally on EVERY tick regardless of candidate/committed/raw proximity state.
+	 * This has to reflect real-world physical motion on its own terms -- it exists
+	 * specifically to cover the case where the proximity channel has nothing to say at
+	 * all, so it cannot itself depend on that channel having said anything. See
+	 * WMR_USER_PRESENCE_MOTION_PRIMARY_RAD_S/_MOTION_SUSTAIN_MS/_MOTION_GAP_MS's own
+	 * comments for the full reasoning; short version: a "run" starts the first tick
+	 * |angular velocity| rises above threshold, extends through brief below-threshold
+	 * dips (up to _MOTION_GAP_MS), and ends once a real gap that long has passed with
+	 * nothing above threshold. motion_sustained below is true once a currently-open run
+	 * has lasted at least _MOTION_SUSTAIN_MS.
+	 */
+	float motion_primary_threshold = debug_get_float_option_wmr_user_presence_motion_primary_rad_s();
+	bool motion_above_now = motion_primary_threshold > 0.0f && motion_mag_rad_s >= motion_primary_threshold;
+	if (motion_above_now) {
+		if (wh->presence.motion_run_started_ns == 0) {
+			wh->presence.motion_run_started_ns = now_ns;
+		}
+		wh->presence.motion_last_above_ns = now_ns;
+	} else if (wh->presence.motion_run_started_ns != 0) {
+		long gap_raw_ms = debug_get_num_option_wmr_user_presence_motion_gap_ms();
+		uint64_t gap_ns = (uint64_t)(gap_raw_ms < 0 ? 0 : gap_raw_ms) * U_TIME_1MS_IN_NS;
+		if (now_ns - wh->presence.motion_last_above_ns > gap_ns) {
+			wh->presence.motion_run_started_ns = 0;
+		}
+	}
+	long motion_sustain_raw_ms = debug_get_num_option_wmr_user_presence_motion_sustain_ms();
+	bool motion_sustained = motion_sustain_raw_ms > 0 && wh->presence.motion_run_started_ns != 0 &&
+	                         (now_ns - wh->presence.motion_run_started_ns) >=
+	                             (uint64_t)motion_sustain_raw_ms * U_TIME_1MS_IN_NS;
+
+	// docs/103 (2026-09-06, addendum #3): is the proximity channel stale/silent enough
+	// that a sustained motion run should be trusted as the SOLE authority on presence,
+	// instead of only ever corroborating a candidate that channel itself already
+	// produced? last_update_ns == 0 ("never" -- see that field's own comment) counts as
+	// stale too: a channel that has NEVER spoken even once is the most extreme case this
+	// exists to rescue, not an exception to it.
+	long rescue_stale_raw_ms = debug_get_num_option_wmr_user_presence_motion_rescue_stale_ms();
+	bool proximity_stale_for_rescue =
+	    rescue_stale_raw_ms > 0 &&
+	    (wh->presence.last_update_ns == 0 ||
+	     (now_ns - wh->presence.last_update_ns) > (uint64_t)rescue_stale_raw_ms * U_TIME_1MS_IN_NS);
+
+	/*
+	 * docs/103 (2026-09-06, addendum #3): worn_signal replaces raw_worn as the value that
+	 * drives the debounce below -- raw_worn alone is what caused tonight's failure (a
+	 * channel that never flips means candidate never flips, means NOTHING below this
+	 * point, including addendum #2's own "hard" timeout, ever runs at all). Three cases,
+	 * evaluated in order:
+	 *   1. The raw byte itself says worn (raw_worn true, whether from a fresh packet or a
+	 *      stale one whose last known value was worn) -- always trusted directly and
+	 *      first, unchanged from before this addendum. This is also why a worn-but-still
+	 *      wearer whose channel later goes quiet is safe: raw_worn stays true (the byte's
+	 *      last known state), so case 1 keeps firing and case 2 below is never reached for
+	 *      that wearer at all.
+	 *   2. The raw byte says NOT worn (or has never said anything) AND the channel is
+	 *      stale enough (proximity_stale_for_rescue) to no longer be trusted on its own --
+	 *      hand authority to motion. If a run is CURRENTLY sustained, assert worn (the
+	 *      actual rescue). If not, HOLD the existing candidate value rather than forcing
+	 *      it to false -- deliberately one-directional. A "motion went quiet -> assert
+	 *      NOT worn" rule was considered and rejected: a genuinely worn-but-still wearer
+	 *      (watching static content, reading, etc.) is a common, expected real usage
+	 *      pattern and would false-doff under that rule, whereas a genuinely NOT-worn,
+	 *      undisturbed headset reliably shows near-zero motion (this unit's own
+	 *      gyro_bias_auto "-> STILL" log, 0.011-0.016 rad/s) and simply never sets
+	 *      candidate true via this path to begin with. This mirrors, rather than
+	 *      contradicts, the struct's pre-existing "fail toward worn" philosophy.
+	 *   3. The raw byte says NOT worn AND the channel is fresh (recently proved it is
+	 *      alive and currently disagrees) -- trust it directly, same as before this
+	 *      addendum. A live, talking channel's own reading always wins over motion.
+	 */
+	bool worn_signal;
+	if (raw_worn) {
+		worn_signal = true;
+	} else if (proximity_stale_for_rescue) {
+		worn_signal = motion_sustained ? true : wh->presence.candidate;
+	} else {
+		worn_signal = false;
+	}
+
+	/*
 	 * Debounce (T224). The raw byte alternated 0,1,0,1 through a measured donning
 	 * gesture, so a candidate state has to hold for its window before it is committed.
 	 * Windows are asymmetric: see the struct comment in wmr_hmd.h for why leaving
@@ -3273,13 +3439,18 @@ wmr_hmd_presence_tick(struct wmr_hmd *wh)
 	 * motion), then extended by the running max just below, every tick, independent of
 	 * whether a new proximity packet arrived. See WMR_USER_PRESENCE_DON_MOTION_RAD_S's own
 	 * comment for why this exists and where its default comes from.
+	 *
+	 * 2026-09-06 (docs/103, addendum #3): driven by worn_signal (above), not raw_worn
+	 * directly, so a candidate flip can now originate from either the proximity byte OR
+	 * the independent motion-primary rescue path -- see worn_signal's own comment just
+	 * above for the full three-case reasoning.
 	 */
-	if (raw_worn != wh->presence.candidate) {
-		wh->presence.candidate = raw_worn;
+	if (worn_signal != wh->presence.candidate) {
+		wh->presence.candidate = worn_signal;
 		wh->presence.candidate_since_ns = now_ns;
 		wh->presence.candidate_confirm_count = 1;
 		wh->presence.candidate_last_counted_update_ns = wh->presence.last_update_ns;
-		wh->presence.candidate_motion_peak_rad_s = raw_worn ? motion_mag_rad_s : 0.0f;
+		wh->presence.candidate_motion_peak_rad_s = worn_signal ? motion_mag_rad_s : 0.0f;
 	} else if (wh->presence.last_update_ns != wh->presence.candidate_last_counted_update_ns) {
 		wh->presence.candidate_confirm_count++;
 		wh->presence.candidate_last_counted_update_ns = wh->presence.last_update_ns;
@@ -3329,10 +3500,17 @@ wmr_hmd_presence_tick(struct wmr_hmd *wh)
 
 		if (time_ok && confirm_ok) {
 			wh->presence.committed = wh->presence.candidate;
+			// docs/103 (2026-09-06, addendum #3): also prints whether the proximity
+			// channel was considered stale/silent at commit time -- "stale" alongside
+			// "via motion" is the signature of the new rescue path actually firing
+			// (the exact case tonight's 5+ minute stuck don needed); "fresh" alongside
+			// "via packets" is the ordinary, channel-healthy path, unchanged from
+			// before this addendum.
 			WMR_INFO(wh,
-			         "User presence: %s (raw proximity sensor value %u, held %llu ms, "
+			         "User presence: %s (raw proximity sensor value %u [%s], held %llu ms, "
 			         "%llu confirming packet(s), motion peak %.3f rad/s, via %s)",
 			         wh->presence.committed ? "WORN" : "NOT WORN", wh->proximity_sensor,
+			         proximity_stale_for_rescue ? "stale" : "fresh",
 			         (unsigned long long)(held_ns / U_TIME_1MS_IN_NS),
 			         (unsigned long long)wh->presence.candidate_confirm_count,
 			         (double)wh->presence.candidate_motion_peak_rad_s, confirm_via);

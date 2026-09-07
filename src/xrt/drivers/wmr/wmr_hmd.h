@@ -243,6 +243,37 @@ struct wmr_hmd
 	 * even if neither corroboration source shows up in time. See both options' own comments
 	 * in wmr_hmd.c for the full reasoning, including the honest limitation of the timeout
 	 * path.
+	 *
+	 * 2026-09-06 addendum #3 (docs/103, later same night, live-caught): addendum #2's
+	 * motion CORROBORATION is worthless when the candidate never exists in the first
+	 * place. Live-observed the same night: a wearer donned the headset for 5+ minutes
+	 * with the panel auto-standby-blanked, and `raw_proximity`/`candidate` in the
+	 * PRESENCE-DIAG heartbeat never moved off their NOT-WORN value for the entire
+	 * stretch -- zero WMR_CONTROL_MSG_IPD_VALUE packets arrived, worn or not, the whole
+	 * time (confirmed against the actual captured jack-in-wayland.log, not assumed). Since
+	 * addendum #2's motion peak/timeout/packet corroboration all live INSIDE
+	 * `if (wh->presence.candidate != wh->presence.committed)` -- which only runs once the
+	 * raw proximity byte has ALREADY flipped -- a channel that never flips at all means
+	 * NONE of that logic, including the "hard" timeout, ever executes. Even repeated
+	 * periodic reassert pokes (WMR_PRESENCE_REASSERT_INTERVAL_MS, already firing every 15s
+	 * in the observed log) did not restore packet delivery during this stretch -- new
+	 * evidence that "reassert wakes the channel" (docs/103, ~12:30) is not reliable enough
+	 * to depend on either.
+	 *
+	 * Fixed by promoting motion from a candidate-corroborator to an independent PRIMARY
+	 * signal: `worn_signal` (wmr_hmd_presence_tick(), computed before the debounce block)
+	 * is `true` whenever the raw proximity byte says so (unchanged, always trusted first),
+	 * OR whenever the channel has gone quiet/never spoken for
+	 * WMR_USER_PRESENCE_MOTION_RESCUE_STALE_MS and a SUSTAINED motion run (see
+	 * motion_run_started_ns/motion_last_above_ns below, and
+	 * WMR_USER_PRESENCE_MOTION_PRIMARY_RAD_S/_MOTION_SUSTAIN_MS/_MOTION_GAP_MS) is
+	 * currently in progress. Deliberately one-directional: this can only push worn_signal
+	 * toward WORN, never toward NOT-WORN -- see wmr_hmd_presence_tick()'s own comment for
+	 * why a "motion went quiet -> commit NOT WORN" rule was considered and rejected (a
+	 * genuinely worn-but-still wearer, e.g. watching static content, is common and would
+	 * false-doff under that rule; a genuinely NOT-worn, undisturbed desk is not, so the
+	 * asymmetry is intentional and mirrors this struct's existing "fail toward worn" logic
+	 * for the DON/DOFF windows above).
 	 */
 	struct
 	{
@@ -287,6 +318,27 @@ struct wmr_hmd
 		//! on the next rare proximity sample. Only consulted for the WORN direction, same as
 		//! candidate_confirm_count above.
 		float candidate_motion_peak_rad_s;
+		//! WMR_USER_PRESENCE_MOTION_SUSTAIN_MS/_MOTION_GAP_MS (2026-09-06, docs/103
+		//! addendum #3): 0 if no motion "run" is currently in progress, otherwise the
+		//! monotonic time the CURRENT run began -- i.e. the tick where
+		//! |wh->fusion.last_angular_velocity| first rose above
+		//! WMR_USER_PRESENCE_MOTION_PRIMARY_RAD_S after being below it (or at startup).
+		//! A run ends (reset to 0) once too long a gap (_MOTION_GAP_MS) passes without a
+		//! tick back above threshold -- see motion_last_above_ns just below. Tracked on
+		//! EVERY tick, unconditionally, independent of candidate/committed/raw proximity --
+		//! this has to reflect real-world physical motion regardless of what the proximity
+		//! channel is currently saying (or not saying), because it exists specifically to
+		//! cover the case where that channel has nothing to say at all. Used to compute
+		//! worn_signal in wmr_hmd_presence_tick() -- see that function's own comment.
+		uint64_t motion_run_started_ns;
+		//! The most recent tick's timestamp where |angular velocity| was at or above
+		//! WMR_USER_PRESENCE_MOTION_PRIMARY_RAD_S, i.e. the end of the current motion run
+		//! so far. Compared against "now" every tick to detect a run ending (a gap longer
+		//! than WMR_USER_PRESENCE_MOTION_GAP_MS since this timestamp resets
+		//! motion_run_started_ns to 0) -- this tolerance exists so a single noisy tick
+		//! dipping momentarily below threshold mid-gesture doesn't spuriously reset an
+		//! otherwise-continuous real donning motion.
+		uint64_t motion_last_above_ns;
 		//! When the companion last delivered a proximity value at all. 0 = never.
 		uint64_t last_update_ns;
 		//! Throttle for the stale-channel notice.
