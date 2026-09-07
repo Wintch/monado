@@ -229,6 +229,20 @@ struct wmr_hmd
 	 * option's own comment and the two
 	 * candidate_confirm_count* fields below) -- entering "worn" is still cheaper than
 	 * leaving it, just no longer cheap enough to be satisfied by noise alone.
+	 *
+	 * 2026-09-06 addendum #2 (docs/103, same day, live wearer test): the packet-count fix
+	 * above traded one bug for another. A genuine, deliberate don's candidate committed to
+	 * nothing for 13+ seconds live (and, per the full captured log, would have run past 43 s
+	 * before the very next packet CONTRADICTED it instead of confirming it -- the don was
+	 * never registered at all), because the companion's packets are simply too sparse to
+	 * reliably deliver a 2nd confirming sample within any latency a wearer will tolerate.
+	 * Fixed by adding a second, independent corroboration source that does not depend on
+	 * the sparse channel at all -- see WMR_USER_PRESENCE_DON_MOTION_RAD_S and
+	 * candidate_motion_peak_rad_s below -- plus a bounded last-resort timeout
+	 * (WMR_USER_PRESENCE_DON_CONFIRM_TIMEOUT_MS) so a real don can never hang indefinitely
+	 * even if neither corroboration source shows up in time. See both options' own comments
+	 * in wmr_hmd.c for the full reasoning, including the honest limitation of the timeout
+	 * path.
 	 */
 	struct
 	{
@@ -243,12 +257,14 @@ struct wmr_hmd
 		//! first confirmation) and incremented only when a genuinely NEW packet re-confirms
 		//! the same value -- see candidate_last_counted_update_ns just below for how "new"
 		//! is detected. This exists because wmr_hmd_presence_tick() runs at the read
-		//! thread's full ~750 Hz rate while the companion's own packets arrive irregularly
-		//! (2 s to 100+ s apart, live-measured): without this counter, a single stray
-		//! packet satisfies WMR_USER_PRESENCE_DON_MS's wall-clock window all by itself,
-		//! because every tick in between just re-reads the same static, unconfirmed byte.
-		//! Only consulted for the WORN direction -- see the debug option's own comment for
-		//! why NOT WORN is left alone.
+		//! thread's full ~250 Hz rate (corrected 2026-09-06 from an earlier ~750 Hz guess --
+		//! see WMR_USER_PRESENCE_DON_CONFIRM_PACKETS' own comment in wmr_hmd.c for the real,
+		//! measured derivation) while the companion's own packets arrive irregularly (2 s to
+		//! 100+ s apart, live-measured): without this counter, a single stray packet
+		//! satisfies WMR_USER_PRESENCE_DON_MS's wall-clock window all by itself, because
+		//! every tick in between just re-reads the same static, unconfirmed byte. Only
+		//! consulted for the WORN direction -- see the debug option's own comment for why
+		//! NOT WORN is left alone.
 		uint64_t candidate_confirm_count;
 		//! The presence.last_update_ns value already counted into candidate_confirm_count.
 		//! A tick where wh->presence.last_update_ns still equals this is just this
@@ -257,6 +273,20 @@ struct wmr_hmd
 		//! past this did a genuinely new packet arrive since the last count, which is what
 		//! actually re-confirms the candidate value independently.
 		uint64_t candidate_last_counted_update_ns;
+		//! WMR_USER_PRESENCE_DON_MOTION_RAD_S (2026-09-06, docs/103 "committed stayed 0 for
+		//! 13+s" addendum): peak |wh->fusion.last_angular_velocity| (rad/s) observed on any
+		//! tick since the candidate value last changed. Reset (to this tick's own magnitude,
+		//! not 0 -- the tick that flips the candidate may already carry real motion) whenever
+		//! the candidate flips, updated every tick thereafter while the candidate is WORN --
+		//! see wmr_hmd_presence_tick()'s own comment for why this exists: the companion's
+		//! proximity packets are too sparse to corroborate a real don within a wearable
+		//! latency (this exact log showed a genuine don's candidate held 43+ s, then got
+		//! contradicted by the next packet before ever committing), while the IMU updates
+		//! every tick regardless, giving a MUCH more available real-time corroboration
+		//! signal for "is something physically handling this thing right now" than waiting
+		//! on the next rare proximity sample. Only consulted for the WORN direction, same as
+		//! candidate_confirm_count above.
+		float candidate_motion_peak_rad_s;
 		//! When the companion last delivered a proximity value at all. 0 = never.
 		uint64_t last_update_ns;
 		//! Throttle for the stale-channel notice.

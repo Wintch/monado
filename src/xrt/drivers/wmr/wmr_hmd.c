@@ -28,6 +28,7 @@
 #include "math/m_mathinclude.h"
 #include "math/m_predict.h"
 #include "math/m_vec2.h"
+#include "math/m_vec3.h"
 
 #include "util/u_var.h"
 #include "util/u_misc.h"
@@ -175,6 +176,76 @@ DEBUG_GET_ONCE_NUM_OPTION(wmr_user_presence_doff_ms, "WMR_USER_PRESENCE_DOFF_MS"
 //! struct's comment in wmr_hmd.h) already argues for leaving that direction alone absent
 //! proof it needs the same treatment. Tighten it too if a live test proves otherwise.
 DEBUG_GET_ONCE_NUM_OPTION(wmr_user_presence_don_confirm_packets, "WMR_USER_PRESENCE_DON_CONFIRM_PACKETS", 2)
+
+//! Follow-up bug, same day (2026-09-06, docs/103 "committed stayed 0 for 13+s" addendum): the
+//! packet-count fix just above trades one failure mode for another. Live wearer test: a
+//! genuine, deliberate don flipped presence.candidate to WORN immediately (a real proximity=1
+//! packet), but presence.committed stayed 0 for 13+ seconds and counting while the wearer sat
+//! there with the panel still blanked -- confirmed via repeated PRESENCE-DIAG heartbeat lines
+//! showing candidate=1 committed=0 unchanged. The full captured log makes the shape worse than
+//! it looked live: last_packet_age_ms for that same candidate climbed past 43000 (43+ real
+//! seconds) before the NEXT proximity packet ever arrived, and that packet reported proximity=0
+//! -- i.e. it CONTRADICTED the candidate instead of confirming it, so the whole don was never
+//! committed WORN at all, not just delayed. Root cause: WMR_USER_PRESENCE_DON_CONFIRM_PACKETS
+//! is the right fix for a single stray blip on an untouched desk (that case has no live evidence
+//! it needs to resolve fast -- nobody is waiting on it), but it has no upper bound at all for a
+//! REAL don, because it depends entirely on the same sparse companion channel this whole
+//! investigation already measured at 2 s to 100+ s between packets. A wearer with the headset
+//! already on their face will not tolerate an unpredictable multi-second-to-multi-minute wait.
+//!
+//! Fixed with a second, independent corroboration source that does NOT depend on the sparse
+//! proximity channel at all: wh->fusion.last_angular_velocity, the calibrated gyro sample this
+//! same read thread already updates on every single IMU packet (~250 Hz, hololens_handle_sensors_
+//! avg/all in this same file) -- continuous and fast, unlike the proximity byte. If the PEAK
+//! |angular velocity| observed since the candidate flipped (presence.candidate_motion_peak_rad_s,
+//! tracked every tick) reaches this threshold, that alone satisfies confirmation, in ADDITION to
+//! (not instead of) the packet-count path -- either one is enough once WMR_USER_PRESENCE_DON_MS
+//! has also elapsed. Rationale for a real donning gesture producing real, detectable rotation:
+//! nobody puts a headset on their head with zero head/wrist motion.
+//!
+//! Default (0.10 rad/s) is not a blind guess -- it reuses the exact STILL_GYRO_RAD_S threshold
+//! already established and shipped elsewhere in Monado itself (m_imu_3dof.c's gyro_bias_auto,
+//! which decides whether a device is at rest before trusting a window to auto-recalibrate gyro
+//! bias). That threshold's own live log output, from THIS exact unit, THIS exact session
+//! (jack-in-wayland.prev2.log, gyro_bias_auto's own "-> STILL" lines), shows genuinely resting
+//! gyro magnitude sitting at 0.011-0.016 rad/s -- comfortably (6-9x) below 0.10, so reusing that
+//! number leaves real margin rather than sitting right at the resting noise floor. What this
+//! default has NOT been validated against, for lack of live access this pass: the actual peak
+//! magnitude a real donning gesture produces on this unit. Expected to clear 0.10 rad/s
+//! trivially (picking up and placing a headset on a head involves far more rotation than resting
+//! desk vibration), but that is reasoning from the sensor's known behavior elsewhere in this same
+//! codebase, not a live measurement of a real don -- the WMR_INFO commit log below now always
+//! prints the observed peak, specifically so the next live session can confirm or correct this
+//! number from real data instead of guessing blind twice.
+//!
+//! A hard timeout backstops both corroboration paths: if presence.candidate has held
+//! continuously for this long with NEITHER enough confirming packets NOR enough motion, commit
+//! anyway on the wall-clock alone (the pre-fix behavior), so a real don is never left hanging
+//! indefinitely -- the one hard requirement here. Default 4000 ms: comfortably within what a
+//! wearer with the headset already on will tolerate (a small multiple of DON_MS, nowhere near the
+//! 43-100+ s this same sparse channel can otherwise take), tunable down further if a live test
+//! shows it is still too slow, or up if the motion path proves reliable enough that the ceiling
+//! is rarely relevant. Being honest about what this ceiling does NOT do: it only weakly improves
+//! noise rejection over the pre-confirm-count behavior, because this driver's own log shows a
+//! stray packet's candidate can and does sit uncontradicted for well over 4 seconds when packets
+//! are this sparse -- the ceiling mainly bounds latency, it does not meaningfully protect against
+//! a slow-arriving noise blip the way the motion path does. The real noise-rejection improvement
+//! in this fix is the motion path (a resting, untouched desk shows ~0.01 rad/s indefinitely and
+//! should never cross 0.10, so it should never reach this ceiling with a false confirmation); the
+//! timeout is purely a latency backstop, not a second line of defense against noise. 0 disables
+//! the ceiling entirely (waits forever on packets/motion only, the pre-this-fix shape).
+//!
+//! Both are consulted for the WORN direction only, matching WMR_USER_PRESENCE_DON_CONFIRM_PACKETS
+//! above -- re-examined against tonight's own data before deciding, not just carried over
+//! unquestioned: the captured session still has no genuine WORN stretch that also shows a
+//! spurious flip back to NOT WORN mid-session, so there remains no live evidence the DOFF
+//! direction (WMR_USER_PRESENCE_DOFF_MS) has the same problem. Applying either mechanism there
+//! would also cut the wrong way for this driver's own hardware-protection goal: it would make a
+//! REAL doff take longer to register (waiting on a 2nd packet or motion evidence before blanking
+//! sooner), trading faster panel-off time for a problem that has not been observed. Left alone;
+//! revisit if a live test ever shows a spurious mid-worn doff.
+DEBUG_GET_ONCE_FLOAT_OPTION(wmr_user_presence_don_motion_rad_s, "WMR_USER_PRESENCE_DON_MOTION_RAD_S", 0.10f)
+DEBUG_GET_ONCE_NUM_OPTION(wmr_user_presence_don_confirm_timeout_ms, "WMR_USER_PRESENCE_DON_CONFIRM_TIMEOUT_MS", 4000)
 
 //! Auto-standby (reverb-g2, 2026-09-04): blank the panel after this many ms continuously
 //! committed NOT WORN, using the same screen_enable_func this driver already calls at
@@ -3164,6 +3235,22 @@ wmr_hmd_presence_tick(struct wmr_hmd *wh)
 	// a real threshold can be picked from live data without a rebuild.
 	bool raw_worn = wh->proximity_sensor != 0;
 
+	// docs/103 (2026-09-06, "committed stayed 0 for 13+s" addendum): current |angular
+	// velocity|, read from the same calibrated sample the fusion filter itself just used --
+	// hololens_sensors_read_packets() (called immediately before this function on every
+	// wmr_run_thread iteration, see that thread's own loop) already refreshed this on
+	// whatever HID report arrived this tick. Cheap (one more short lock/unlock, same class
+	// of cost this thread already pays into wh->fusion.mutex a few lines up its own call
+	// chain) and available every tick regardless of whether a proximity packet has ever
+	// arrived -- see WMR_USER_PRESENCE_DON_MOTION_RAD_S's own comment for why this exists.
+	float motion_mag_rad_s = 0.0f;
+	{
+		os_mutex_lock(&wh->fusion.mutex);
+		struct xrt_vec3 angular_velocity = wh->fusion.last_angular_velocity;
+		os_mutex_unlock(&wh->fusion.mutex);
+		motion_mag_rad_s = m_vec3_len(angular_velocity);
+	}
+
 	/*
 	 * Debounce (T224). The raw byte alternated 0,1,0,1 through a measured donning
 	 * gesture, so a candidate state has to hold for its window before it is committed.
@@ -3179,15 +3266,26 @@ wmr_hmd_presence_tick(struct wmr_hmd *wh)
 	 * otherwise this function is just re-running on the same still-unconfirmed byte at
 	 * ~250 Hz (measured, see the debug option's own comment above), which must NOT count
 	 * as repeated evidence.
+	 *
+	 * 2026-09-06 (docs/103, same-day addendum #2): also tracks candidate_motion_peak_rad_s,
+	 * the peak of motion_mag_rad_s (above) seen since the candidate last flipped -- reset to
+	 * THIS tick's own reading on a flip (not to 0: the flipping tick may already carry real
+	 * motion), then extended by the running max just below, every tick, independent of
+	 * whether a new proximity packet arrived. See WMR_USER_PRESENCE_DON_MOTION_RAD_S's own
+	 * comment for why this exists and where its default comes from.
 	 */
 	if (raw_worn != wh->presence.candidate) {
 		wh->presence.candidate = raw_worn;
 		wh->presence.candidate_since_ns = now_ns;
 		wh->presence.candidate_confirm_count = 1;
 		wh->presence.candidate_last_counted_update_ns = wh->presence.last_update_ns;
+		wh->presence.candidate_motion_peak_rad_s = raw_worn ? motion_mag_rad_s : 0.0f;
 	} else if (wh->presence.last_update_ns != wh->presence.candidate_last_counted_update_ns) {
 		wh->presence.candidate_confirm_count++;
 		wh->presence.candidate_last_counted_update_ns = wh->presence.last_update_ns;
+	}
+	if (wh->presence.candidate && motion_mag_rad_s > wh->presence.candidate_motion_peak_rad_s) {
+		wh->presence.candidate_motion_peak_rad_s = motion_mag_rad_s;
 	}
 
 	if (wh->presence.candidate != wh->presence.committed) {
@@ -3198,26 +3296,46 @@ wmr_hmd_presence_tick(struct wmr_hmd *wh)
 		uint64_t held_ns = now_ns - wh->presence.candidate_since_ns;
 		bool time_ok = held_ns >= window_ms * U_TIME_1MS_IN_NS;
 
-		// WMR_USER_PRESENCE_DON_CONFIRM_PACKETS (docs/103, 2026-09-06): only gates
-		// entering WORN -- see that option's own comment for why NOT WORN is left as
-		// pure wall-clock. A value below 1 is nonsensical (nothing commits without at
-		// least the one packet that created the candidate in the first place) so it is
-		// floored to 1 here rather than trusted verbatim from the env var.
+		// WMR_USER_PRESENCE_DON_CONFIRM_PACKETS / _DON_MOTION_RAD_S / _DON_CONFIRM_TIMEOUT_MS
+		// (docs/103, 2026-09-06): only gate entering WORN -- see WMR_USER_PRESENCE_DON_
+		// CONFIRM_PACKETS' own comment for why NOT WORN is left as pure wall-clock. Any ONE
+		// of three independent paths is enough, once time_ok also holds: (1) enough
+		// independent proximity packets agreed (fast when the sparse channel happens to
+		// cooperate), (2) real motion was observed during the hold (fast and available
+		// every tick, expected to be the common case for a genuine don), or (3) the
+		// candidate has simply held long enough that a wearer can no longer be made to wait
+		// on the other two (the bounded worst case -- see that option's own comment for the
+		// honest limitation this path does NOT solve). need_packets is a floor at 1 (nothing
+		// commits without at least the packet that created the candidate); a
+		// motion/timeout option <= 0 disables that specific path rather than trusting a
+		// nonsensical env var verbatim.
 		bool confirm_ok = true;
+		const char *confirm_via = "n/a";
 		if (wh->presence.candidate) {
 			long need_raw = debug_get_num_option_wmr_user_presence_don_confirm_packets();
 			uint64_t need = need_raw < 1 ? 1 : (uint64_t)need_raw;
-			confirm_ok = wh->presence.candidate_confirm_count >= need;
+			bool packets_ok = wh->presence.candidate_confirm_count >= need;
+
+			float motion_threshold = debug_get_float_option_wmr_user_presence_don_motion_rad_s();
+			bool motion_ok =
+			    motion_threshold > 0.0f && wh->presence.candidate_motion_peak_rad_s >= motion_threshold;
+
+			long timeout_raw = debug_get_num_option_wmr_user_presence_don_confirm_timeout_ms();
+			bool timeout_ok = timeout_raw > 0 && held_ns >= (uint64_t)timeout_raw * U_TIME_1MS_IN_NS;
+
+			confirm_ok = packets_ok || motion_ok || timeout_ok;
+			confirm_via = packets_ok ? "packets" : motion_ok ? "motion" : timeout_ok ? "timeout" : "none yet";
 		}
 
 		if (time_ok && confirm_ok) {
 			wh->presence.committed = wh->presence.candidate;
 			WMR_INFO(wh,
 			         "User presence: %s (raw proximity sensor value %u, held %llu ms, "
-			         "%llu confirming packet(s))",
+			         "%llu confirming packet(s), motion peak %.3f rad/s, via %s)",
 			         wh->presence.committed ? "WORN" : "NOT WORN", wh->proximity_sensor,
 			         (unsigned long long)(held_ns / U_TIME_1MS_IN_NS),
-			         (unsigned long long)wh->presence.candidate_confirm_count);
+			         (unsigned long long)wh->presence.candidate_confirm_count,
+			         (double)wh->presence.candidate_motion_peak_rad_s, confirm_via);
 		}
 	}
 
