@@ -11,6 +11,7 @@
 #include "os/os_threading.h"
 #include "os/os_time.h"
 #include "tracking/t_tracking.h"
+#include "util/u_debug.h"
 #include "util/u_logging.h"
 #include "util/u_misc.h"
 
@@ -31,6 +32,13 @@ euroc_run_dataset(const char *euroc_path,
 {}
 
 #else
+
+//! How often to ask the tracker for a pose during a batch run, in Hz. The loop below polls at
+//! 5 Hz, which is enough to notice that tracking stopped but useless for anything else: PREDICTION
+//! only ever runs inside get_tracked_pose, so prediction.csv comes out ~34x sparser than a real
+//! session's ~170 Hz and cannot characterise the SLAM_PRED_* knobs at all. 0 restores the original
+//! 5 Hz-only behaviour.
+DEBUG_GET_ONCE_NUM_OPTION(slam_batch_poll_hz, "SLAM_BATCH_POLL_HZ", 170)
 
 static struct euroc_player_config *
 make_euroc_player_config(const char *euroc_path)
@@ -92,7 +100,11 @@ euroc_run_dataset(const char *euroc_path,
 {
 	struct euroc_player_config *ep_config = make_euroc_player_config(euroc_path);
 	struct t_slam_tracker_config *st_config = make_slam_tracker_config(slam_config, output_path);
-	st_config->cam_count = ep_config->dataset.cam_count;
+	// playback, not dataset: EUROC_CAM_COUNT narrows how many cameras the player actually streams
+	// (a G2 dataset records all 4, SLAM runs on 2), and sizing the tracker off the dataset instead
+	// makes it wait for cam2 forever -- "Assertion failed @push_frame: Expected cam2 frame,
+	// received cam0" on the very first round.
+	st_config->cam_count = ep_config->playback.cam_count;
 
 	// Frame context that will manage SLAM tracker and euroc player lifetimes
 	struct xrt_frame_context xfctx = {0};
@@ -115,10 +127,25 @@ euroc_run_dataset(const char *euroc_path,
 	struct xrt_space_relation b = {0};
 	b.pose.orientation.w = 42; // Make b different from a
 
+	// The stop check still compares two samples 0.2 s apart, exactly as before; the inner loop
+	// only adds the display-rate polling that makes the prediction path run (SLAM_BATCH_POLL_HZ).
+	const int64_t check_period_ns = (int64_t)(0.2 * U_TIME_1S_IN_NS);
+	const long poll_hz = debug_get_num_option_slam_batch_poll_hz();
+	const int64_t poll_period_ns = poll_hz > 0 ? U_TIME_1S_IN_NS / poll_hz : 0;
+
 	bool tracking = true;
 	bool streaming = xrt_fs_is_running(xfs);
 	while ((streaming || tracking) && !*should_exit) {
-		os_nanosleep(0.2 * U_TIME_1S_IN_NS);
+		if (poll_period_ns > 0) {
+			for (int64_t waited = 0; waited < check_period_ns && !*should_exit;
+			     waited += poll_period_ns) {
+				struct xrt_space_relation ignored = {0};
+				os_nanosleep(poll_period_ns);
+				xrt_tracked_slam_get_tracked_pose(xts, os_monotonic_get_ns(), &ignored);
+			}
+		} else {
+			os_nanosleep(check_period_ns);
+		}
 		a = b;
 		xrt_tracked_slam_get_tracked_pose(xts, os_monotonic_get_ns(), &b);
 		tracking = memcmp(&a, &b, sizeof(struct xrt_space_relation)) != 0;
