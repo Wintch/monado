@@ -26,6 +26,8 @@
 #include "wmr_controller_protocol.h"
 #include "wmr_config.h"
 
+#include <stdio.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -206,6 +208,13 @@ struct wmr_controller_base
 		//! get_tracked_pose_call_count just above: a shared static would silently mute one hand's
 		//! heartbeat under interleaved calls.
 		uint64_t yaw_lock_status_log_count;
+
+		/*!
+		 * Open only while WMR_CONTROLLER_HEADING_CSV is set (docs/125 step 3), one file per
+		 * hand so the two tracker threads never share a handle. Written once per constellation
+		 * solve that reaches apply_solve_yaw_correction, accepted or distrusted.
+		 */
+		FILE *heading_csv;
 
 		/*!
 		 * Every constellation sample this controller receives, keyed by the sample's own

@@ -91,6 +91,10 @@ DEBUG_GET_ONCE_FLOAT_OPTION(wmr_constellation_tracker_gravity_gate_deg,
 //! live value: 0.05 (5% of the measured yaw error corrected per accepted solve).
 DEBUG_GET_ONCE_FLOAT_OPTION(wmr_controller_solve_yaw_correct, "WMR_CONTROLLER_SOLVE_YAW_CORRECT", 0.0f)
 
+//! Path prefix for the per-solve heading telemetry of docs/125 step 3; "-left.csv"/"-right.csv"
+//! is appended. Unset (the default) costs one null check per solve and opens nothing.
+DEBUG_GET_ONCE_OPTION(wmr_controller_heading_csv, "WMR_CONTROLLER_HEADING_CSV", NULL)
+
 //! Degrees of yaw disagreement (same swing-twist-about-world-up measurement
 //! WMR_CONTROLLER_SOLVE_YAW_CORRECT already computes) a constellation solve may have from the
 //! fusion's CURRENT heading before the whole sample is rejected outright -- not stored, not
@@ -1157,6 +1161,11 @@ wmr_controller_base_deinit(struct wmr_controller_base *wcb)
 	os_mutex_destroy(&wcb->data_lock);
 
 	// Destroy the fusion.
+	if (wcb->constellation.heading_csv != NULL) {
+		fclose(wcb->constellation.heading_csv);
+		wcb->constellation.heading_csv = NULL;
+	}
+
 	m_imu_3dof_close(&wcb->fusion);
 }
 
@@ -1540,6 +1549,64 @@ wmr_constellation_solve_yaw_error_rad(const struct xrt_quat *solve_orientation, 
 	return yaw_error_rad;
 }
 
+/*!
+ * One row of docs/125 step 3's heading telemetry, snapshotted under @ref data_lock because the
+ * IMU thread owns every field of it (m_imu_3dof_update -> gyro_bias_auto) while this runs on the
+ * tracker thread.
+ */
+struct heading_row
+{
+	uint64_t t_ns;           //!< The fusion's own IMU clock, the same clock gyro_bias uses.
+	struct xrt_vec3 bias;    //!< Current gyro bias estimate, rad/s.
+	uint64_t bias_last_ns;   //!< When the estimator last ran; 0 if it never has.
+	uint32_t bias_fires;     //!< How many times the automatic path has fired this session.
+	uint32_t bias_estimates; //!< How many estimates have been folded into the value.
+	float gyro_len;          //!< |gyro| after bias removal -- the motion proxy for this row.
+	bool locked;             //!< solve_yaw_locked, i.e. "has ever converged" (it is monotonic).
+};
+
+/*!
+ * Append one row, opening the file on first use. Rate is 4-8 solves/s/controller, so the
+ * unbuffered-ish flush per row costs nothing and means a killed session still has its data.
+ */
+static void
+heading_csv_write(struct wmr_controller_base *wcb, const struct heading_row *row, float yaw_error_rad, float step_rad, bool accepted)
+{
+	const char *prefix = debug_get_option_wmr_controller_heading_csv();
+	if (prefix == NULL) {
+		return;
+	}
+
+	if (wcb->constellation.heading_csv == NULL) {
+		bool is_left = wcb->base.device_type == XRT_DEVICE_TYPE_LEFT_HAND_CONTROLLER;
+		char path[512];
+		snprintf(path, sizeof(path), "%s-%s.csv", prefix, is_left ? "left" : "right");
+		wcb->constellation.heading_csv = fopen(path, "w");
+		if (wcb->constellation.heading_csv == NULL) {
+			WMR_ERROR(wcb, "WMR_CONTROLLER_HEADING_CSV: cannot open %s -- no telemetry this run", path);
+			// Leave it NULL; every later call re-tries the open, which is harmless at this rate
+			// and recovers if the directory appears later.
+			return;
+		}
+		fprintf(wcb->constellation.heading_csv,
+		        "t_ns,yaw_err_deg,accepted,locked,bias_x,bias_y,bias_z,bias_age_ms,bias_fires,bias_estimates,gyro_len,step_deg\n");
+		WMR_INFO(wcb, "WMR_CONTROLLER_HEADING_CSV: writing %s", path);
+	}
+
+	// A bias that has never been estimated is reported as -1 rather than as a huge age: "never"
+	// and "very stale" are different states and the analysis must not average them together.
+	double bias_age_ms = -1.0;
+	if (row->bias_last_ns != 0 && row->t_ns >= row->bias_last_ns) {
+		bias_age_ms = (double)(row->t_ns - row->bias_last_ns) / 1000000.0;
+	}
+
+	fprintf(wcb->constellation.heading_csv, "%" PRIu64 ",%.3f,%d,%d,%.6f,%.6f,%.6f,%.1f,%u,%u,%.4f,%.3f\n",
+	        row->t_ns, (double)(yaw_error_rad * 180.0 / M_PI), accepted ? 1 : 0, row->locked ? 1 : 0,
+	        (double)row->bias.x, (double)row->bias.y, (double)row->bias.z, bias_age_ms, row->bias_fires,
+	        row->bias_estimates, (double)row->gyro_len, (double)(step_rad * 180.0 / M_PI));
+	fflush(wcb->constellation.heading_csv);
+}
+
 static void
 apply_solve_yaw_correction(struct wmr_controller_base *wcb,
                            const struct t_constellation_tracker_sample *sample,
@@ -1559,6 +1626,18 @@ apply_solve_yaw_correction(struct wmr_controller_base *wcb,
 
 	float yaw_error_rad = wmr_constellation_solve_yaw_error_rad(&sample->pose.orientation, &fusion_rot);
 
+	// docs/125 step 3: snapshot the bias estimator's state before either exit below, so a
+	// distrusted (ghost) sample is recorded with exactly the same context an accepted one is.
+	struct heading_row row = {
+	    .t_ns = wcb->fusion.last.timestamp_ns,
+	    .bias = wcb->fusion.gyro_bias.value,
+	    .bias_last_ns = wcb->fusion.gyro_bias.last_auto_ns,
+	    .bias_fires = wcb->fusion.gyro_bias.auto_fire_count,
+	    .bias_estimates = wcb->fusion.gyro_bias.estimate_count,
+	    .gyro_len = wcb->fusion.last.gyro_biased_length,
+	    .locked = wcb->constellation.solve_yaw_locked,
+	};
+
 	// Ghost-solve trust window (0047's open near-pure-yaw mis-assignments produce solves at
 	// wildly different headings with equally-good reprojection): before the heading has ever
 	// locked, trust any error (the boot offset can legitimately be up to 180). Once the
@@ -1569,6 +1648,10 @@ apply_solve_yaw_correction(struct wmr_controller_base *wcb,
 	const float yaw_distrust_rad = 60.0f * ((float)M_PI / 180.0f);
 	if (wcb->constellation.solve_yaw_locked && fabsf(yaw_error_rad) > yaw_distrust_rad) {
 		os_mutex_unlock(&wcb->data_lock);
+		// Recorded with accepted=0 and step=0: these are the distrusted ghosts, and their own
+		// distribution against bias_age_ms is half the question. Dropping them here would leave
+		// the telemetry describing only the samples the existing gate already liked.
+		heading_csv_write(wcb, &row, yaw_error_rad, 0.0f, false);
 		return;
 	}
 	// T223 (2026-08-19, docs/58): this is the ONLY place solve_yaw_locked is ever written, and
@@ -1620,6 +1703,8 @@ apply_solve_yaw_correction(struct wmr_controller_base *wcb,
 	wcb->constellation.solve_yaw_correction_count++;
 	uint64_t count = wcb->constellation.solve_yaw_correction_count;
 	os_mutex_unlock(&wcb->data_lock);
+
+	heading_csv_write(wcb, &row, yaw_error_rad, step_rad, true);
 
 	// Unconditional, not throttled: a lock/unlock transition is rare (once per session, in
 	// practice, since the flag is monotonic -- see the comment at the write site above) and is
