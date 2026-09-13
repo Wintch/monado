@@ -33,6 +33,14 @@
 
 DEBUG_GET_ONCE_LOG_OPTION(wmr_log, "WMR_LOG", U_LOGGING_INFO)
 
+//! Decline to build even when a WMR headset is plugged in, so that a lower-priority builder can
+//! take the head role instead. The case this exists for: replaying a recorded EuRoC dataset
+//! through the euroc player (EUROC_PATH + EUROC_HMD) to compare tracking/prediction configs
+//! offline. The prober picks the first builder that is *certain* it can create a head, and a
+//! connected G2 always makes this one certain, so the euroc device could never be reached
+//! without physically unplugging the headset.
+DEBUG_GET_ONCE_BOOL_OPTION(wmr_disable, "WMR_DISABLE", false)
+
 
 /*
  *
@@ -111,6 +119,14 @@ wmr_estimate_system(struct xrt_builder *xb,
 	struct xrt_prober_device **xpdevs = NULL;
 	size_t xpdev_count = 0;
 	xrt_result_t xret = XRT_SUCCESS;
+
+	// See WMR_DISABLE above. Report an all-zero estimate without touching the device list, so
+	// the prober moves on to the next builder exactly as it would with nothing plugged in.
+	if (debug_get_bool_option_wmr_disable()) {
+		U_LOG_IFL_I(log_level, "WMR_DISABLE is set, declining to build.");
+		*out_estimate = estimate;
+		return XRT_SUCCESS;
+	}
 
 	/*
 	 * Pre device looking stuff.
