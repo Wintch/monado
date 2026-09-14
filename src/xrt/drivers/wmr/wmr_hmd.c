@@ -1510,12 +1510,14 @@ wmr_hmd_send_controller_keepalives(struct wmr_hmd *wh)
 		struct xrt_device *xdev = wmr_hmd_controller_connection_get_controller(left);
 		if (xdev != NULL) {
 			wmr_controller_base_send_keepalive_if_due(xdev);
+			wmr_controller_base_send_led_pulse_if_due(xdev);
 		}
 	}
 	if (right != NULL) {
 		struct xrt_device *xdev = wmr_hmd_controller_connection_get_controller(right);
 		if (xdev != NULL) {
 			wmr_controller_base_send_keepalive_if_due(xdev);
+			wmr_controller_base_send_led_pulse_if_due(xdev);
 		}
 	}
 }

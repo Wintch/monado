@@ -148,6 +148,17 @@ struct wmr_controller_base
 	//! See the keepalive prototype in wmr_controller_base_get_tracked_pose. Diagnostic-only,
 	//! off by default.
 	uint64_t last_keepalive_ns;
+
+	/*!
+	 * WMR_CONTROLLER_LED_INTENSITY state -- the LED pulse-train command this driver
+	 * historically never sent. @ref last_led_pulse_ns is the monotonic time of the last
+	 * command (0 before the first), @ref led_cmd_counter the 8-bit counter shared with the
+	 * keepalive command family, and @ref led_ts_counter the 2-bit counter the device expects
+	 * to see cycle 1,2,3,1,... and never 0. See wmr_controller_send_led_pulse_train().
+	 */
+	uint64_t last_led_pulse_ns;
+	uint8_t led_cmd_counter;
+	uint8_t led_ts_counter;
 	//! Main fusion calculator.
 	struct m_imu_3dof fusion;
 	//! The last angular velocity from the IMU, for prediction.
@@ -342,6 +353,17 @@ wmr_controller_base_apply_stick_autocenter(struct wmr_controller_base *wcb, stru
  */
 void
 wmr_controller_base_send_keepalive_if_due(struct xrt_device *xdev);
+
+/*!
+ * Send the constellation LED pulse-train command if WMR_CONTROLLER_LED_INTENSITY is set and
+ * enough time has passed. Driven from wmr_hmd.c's run thread next to the keepalive tick, for
+ * the same reason: that thread lives for the whole life of the HMD device and holds no locks
+ * across the call. No-op (one clock read) when the option is unset.
+ *
+ * @ingroup drv_wmr
+ */
+void
+wmr_controller_base_send_led_pulse_if_due(struct xrt_device *xdev);
 
 /*!
  * WMR_CONTROLLER_HAPTICS (UNVALIDATED PROTOTYPE, default off): xrt_device::set_output
