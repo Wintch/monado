@@ -93,6 +93,28 @@ DEBUG_GET_ONCE_BOOL_OPTION(constellation_seed_first, "WMR_CONSTELLATION_SEED_FIR
 // tracked object legitimately further than this from the camera that observes it.
 DEBUG_GET_ONCE_FLOAT_OPTION(constellation_max_cam_range_m, "WMR_CONSTELLATION_MAX_CAM_RANGE_M", -1.0f)
 
+//! Per-observation blob telemetry: how many blobs the detector found and how big and bright they
+//! were, logged at the sink where observations ARRIVE -- deliberately before the num_blobs == 0
+//! early return below.
+//!
+//! That placement is the whole point. reverb-g2 docs/126 measured a hard wall between 77 cm and
+//! 1 m: 634 constellation samples in 20 s at 75 cm, zero at 1 m, with no degradation in between.
+//! Two very different failures produce that same zero and nothing currently distinguishes them:
+//!
+//!   - **no blobs at all** -> a DETECTION limit. Each ~3 mm emitter projects to an estimated
+//!     1.63 / 1.08 / 0.81 px at 50 / 75 / 100 cm, so the emitters may simply fall below a pixel.
+//!     Amplitude is then the lever: camera gain, or (with timesync, unlike lab patch 0108) LED
+//!     brightness.
+//!   - **blobs present, no pose** -> a CORRESPONDENCE limit. Amplitude buys nothing; the fix is in
+//!     the matching, and docs/125's yaw work is the relevant thread.
+//!
+//! Logging only the frames that survive the early return would answer neither, since the case of
+//! interest is exactly the one that returns.
+//!
+//! Off by default. One line per observation, not per blob: at 90 fps a per-blob line is a firehose,
+//! and the per-frame distribution is what the question needs.
+DEBUG_GET_ONCE_BOOL_OPTION(constellation_blob_telemetry, "WMR_CONSTELLATION_BLOB_TELEMETRY", false)
+
 /*
  *
  * Helper functions
@@ -1943,6 +1965,36 @@ constellation_tracker_camera_push_blobs(t_blob_sink *tbs, t_blob_observation *tb
 	ConstellationTracker *tracker = camera->tracker;
 
 	CT_TRACE(tracker, "Received blob observation with %u blobs", tbo->num_blobs);
+
+	// WMR_CONSTELLATION_BLOB_TELEMETRY -- see the option's declaration for why this sits above the
+	// early return rather than below it.
+	if (debug_get_bool_option_constellation_blob_telemetry()) {
+		const uint32_t n = tbo->num_blobs;
+		if (n == 0) {
+			CT_INFO(tracker, "blobs: t=%" PRIu64 " n=0", (uint64_t)tbo->timestamp_ns);
+		} else {
+			float w_min = 1e9f, w_max = 0.0f, w_sum = 0.0f;
+			float b_min = 1e9f, b_max = 0.0f, b_sum = 0.0f;
+			for (uint32_t i = 0; i < n; i++) {
+				const struct t_blob *tb = &tbo->blobs[i];
+				// Mean of the bounding box's two sides: a blob near the detection floor is a
+				// couple of pixels across and not meaningfully elongated, so one number is
+				// enough and keeps the line readable.
+				const float w = (tb->size.x + tb->size.y) * 0.5f;
+				w_min = fminf(w_min, w);
+				w_max = fmaxf(w_max, w);
+				w_sum += w;
+				b_min = fminf(b_min, tb->brightness);
+				b_max = fmaxf(b_max, tb->brightness);
+				b_sum += tb->brightness;
+			}
+			CT_INFO(tracker,
+			        "blobs: t=%" PRIu64 " n=%u size_px min=%.2f mean=%.2f max=%.2f "
+			        "bright min=%.3f mean=%.3f max=%.3f",
+			        (uint64_t)tbo->timestamp_ns, n, w_min, w_sum / n, w_max, b_min, b_sum / n,
+			        b_max);
+		}
+	}
 
 	if (tbo->num_blobs == 0) {
 		CT_TRACE(tracker, "No blobs in observation, skipping processing");
