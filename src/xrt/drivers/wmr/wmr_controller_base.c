@@ -108,6 +108,25 @@ DEBUG_GET_ONCE_OPTION(wmr_controller_heading_csv, "WMR_CONTROLLER_HEADING_CSV", 
 //! other configuration is wrong.
 DEBUG_GET_ONCE_BOOL_OPTION(wmr_constellation_raw_samples_log, "WMR_CONSTELLATION_RAW_SAMPLES_LOG", false)
 
+//! Dump every LED's factory position and normal once at init, one line each.
+//!
+//! This geometry has been parsed since the driver was written and NEVER logged -- only the count
+//! ("Parsed %d LED entries"). Two live questions depend on the actual layout and neither can be
+//! answered without it:
+//!
+//!   1. docs/126's resolution wall assumes 32 LEDs spaced EVENLY (11.25 deg, an 11.66 mm chord on
+//!      the measured 11.9 cm ring), which sets the px-between-neighbours numbers the wall is
+//!      explained by. The wearer reports the LEDs are patterned, not uniform. If so the MINIMUM
+//!      neighbour gap is smaller than that average and the wall arrives earlier than computed.
+//!   2. docs/125 founds the yaw ghost on the ring being "near-symmetric under that half-turn". A
+//!      deliberately asymmetric pattern is exactly how CV1/PSVR-class constellations make
+//!      correspondence unique, so if the pattern IS asymmetric that premise is wrong and the ghost
+//!      is our correspondence search not exploiting it -- a different bug with a different fix.
+//!
+//! Raw values only, no derived angles: the ring axis and ordering are better computed offline
+//! where they can be checked, rather than trusted from arithmetic buried in device init.
+DEBUG_GET_ONCE_BOOL_OPTION(wmr_controller_led_dump, "WMR_CONTROLLER_LED_DUMP", false)
+
 //! Degrees of yaw disagreement (same swing-twist-about-world-up measurement
 //! WMR_CONTROLLER_SOLVE_YAW_CORRECT already computes) a constellation solve may have from the
 //! fusion's CURRENT heading before the whole sample is rejected outright -- not stored, not
@@ -689,6 +708,18 @@ read_controller_config(struct wmr_controller_base *wcb)
 	free(cache_filename);
 
 	WMR_DEBUG(wcb, "Parsed %d LED entries from controller calibration", wcb->config.led_count);
+
+	// WMR_CONTROLLER_LED_DUMP: the constellation geometry itself, once, at INFO. See the option's
+	// declaration for the two open questions that need it.
+	if (debug_get_bool_option_wmr_controller_led_dump()) {
+		WMR_INFO(wcb, "LED dump [%s]: %d LEDs, pos_m then normal, controller local frame",
+		         wcb->base.str, wcb->config.led_count);
+		for (int i = 0; i < wcb->config.led_count; i++) {
+			const struct wmr_led_config *l = &wcb->config.leds[i];
+			WMR_INFO(wcb, "  led %2d: pos=(%+.5f,%+.5f,%+.5f) norm=(%+.4f,%+.4f,%+.4f)", i,
+			         l->pos.x, l->pos.y, l->pos.z, l->norm.x, l->norm.y, l->norm.z);
+		}
+	}
 
 	return true;
 }
