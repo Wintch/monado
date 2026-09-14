@@ -95,6 +95,19 @@ DEBUG_GET_ONCE_FLOAT_OPTION(wmr_controller_solve_yaw_correct, "WMR_CONTROLLER_SO
 //! is appended. Unset (the default) costs one null check per solve and opens nothing.
 DEBUG_GET_ONCE_OPTION(wmr_controller_heading_csv, "WMR_CONTROLLER_HEADING_CSV", NULL)
 
+//! Log EVERY constellation sample the tracker hands this device, at the very top of
+//! constellation_sample_store, before any gate or guard drops it. WMR_CONTROLLER_HEADING_CSV
+//! (0107) deliberately sits after the gravity gate, so it counts what SURVIVES; this counts what
+//! the cameras actually produced, which is the quantity docs/125's visibility cliff is about
+//! ("118 poses in 20 s at 50 cm, zero at 75 cm and at 1 m"). Off by default.
+//!
+//! The distance is from the tracking ORIGIN, not from the camera. Those differ in general -- see
+//! the world-frame guard's long comment below -- but they coincide in the one setup this was
+//! written for: WMR_SLAM=0 (ctrl mode) with the headset stationary, where the head pose never
+//! moves and world-frame therefore is head-frame. Reading it as a hand-to-camera range in any
+//! other configuration is wrong.
+DEBUG_GET_ONCE_BOOL_OPTION(wmr_constellation_raw_samples_log, "WMR_CONSTELLATION_RAW_SAMPLES_LOG", false)
+
 //! Degrees of yaw disagreement (same swing-twist-about-world-up measurement
 //! WMR_CONTROLLER_SOLVE_YAW_CORRECT already computes) a constellation solve may have from the
 //! fusion's CURRENT heading before the whole sample is rejected outright -- not stored, not
@@ -1866,6 +1879,18 @@ constellation_sample_store(struct t_constellation_tracker_device *device, struct
 {
 	struct wmr_controller_base *wcb =
 	    container_of(device, struct wmr_controller_base, constellation.device);
+
+	// WMR_CONSTELLATION_RAW_SAMPLES_LOG: the pre-gate census. Every drop path below is a place a
+	// real solve can vanish silently, and this project has already lost a whole session to one
+	// of them (see the T223 story in the guard comment just below). One line per sample, so the
+	// count is exact rather than inferred from throttled drop counters.
+	if (debug_get_bool_option_wmr_constellation_raw_samples_log()) {
+		float rx = sample->pose.position.x;
+		float ry = sample->pose.position.y;
+		float rz = sample->pose.position.z;
+		WMR_INFO(wcb, "raw constellation sample [%s]: t=%" PRIu64 " pos=(%.3f,%.3f,%.3f) dist=%.3f",
+		         wcb->base.str, os_monotonic_get_ns(), rx, ry, rz, sqrtf(rx * rx + ry * ry + rz * rz));
+	}
 
 	// A controller is on the end of an arm. Anything beyond a generous room away is not a bad
 	// measurement of where it is, it is a failed solve reporting a number -- observed live
